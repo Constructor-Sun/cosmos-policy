@@ -3,6 +3,7 @@
 rollouts/
 experiments/
 archieve/
+**/__pycache__/
 
 
 *.whl
