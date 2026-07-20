@@ -1,2 +1,8 @@
 /.cuda-name
 /build
+rollouts/
+experiments/
+archieve/
+
+
+*.whl

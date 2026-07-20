@@ -166,6 +166,7 @@ class TaskSuite(str, Enum):
     LIBERO_GOAL = "libero_goal"
     LIBERO_10 = "libero_10"
     LIBERO_90 = "libero_90"
+    LIBERO_MIX = "libero_mix"
 
 
 # Define max steps for each task suite
@@ -175,6 +176,7 @@ TASK_MAX_STEPS = {
     TaskSuite.LIBERO_GOAL: 300,  # longest training demo has 270 steps
     TaskSuite.LIBERO_10: 520,  # longest training demo has 505 steps
     TaskSuite.LIBERO_90: 400,  # longest training demo has 373 steps
+    TaskSuite.LIBERO_MIX: 520,  # LIBERO-plus mixture; keep the conservative LIBERO-10 horizon
 }
 
 
@@ -240,7 +242,8 @@ class PolicyEvalConfig:
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
-    task_suite_name: str = TaskSuite.LIBERO_SPATIAL                      # Task suite (must be one of: LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_10, LIBERO_90)
+    task_suite_name: str = TaskSuite.LIBERO_SPATIAL                      # Task suite (must be one of: LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_10, LIBERO_90, LIBERO_MIX)
+    unnorm_key: str = ""                                                 # Optional action un-normalization key override (e.g., use libero_10 for LIBERO-plus)
     num_trials_per_task: int = 50                                        # Number of rollouts per task
     initial_states_path: str = "DEFAULT"                                 # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                                               # Resolution for rendering environment images (not policy input resolution)
@@ -292,7 +295,7 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
 def check_unnorm_key(cfg: PolicyEvalConfig, model) -> None:
     """Check that the model contains the action un-normalization key."""
     # Initialize unnorm_key
-    unnorm_key = cfg.task_suite_name
+    unnorm_key = cfg.unnorm_key or cfg.task_suite_name
 
     # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
     # with the suffix "_no_noops" in the dataset name)

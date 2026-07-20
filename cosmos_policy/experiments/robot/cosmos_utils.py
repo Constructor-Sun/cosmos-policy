@@ -888,6 +888,8 @@ def get_action(
         # Get T5 embedding of language instruction
         if isinstance(task_label_or_embedding, str):
             text_embedding = get_t5_embedding_from_cache(task_label_or_embedding)
+        elif isinstance(task_label_or_embedding, torch.Tensor):
+            text_embedding = task_label_or_embedding.to(dtype=torch.bfloat16).cuda()
         elif isinstance(task_label_or_embedding, np.ndarray):
             text_embedding = torch.tensor(task_label_or_embedding, dtype=torch.bfloat16).cuda()
 
