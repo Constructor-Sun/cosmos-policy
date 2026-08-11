@@ -215,7 +215,9 @@ def load_model_state_dict_from_checkpoint(
 
     from cosmos_policy._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 
-    load_from_local = True
+    # Local .pt files use the regular file loader. DCP paths are directories
+    # and must go through DistributedCheckpointer, regardless of backend.
+    load_from_local = checkpoint_format == "pt"
     local_s3_ckpt_fp = get_checkpoint_path(cur_key_ckpt_full_path)
 
     if SMOKE:
@@ -285,7 +287,7 @@ def load_model_state_dict_from_checkpoint(
 
         distributed.sync_model_states(model, src=0, params_and_buffers_to_ignore=params_and_buffers_to_ignore)
     else:
-        log.info(f"Loading model from s3 {s3_checkpoint_dir}")
+        log.info(f"Loading model from distributed checkpoint {s3_checkpoint_dir}")
 
         checkpointer = DistributedCheckpointer(config.checkpoint, config.job, callbacks=None, disable_async=True)
 

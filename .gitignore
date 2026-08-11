@@ -3,7 +3,15 @@
 rollouts/
 experiments/
 archieve/
-**/__pycache__/
+dataset/
+vector_db/
+__pycache__/
+LIBERO-Cosmos-Policy/
+LIBERO-plus/
+outputs/
 
-
+*.pyc
 *.whl
+*.log
+
+./run_libero_smoke_test.sh

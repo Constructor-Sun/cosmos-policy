@@ -88,6 +88,7 @@ def forward_corrected(
     target_rms: float,
     args,
 ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+    hook_mode = getattr(args, "hook_mode", "pre")
     with DynamicCorrectionContext(
         model,
         corrector,
@@ -96,6 +97,7 @@ def forward_corrected(
         target_rms=target_rms,
         alpha=args.alpha,
         condition_pass_only=args.condition_pass_only,
+        hook_mode=hook_mode,
     ) as ctx:
         phase2.set_seed_everywhere(args.reset_seed)
         out = phase2.get_action(
@@ -122,6 +124,7 @@ def pair_metrics(
     clean_h: torch.Tensor,
     pert_h: torch.Tensor,
     corrected_h: torch.Tensor,
+    direct_pred_delta: torch.Tensor,
 ) -> dict[str, float]:
     base_rel = action_rel_error(pert_action, clean_action)
     corr_rel = action_rel_error(corrected_action, clean_action)
@@ -136,7 +139,55 @@ def pair_metrics(
         "action_mse_recovery_vs_pert": 1.0 - corr_mse / (base_mse + EPS),
     }
     out.update(hidden_recovery(clean_h, pert_h, corrected_h))
+    true_delta = clean_h.detach().float() - pert_h.detach().float()
+    effective_delta = corrected_h.detach().float() - pert_h.detach().float()
+    out.update(delta_alignment_metrics(true_delta, direct_pred_delta, prefix="direct_delta"))
+    out.update(delta_alignment_metrics(true_delta, effective_delta, prefix="effective_delta"))
     return out
+
+
+def delta_alignment_metrics(
+    true_delta: torch.Tensor,
+    predicted_delta: torch.Tensor,
+    *,
+    prefix: str,
+) -> dict[str, float]:
+    """Measure direction, magnitude, and scalar-rescaling headroom."""
+    true_flat = true_delta.detach().float().reshape(-1)
+    pred_flat = predicted_delta.detach().float().reshape(-1)
+    true_norm = torch.linalg.vector_norm(true_flat)
+    pred_norm = torch.linalg.vector_norm(pred_flat)
+    dot = torch.dot(true_flat, pred_flat)
+    cosine = torch.clamp(dot / (true_norm * pred_norm + EPS), -1.0, 1.0)
+    optimal_alpha = dot / (pred_norm.square() + EPS)
+    oracle_error = torch.mean((optimal_alpha * pred_flat - true_flat) ** 2)
+    baseline_error = torch.mean(true_flat ** 2)
+    return {
+        f"{prefix}_cosine": float(cosine),
+        f"{prefix}_angle_deg": float(torch.rad2deg(torch.acos(cosine))),
+        f"{prefix}_norm_ratio": float(pred_norm / (true_norm + EPS)),
+        f"{prefix}_optimal_alpha": float(optimal_alpha),
+        f"{prefix}_oracle_scaled_recovery": float(1.0 - oracle_error / (baseline_error + EPS)),
+    }
+
+
+def print_delta_alignment(rows: list[dict[str, Any]]) -> None:
+    print("delta-z alignment:", flush=True)
+    if not rows:
+        print("  no successful pairs", flush=True)
+        return
+    for prefix, label in (("direct_delta", "direct predictor"), ("effective_delta", "online effective")):
+        cosine = mean_metric(rows, f"{prefix}_cosine")
+        angle = mean_metric(rows, f"{prefix}_angle_deg")
+        ratio = mean_metric(rows, f"{prefix}_norm_ratio")
+        alpha = mean_metric(rows, f"{prefix}_optimal_alpha")
+        oracle = mean_metric(rows, f"{prefix}_oracle_scaled_recovery")
+        print(
+            f"  {label}: cosine={cosine:.6f} angle_deg={angle:.3f} "
+            f"norm_ratio={ratio:.6f} optimal_alpha={alpha:.6f} "
+            f"oracle_scaled_recovery={oracle:.6f}",
+            flush=True,
+        )
 
 
 def mean_metric(rows: list[dict[str, Any]], key: str) -> float | None:
@@ -146,7 +197,7 @@ def mean_metric(rows: list[dict[str, Any]], key: str) -> float | None:
 
 def group_metric_stats(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, float | int | None]]:
     out: dict[str, dict[str, float | int | None]] = {}
-    for group in ("preserved", "flipped", "all"):
+    for group in ("preserved", "flipped", "unknown", "all"):
         group_rows = rows if group == "all" else [row for row in rows if row.get("group") == group]
         vals = [float(row[key]) for row in group_rows if key in row]
         if not vals:
@@ -163,7 +214,7 @@ def group_metric_stats(rows: list[dict[str, Any]], key: str) -> dict[str, dict[s
 
 def print_action_recovery_by_group(stats: dict[str, dict[str, float | int | None]]) -> None:
     print("action_recovery_vs_pert by group:", flush=True)
-    for group in ("preserved", "flipped", "all"):
+    for group in ("preserved", "flipped", "unknown", "all"):
         row = stats[group]
         mean = row["mean"]
         frac = row["frac_positive"]
@@ -200,6 +251,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--env-resolution", type=int, default=256)
     p.add_argument("--flip-images", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--condition-pass-only", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--hook-mode", default="pre", choices=["pre", "forward"],
+                   help="'pre' = inject at block entry; 'forward' = inject at block exit")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--fail-fast", action="store_true")
     return p
@@ -207,6 +260,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    # cosmos_utils.resolve_path treats unresolved "../..." paths as Hugging
+    # Face identifiers, so normalize local CLI paths before constructing cfg.
+    args.checkpoint = pathlib.Path(args.checkpoint).expanduser().resolve()
+    args.policy_dir = pathlib.Path(args.policy_dir).expanduser().resolve()
+    args.summary = pathlib.Path(args.summary).expanduser().resolve()
+    args.output_dir = pathlib.Path(args.output_dir).expanduser().resolve()
+
     device = torch.device(args.device)
     corrector, ckpt = load_corrector(args.checkpoint, device)
     target_cfg = ckpt["target"]
@@ -215,9 +275,8 @@ def main() -> None:
     target_rms = float(target_cfg["target_rms"])
     print(f"checkpoint target: layer={layer} target={target} rms={target_rms:.6g}", flush=True)
 
-    args.policy_dir = pathlib.Path(args.policy_dir)
     phase2.patch_checkpoint_db(args.policy_dir)
-    summary_path = pathlib.Path(args.summary)
+    summary_path = args.summary
     summary, pairs = phase2.discover_pairs(summary_path, set(args.conditions or []), set(args.groups))
     if args.max_pairs:
         pairs = pairs[: args.max_pairs]
@@ -231,7 +290,7 @@ def main() -> None:
     phase2.load_extra_t5(args.t5_extra_embeddings)
     stats = phase2.load_dataset_stats(cfg.dataset_stats_path)
     model, _ = phase2.get_model(cfg)
-    out_root = pathlib.Path(args.output_dir).expanduser()
+    out_root = args.output_dir
     out_root.mkdir(parents=True, exist_ok=True)
 
     rows, errors = [], []
@@ -249,6 +308,10 @@ def main() -> None:
             pert_action, pert_h = forward_capture_target(
                 cfg=cfg, model=model, stats=stats, obs=pert_obs,
                 instruction=pert_instr, seed=args.seed, layer=layer, target=target, args=args)
+            with torch.no_grad():
+                direct_pred_delta = (
+                    corrector(pert_h.to(device).float()).cpu() * target_rms
+                )
             corrected_action, _before, corrected_h = forward_corrected(
                 cfg=cfg, model=model, stats=stats, corrector=corrector, obs=pert_obs,
                 instruction=pert_instr, seed=args.seed, layer=layer, target=target,
@@ -260,6 +323,7 @@ def main() -> None:
                 clean_h=clean_h,
                 pert_h=pert_h,
                 corrected_h=corrected_h,
+                direct_pred_delta=direct_pred_delta,
             )
             rows.append({
                 "condition": cond,
@@ -282,6 +346,16 @@ def main() -> None:
     append_jsonl(out_root / "results.jsonl", rows)
     action_recovery_by_group = group_metric_stats(rows, "action_recovery_vs_pert")
     print_action_recovery_by_group(action_recovery_by_group)
+    print_delta_alignment(rows)
+    delta_alignment = {}
+    for prefix in ("direct_delta", "effective_delta"):
+        delta_alignment[prefix] = {
+            "mean_cosine": mean_metric(rows, f"{prefix}_cosine"),
+            "mean_angle_deg": mean_metric(rows, f"{prefix}_angle_deg"),
+            "mean_norm_ratio": mean_metric(rows, f"{prefix}_norm_ratio"),
+            "mean_optimal_alpha": mean_metric(rows, f"{prefix}_optimal_alpha"),
+            "mean_oracle_scaled_recovery": mean_metric(rows, f"{prefix}_oracle_scaled_recovery"),
+        }
     summary_payload = {
         "checkpoint": str(args.checkpoint),
         "summary": str(summary_path),
@@ -295,6 +369,7 @@ def main() -> None:
         "num_errors": len(errors),
         "mean_action_recovery_vs_pert": mean_metric(rows, "action_recovery_vs_pert"),
         "action_recovery_by_group": action_recovery_by_group,
+        "delta_alignment": delta_alignment,
         "mean_hidden_recovery_vs_pert": mean_metric(rows, "hidden_recovery_vs_pert"),
         "mean_corrected_action_rel_error": mean_metric(rows, "corrected_action_rel_error"),
         "errors": errors,

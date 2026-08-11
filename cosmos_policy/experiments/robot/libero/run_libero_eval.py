@@ -266,6 +266,8 @@ class PolicyEvalConfig:
     #################################################################################################################
     data_collection: bool = False                                        # If True, save episodic data for later offline use
     jpeg_compress: bool = True                                           # If True, apply JPEG compression to images before saving
+    save_vector_db: bool = False                                         # If True, save VAE latents + proprio at action chunk boundaries
+    vector_db_output_dir: str = ""                                       # Output directory for vector DB .pt files
 
     # fmt: on
 
@@ -351,6 +353,7 @@ def run_episode(
     resize_size,
     initial_state=None,
     log_file=None,
+    episode_index=0,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -373,6 +376,7 @@ def run_episode(
             "recommend executing the full action chunk."
         )
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
+    offset_gripper_action = None
 
     # Setup
     t = 0
@@ -390,6 +394,7 @@ def run_episode(
         wrist_images_list = []
         proprio_list = []
         actions_list = []
+    vector_db_chunks: list = []  # always created; populated only when save_vector_db=True
 
     # Run episode
     success = False
@@ -418,10 +423,66 @@ def run_episode(
                 wrist_images_list.append(observation["wrist_image"])
                 proprio_list.append(observation["proprio"])
 
+            # During an external offset, pause policy inference and execute only
+            # the injected motion. Discard pre-offset actions so the policy is
+            # requeried from the post-offset observation when control resumes.
+            _offset_start_t = int(os.environ.get("COSMOS_OFFSET_START_T", "-1"))
+            _offset_duration = int(os.environ.get("COSMOS_OFFSET_DURATION", "16"))
+            if _offset_duration <= 0:
+                raise ValueError("COSMOS_OFFSET_DURATION must be positive")
+            _offset_active = _offset_start_t >= 0 and _offset_start_t <= t < _offset_start_t + _offset_duration
+            if _offset_active:
+                _amount_str = os.environ.get("COSMOS_OFFSET_AMOUNT", "0.01,0,0,0,0,0")
+                _total = np.asarray([float(x.strip()) for x in _amount_str.split(",")], dtype=np.float32)
+                if _total.shape != (6,):
+                    raise ValueError("COSMOS_OFFSET_AMOUNT must contain exactly 6 comma-separated values")
+                _per_step = _total / _offset_duration
+
+                if t == _offset_start_t:
+                    offset_gripper_action = (
+                        float(action_queue[0][6]) if action_queue else float(get_libero_dummy_action(cfg.model_family)[6])
+                    )
+                    action_queue.clear()
+                    log_message(
+                        f"[OFFSET] t={t}: pausing policy and injecting {_total.tolist()} "
+                        f"over {_offset_duration} steps (per_step={_per_step.tolist()})",
+                        log_file,
+                    )
+
+                action = np.zeros(7, dtype=np.float32)
+                action[:6] = _per_step
+                action[6] = offset_gripper_action
+                print(f"t: {t}\t external action: {action}")
+
+                if cfg.data_collection:
+                    actions_list.append(action.copy())
+
+                obs, reward, done, info = env.step(action.tolist())
+                if done:
+                    success = True
+                    break
+                t += 1
+                continue
+
+            if _offset_start_t >= 0 and t == _offset_start_t + _offset_duration:
+                offset_gripper_action = None
+                log_message(f"[OFFSET] t={t}: finished; resuming policy from current observation", log_file)
+
             # If action queue is empty, requery model
             if len(action_queue) == 0:
                 best_actions = None
                 best_future_predictions = None
+
+                # Capture VAE latent during the first model forward pass in get_action()
+                if cfg.save_vector_db:
+                    _captured_latent = []
+                    _orig_gdac = model.get_data_and_condition
+                    def _hook_gdac(data_batch):
+                        raw, latent, cond = _orig_gdac(data_batch)
+                        if not _captured_latent:
+                            _captured_latent.append(latent.detach().cpu())
+                        return raw, latent, cond
+                    model.get_data_and_condition = _hook_gdac
 
                 # Query model multiple times if value functions are available
                 num_queries = cfg.num_queries_best_of_n
@@ -597,6 +658,17 @@ def run_episode(
                 future_image_predictions_list.append(best_future_predictions)
                 log_message(f"t={t}: Selected seed {best_seed} with value = {best_value_predictions:.4f}", log_file)
 
+                if cfg.save_vector_db:
+                    model.get_data_and_condition = _orig_gdac
+                    if _captured_latent:
+                        vae_video = _captured_latent[0][0, :, [2, 3], :, :].half()
+                        vector_db_chunks.append({
+                            "vae_video": vae_video,
+                            "proprio": torch.from_numpy(observation["proprio"].copy()).half(),
+                            "action_chunk": torch.from_numpy(np.array(best_actions)).half(),
+                            "step_index": t,
+                        })
+
             # Get action from queue
             action = action_queue.popleft()
 
@@ -645,6 +717,17 @@ def run_episode(
                 collected_data["future_wrist_images"] = np.stack(future_wrist_images, axis=0)
     else:
         collected_data = None
+
+    if cfg.save_vector_db and vector_db_chunks:
+        out_dir = cfg.vector_db_output_dir or os.path.join(cfg.local_log_dir, "vector_db")
+        os.makedirs(out_dir, exist_ok=True)
+        init_offset = int(os.environ.get("COSMOS_INIT_STATE_OFFSET", "0"))
+        state_idx = init_offset + episode_index
+        ts = int(time.time() * 1_000_000)
+        fname = f"chunks_state{state_idx}_ep{episode_index + 1}_{ts}.pt"
+        for chunk in vector_db_chunks:
+            chunk["init_state_index"] = state_idx
+        torch.save(vector_db_chunks, os.path.join(out_dir, fname))
 
     return success, replay_images, replay_wrist_images, future_image_predictions_list, collected_data
 
@@ -708,6 +791,7 @@ def run_task(
             resize_size,
             initial_state,
             log_file,
+            episode_index=episode_idx,
         )
 
         # Update counters
@@ -717,14 +801,15 @@ def run_task(
             task_successes += 1
             total_successes += 1
 
-        # Save replay video
-        save_rollout_video(
-            replay_images,
-            total_episodes,
-            success=success,
-            task_description=task_description,
-            log_file=log_file,
-        )
+        # Save replay video (skip if COSMOS_SKIP_PLAIN_ROLLOUT is set)
+        if os.environ.get("COSMOS_SKIP_PLAIN_ROLLOUT", "").lower() not in ("1", "true", "yes"):
+            save_rollout_video(
+                replay_images,
+                total_episodes,
+                success=success,
+                task_description=task_description,
+                log_file=log_file,
+            )
 
         # Save replay video with future image predictions included
         future_primary_image_predictions = None

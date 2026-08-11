@@ -9,12 +9,22 @@ import torch
 
 
 class CosmosLayerCaptureIntervener:
-    """Capture and optionally shift selected latent slots at DiT block entry.
+    """Capture and optionally shift selected latent slots at DiT block entry/exit.
 
     Cosmos Policy uses latent sequence layout [B, T, H, W, D].  For LIBERO,
     the current video slots are T=[2, 3] and the action chunk slot is T=4.
-    This helper captures ``x[:, target_indices]`` before selected blocks and
-    can add a token-wise direction at one block entrance.
+
+    Supports two hook modes:
+
+    ``"pre"`` (default) — ``register_forward_pre_hook``: intercepts the block
+    *input* before self-attention / cross-attention / MLP.  The shift is
+    applied to the action slot at block entry, but the block's own
+    self-attention may later mix uncorrected video tokens back in.
+
+    ``"forward"`` — ``register_forward_hook``: intercepts the block *output*
+    after all attention and MLP.  The shift is applied directly to the block
+    result, and only the final linear + unpatchify layers remain — those have
+    no cross-token interaction, so the correction is preserved to the output.
 
     In CFG sampling, the network is called twice per denoising step:
     conditioned pass first, then unconditioned pass.  By default this helper
@@ -60,6 +70,21 @@ class CosmosLayerCaptureIntervener:
         self.pass_idx = -1
         self.captured = {}
         self.after = {}
+
+    def reset_direct(
+        self,
+        *,
+        capture_layers: Optional[set[int] | list[int] | tuple[int, ...]] = None,
+        intervene_layer: Optional[int] = None,
+        direction: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Configure a direct, already-scaled direction injection."""
+        self.reset(
+            capture_layers=capture_layers,
+            intervene_layer=intervene_layer,
+            direction=direction,
+            alpha=1.0 if direction is not None else 0.0,
+        )
 
     def _active_pass(self) -> bool:
         if not self.condition_pass_only:
@@ -123,15 +148,70 @@ class CosmosLayerCaptureIntervener:
 
         return hook
 
+    def forward_hook(self, layer_idx: int):
+        """Return a ``register_forward_hook`` callback for one block.
+
+        Captures and/or intervenes on the block *output* (after self-attention,
+        cross-attention, and MLP).  The remaining ``final_layer`` is a
+        per-position linear projection — no further token mixing occurs.
+        """
+
+        layer_idx = int(layer_idx)
+
+        def hook(_module, _inputs, output):
+            if layer_idx == 0:
+                self.pass_idx += 1
+
+            if not self._active_pass():
+                return None
+
+            hidden = output[0] if isinstance(output, tuple) else output
+            if not torch.is_tensor(hidden) or hidden.ndim != 5:
+                return None
+
+            target_hidden = self._target_hidden(hidden)
+            if layer_idx in self.capture_layers:
+                self.captured[layer_idx] = target_hidden.detach().float().cpu().clone()
+
+            if self.intervene_layer is None or layer_idx != self.intervene_layer:
+                return None
+
+            if float(self.alpha) == 0.0:
+                self.after[layer_idx] = target_hidden.detach().float().cpu().clone()
+                return None
+
+            direction = self._direction_for(target_hidden)
+            shifted = hidden.clone()
+            shifted[:, self.target_indices] = target_hidden + self.alpha * direction
+            self.after[layer_idx] = (
+                shifted[:, self.target_indices].detach().float().cpu().clone()
+            )
+
+            if isinstance(output, tuple):
+                return (shifted,) + output[1:]
+            return shifted
+
+        return hook
+
 
 class layer_shift_context(AbstractContextManager):
-    """Temporarily register DiT block-entry hooks."""
+    """Temporarily register DiT block-entry or block-exit hooks.
+
+    Parameters
+    ----------
+    hook_mode : ``"pre"`` (default) or ``"forward"``
+        ``"pre"`` uses ``register_forward_pre_hook`` — captures/intervenes at
+        block entry.  ``"forward"`` uses ``register_forward_hook`` —
+        captures/intervenes at block exit.
+    """
 
     def __init__(
         self,
         model_or_blocks,
         intervener: CosmosLayerCaptureIntervener,
         hook_layers: list[int] | tuple[int, ...] | set[int],
+        *,
+        hook_mode: str = "pre",
     ) -> None:
         if hasattr(model_or_blocks, "net") and hasattr(model_or_blocks.net, "blocks"):
             self._blocks = model_or_blocks.net.blocks
@@ -141,15 +221,23 @@ class layer_shift_context(AbstractContextManager):
         self._hook_layers = sorted({0, *[int(layer) for layer in hook_layers]})
         self._intervener = intervener
         self._handles: list = []
+        if hook_mode not in ("pre", "forward"):
+            raise ValueError(f"hook_mode must be 'pre' or 'forward', got {hook_mode!r}")
+        self._hook_mode = hook_mode
 
     def __enter__(self):
         num_blocks = len(self._blocks)
         for layer_idx in self._hook_layers:
             if layer_idx < 0 or layer_idx >= num_blocks:
                 raise ValueError(f"layer {layer_idx} out of range [0, {num_blocks - 1}]")
-            handle = self._blocks[layer_idx].register_forward_pre_hook(
-                self._intervener.pre_forward_hook(layer_idx)
-            )
+            if self._hook_mode == "forward":
+                handle = self._blocks[layer_idx].register_forward_hook(
+                    self._intervener.forward_hook(layer_idx)
+                )
+            else:
+                handle = self._blocks[layer_idx].register_forward_pre_hook(
+                    self._intervener.pre_forward_hook(layer_idx)
+                )
             self._handles.append(handle)
         return self
 

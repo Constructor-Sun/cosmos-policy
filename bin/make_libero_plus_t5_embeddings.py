@@ -5,6 +5,12 @@ import argparse
 import pathlib
 import pickle
 import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+LIBERO_PLUS = ROOT.parent / "LIBERO-plus"
+if LIBERO_PLUS.is_dir():
+    sys.path.insert(0, str(LIBERO_PLUS))
 
 import torch
 from libero.libero import benchmark
@@ -43,6 +49,11 @@ def parse_args():
         help="Exact LIBERO-plus task name. Can be passed multiple times. Defaults to the smoke-test language_5 task.",
     )
     parser.add_argument(
+        "--prompt",
+        action="append",
+        help="Arbitrary prompt to encode. May be repeated; bypasses LIBERO task lookup.",
+    )
+    parser.add_argument(
         "--all-language-variants",
         action="store_true",
         help="Generate embeddings for every language perturbation variant matching --base-task.",
@@ -50,7 +61,7 @@ def parse_args():
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--model-path",
-        default="/data3/liu/exp/counterfactual/checkpoints/t5-11b",
+        default="/data1/liu/exp/counterfactual/checkpoints/t5-11b",
         help="Local google-t5/t5-11b directory or HuggingFace model name.",
     )
     parser.add_argument(
@@ -144,18 +155,15 @@ def main():
         raise ValueError("--task-name cannot be combined with --all-base-tasks")
 
     suites = MAIN_SUITES if args.all_main_suites else [args.suite]
-    all_languages = []
-    for suite_name in suites:
-        suite_languages = get_task_languages(
-            suite_name,
-            args.category,
-            args.base_task,
-            args.task_name,
-            args.all_language_variants,
-            args.all_base_tasks,
-        )
-        print(f"{suite_name}: {len(suite_languages)} language instruction(s)")
-        all_languages.extend(suite_languages)
+    all_languages = list(args.prompt or [])
+    if not args.prompt:
+        for suite_name in suites:
+            suite_languages = get_task_languages(
+                suite_name, args.category, args.base_task, args.task_name,
+                args.all_language_variants, args.all_base_tasks,
+            )
+            print(f"{suite_name}: {len(suite_languages)} language instruction(s)")
+            all_languages.extend(suite_languages)
 
     languages = list(dict.fromkeys(all_languages))
 

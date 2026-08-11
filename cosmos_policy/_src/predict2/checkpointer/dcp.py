@@ -490,9 +490,17 @@ class DistributedCheckpointer(AbstractCheckpointer):
             checkpoint_path = os.path.join(self.load_dirname, latest_checkpoint_file)
             resume_keys.extend(self.KEYS_TO_SAVE)
         else:
-            if self.load_path and not str(self.load_path).endswith(".pt"):
+            if self.load_path:
                 # 2. Load the module weights specified by config_checkpoint.path.
                 checkpoint_path = self.load_path
+                if str(checkpoint_path).endswith(".pt"):
+                    if self.load_training_state:
+                        raise ValueError(
+                            "Consolidated .pt checkpoints contain model weights only; "
+                            "set checkpoint.load_training_state=false."
+                        )
+                    resume_keys.append("model")
+                    return set(resume_keys), checkpoint_path
                 if self.load_s3_backend_key:
                     checkpoint_path = f"s3://{self.config_checkpoint.load_from_object_store.bucket}/{checkpoint_path}"
                     if not re.search(r"/checkpoints/iter_\d{9}/?$", checkpoint_path):
@@ -543,57 +551,89 @@ class DistributedCheckpointer(AbstractCheckpointer):
 
         if checkpoint_path is not None:
             self._check_checkpoint_exists(checkpoint_path)
-            for key in resume_keys:
-                load_planner = DefaultLoadPlanner(allow_partial_load=True)
-                if hasattr(load_planner, "set_partial_channel_weight"):
-                    log.critical(f"set_partial_channel_weight: {self.config_checkpoint.dcp_allow_mismatched_size}")
-                    load_planner.set_partial_channel_weight(self.config_checkpoint.dcp_allow_mismatched_size)
-                cur_key_ckpt_full_path = os.path.join(checkpoint_path, key)
-                log.critical(f"Start loading checkpoint from {checkpoint_path}")
-                storage_reader = self.get_storage_reader(cur_key_ckpt_full_path)
-                torch.distributed.barrier()
-                log.critical(f"starting {cur_key_ckpt_full_path}", rank0_only=False)
-                if key == "model":
-                    log.info("- Loading the model...")
-                    _model_wrapper = ModelWrapper(model)
-                    _state_dict = _model_wrapper.state_dict()
-
-                    dcp_load_state_dict(_state_dict, storage_reader, load_planner)
-                    _model_wrapper.load_state_dict(_state_dict)
-                elif key == "optim":
-                    log.info("- Loading the optimizer...")
-                    _optim_wrapper = OptimizerWrapper(model, optimizer)
-                    _state_dict = _optim_wrapper.state_dict()
-                    dcp.load(
-                        _state_dict,
-                        storage_reader=storage_reader,
-                        planner=load_planner,
+            if str(checkpoint_path).endswith(".pt"):
+                if distributed.is_rank0():
+                    log.info(f"Loading consolidated model checkpoint on rank 0: {checkpoint_path}")
+                    checkpoint_state_dict = torch.load(
+                        checkpoint_path,
+                        map_location="cpu",
+                        weights_only=True,
+                        mmap=True,
                     )
-                    _optim_wrapper.load_state_dict(_state_dict)
-                elif key == "scheduler":
-                    log.info("- Loading the scheduler...")
-                    _state_dict = scheduler.state_dict()
-                    dcp.load(
-                        _state_dict,
-                        storage_reader=storage_reader,
-                        planner=load_planner,
-                    )
-                    scheduler.load_state_dict(_state_dict)
-                elif key == "trainer":
-                    log.info("- Loading the trainer...")
-                    _state_dict = {
-                        "grad_scaler": grad_scaler.state_dict(),
-                        "iteration": iteration,
-                    }
-                    dcp.load(
-                        _state_dict,
-                        storage_reader=storage_reader,
-                        planner=load_planner,
-                    )
-                    grad_scaler.load_state_dict(_state_dict["grad_scaler"])
-                    iteration = _state_dict["iteration"]
+                    if "model" in checkpoint_state_dict:
+                        checkpoint_state_dict = checkpoint_state_dict["model"]
+                    elif "state_dict" in checkpoint_state_dict:
+                        checkpoint_state_dict = checkpoint_state_dict["state_dict"]
                 else:
-                    raise ValueError(f"Invalid key: {key}. not support to resume.")
+                    checkpoint_state_dict = {}
+
+                log.info("Broadcasting consolidated model checkpoint from rank 0")
+                set_model_state_dict(
+                    model,
+                    model_state_dict=checkpoint_state_dict,
+                    options=StateDictOptions(
+                        full_state_dict=True,
+                        broadcast_from_rank0=True,
+                        strict=False,
+                    ),
+                )
+                if distributed.is_rank0():
+                    log.info("Consolidated checkpoint state was applied successfully")
+                del checkpoint_state_dict
+                log.critical(f"Loaded consolidated model checkpoint from {checkpoint_path}")
+                _state_dict = {}
+            else:
+                for key in resume_keys:
+                    load_planner = DefaultLoadPlanner(allow_partial_load=True)
+                    if hasattr(load_planner, "set_partial_channel_weight"):
+                        log.critical(f"set_partial_channel_weight: {self.config_checkpoint.dcp_allow_mismatched_size}")
+                        load_planner.set_partial_channel_weight(self.config_checkpoint.dcp_allow_mismatched_size)
+                    cur_key_ckpt_full_path = os.path.join(checkpoint_path, key)
+                    log.critical(f"Start loading checkpoint from {checkpoint_path}")
+                    storage_reader = self.get_storage_reader(cur_key_ckpt_full_path)
+                    torch.distributed.barrier()
+                    log.critical(f"starting {cur_key_ckpt_full_path}", rank0_only=False)
+                    if key == "model":
+                        log.info("- Loading the model...")
+                        _model_wrapper = ModelWrapper(model)
+                        _state_dict = _model_wrapper.state_dict()
+
+                        dcp_load_state_dict(_state_dict, storage_reader, load_planner)
+                        _model_wrapper.load_state_dict(_state_dict)
+                    elif key == "optim":
+                        log.info("- Loading the optimizer...")
+                        _optim_wrapper = OptimizerWrapper(model, optimizer)
+                        _state_dict = _optim_wrapper.state_dict()
+                        dcp.load(
+                            _state_dict,
+                            storage_reader=storage_reader,
+                            planner=load_planner,
+                        )
+                        _optim_wrapper.load_state_dict(_state_dict)
+                    elif key == "scheduler":
+                        log.info("- Loading the scheduler...")
+                        _state_dict = scheduler.state_dict()
+                        dcp.load(
+                            _state_dict,
+                            storage_reader=storage_reader,
+                            planner=load_planner,
+                        )
+                        scheduler.load_state_dict(_state_dict)
+                    elif key == "trainer":
+                        log.info("- Loading the trainer...")
+                        _state_dict = {
+                            "grad_scaler": grad_scaler.state_dict(),
+                            "iteration": iteration,
+                        }
+                        dcp.load(
+                            _state_dict,
+                            storage_reader=storage_reader,
+                            planner=load_planner,
+                        )
+                        grad_scaler.load_state_dict(_state_dict["grad_scaler"])
+                        iteration = _state_dict["iteration"]
+                    else:
+                        raise ValueError(f"Invalid key: {key}. not support to resume.")
             if self.callbacks is not None:
                 self.callbacks.on_load_checkpoint(model, state_dict=_state_dict)
             log.critical(f"Loaded checkpoint from {checkpoint_path} in iteration {iteration}")

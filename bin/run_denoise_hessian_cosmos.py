@@ -42,8 +42,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
 
-os.environ.setdefault("MUJOCO_GL", "osmesa")
-os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("PYTHONNOUSERSITE", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -78,6 +78,8 @@ preload_wand_imagemagick()
 
 import numpy as np
 import torch
+
+from hessian_shift_alignment import ritz_shift_alignment
 
 from cosmos_policy._src.imaginaire.functional.multi_step import is_multi_step_fn_supported
 from cosmos_policy._src.imaginaire.functional.runge_kutta import is_runge_kutta_fn_supported
@@ -160,6 +162,35 @@ DELTA_FIELDS = [
     "loss_clean",
     "loss_perturbed",
     "delta_loss",
+]
+
+ALIGNMENT_FIELDS = [
+    "condition",
+    "episode",
+    "group",
+    "anchor_branch",
+    "denoise_call_index",
+    "denoise_num_calls",
+    "sigma",
+    "site",
+    "layer",
+    "target_source",
+    "hvp_mode",
+    "fd_eps",
+    "lambda_max",
+    "hvp_dim",
+    "shift_l2",
+    "shift_rms",
+    "alignment_valid",
+    "alignment_k",
+    "abs_cos_top1",
+    "max_abs_cos_topk",
+    "alignment_energy_topk",
+    "alignment_rms_topk",
+    "random_energy_topk",
+    "abs_cosines_topk",
+    "action_error_from_final_latent",
+    "pert_action_mse_to_clean_final",
 ]
 
 
@@ -757,6 +788,14 @@ def l2_normalize(x: torch.Tensor) -> torch.Tensor:
     return x / (torch.linalg.vector_norm(x) + EPS)
 
 
+def captured_site_tensor(capture: CapturedCall, site: str, layer: int | None) -> torch.Tensor:
+    if site == "vae":
+        return capture.x_in
+    if layer is None or layer not in capture.hidden:
+        raise RuntimeError(f"Missing hidden capture for site={site} layer={layer} call={capture.call_index}")
+    return capture.hidden[layer]
+
+
 def hvp(loss_fn: Callable[[torch.Tensor], torch.Tensor], x0: torch.Tensor, vector: torch.Tensor) -> tuple[torch.Tensor, float]:
     x = x0.detach().clone().requires_grad_(True)
     loss = loss_fn(x)
@@ -800,7 +839,9 @@ def lanczos_extreme_eigs(
     seed: int,
     hvp_mode: str,
     fd_eps: float,
-) -> dict[str, float]:
+    shift: torch.Tensor | None = None,
+    alignment_top_k: int = 5,
+) -> dict[str, Any]:
     generator = torch.Generator(device=x0.device)
     generator.manual_seed(seed)
     q = torch.randn(x0.shape, device=x0.device, dtype=torch.float32, generator=generator)
@@ -850,11 +891,11 @@ def lanczos_extreme_eigs(
     for i, beta in enumerate(betas[: max(0, len(alphas) - 1)]):
         tri[i, i + 1] = beta
         tri[i + 1, i] = beta
-    eigs = torch.linalg.eigvalsh(tri)
+    eigs, tri_eigvecs = torch.linalg.eigh(tri)
     lambda_min = float(eigs[0])
     lambda_max = float(eigs[-1])
     lambda_abs = float(eigs[torch.argmax(torch.abs(eigs))])
-    return {
+    result = {
         "loss_value": last_loss,
         "lambda_min": lambda_min,
         "lambda_max": lambda_max,
@@ -864,6 +905,9 @@ def lanczos_extreme_eigs(
         "lanczos_iters": len(alphas),
         "hvp_dim": int(x0.numel()),
     }
+    if shift is not None:
+        result.update(ritz_shift_alignment(basis, tri_eigvecs, shift, alignment_top_k))
+    return result
 
 
 def action_from_latent(sample: torch.Tensor, data_batch: dict[str, Any], chunk_size: int) -> np.ndarray:
@@ -993,6 +1037,8 @@ def main() -> None:
         raise ValueError(f"--target-source {args.target_source} requires --loss-frames action")
     if args.hvp_mode == "finite_diff" and args.fd_eps <= 0:
         raise ValueError("--fd-eps must be positive for --hvp-mode finite_diff")
+    if args.alignment_top_k <= 0:
+        raise ValueError("--alignment-top-k must be positive")
     discover_pairs, first_observation, load_extra_t5, make_cfg, patch_checkpoint_db = load_phase2_helpers()
     start = time.time()
     args.policy_dir = pathlib.Path(args.policy_dir)
@@ -1034,6 +1080,7 @@ def main() -> None:
 
     out_root = pathlib.Path(args.output_dir)
     detail_rows: list[dict[str, Any]] = []
+    alignment_rows: list[dict[str, Any]] = []
     pair_records: list[dict[str, Any]] = []
 
     for pair_idx, pair in enumerate(pairs, 1):
@@ -1126,6 +1173,18 @@ def main() -> None:
                     continue
                 for site in sites:
                     layer = None if site == "vae" else layer_map[site]
+                    clean_capture = branch_results["clean"].captures.get(call_idx)
+                    pert_capture = branch_results["perturbed"].captures.get(call_idx)
+                    if clean_capture is None or pert_capture is None:
+                        continue
+                    clean_site = captured_site_tensor(clean_capture, site, layer)
+                    pert_site = captured_site_tensor(pert_capture, site, layer)
+                    if clean_site.shape != pert_site.shape:
+                        raise RuntimeError(
+                            f"Shift shape mismatch at call={call_idx} site={site}: "
+                            f"clean={tuple(clean_site.shape)} perturbed={tuple(pert_site.shape)}"
+                        )
+                    shift = pert_site - clean_site
                     print(f"  Hessian branch={branch_name} call={call_idx} site={site}", flush=True)
                     loss_fn, x0 = make_loss_fn(model, branch, capture, site, layer, target, stats, args)
                     spec = lanczos_extreme_eigs(
@@ -1135,6 +1194,8 @@ def main() -> None:
                         args.seed + call_idx + (layer or 0),
                         args.hvp_mode,
                         args.fd_eps,
+                        shift=shift,
+                        alignment_top_k=args.alignment_top_k,
                     )
                     detail_rows.append({
                         "condition": condition,
@@ -1162,12 +1223,36 @@ def main() -> None:
                         "instruction_mode": pert_ep.get("instruction_mode", "task"),
                         **spec,
                     })
+                    alignment_rows.append({
+                        "condition": condition,
+                        "episode": episode,
+                        "group": group,
+                        "anchor_branch": branch_name,
+                        "denoise_call_index": call_idx,
+                        "denoise_num_calls": args.num_denoising_steps,
+                        "sigma": capture.sigma,
+                        "site": site,
+                        "layer": "" if layer is None else layer,
+                        "target_source": args.target_source,
+                        "hvp_mode": args.hvp_mode,
+                        "fd_eps": args.fd_eps if args.hvp_mode == "finite_diff" else "",
+                        "lambda_max": spec["lambda_max"],
+                        "hvp_dim": spec["hvp_dim"],
+                        "action_error_from_final_latent": action_error,
+                        "pert_action_mse_to_clean_final": (
+                            float(np.mean((pert_action - clean_action) ** 2))
+                            if args.target_source == "clean_final_action"
+                            else ""
+                        ),
+                        **{field: spec[field] for field in ALIGNMENT_FIELDS if field in spec},
+                    })
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     gc.collect()
 
         write_csv(out_root / "denoise_hessian_detail.csv", DETAIL_FIELDS, detail_rows)
         write_csv(out_root / "denoise_hessian_delta.csv", DELTA_FIELDS, build_delta_rows(detail_rows))
+        write_csv(out_root / "hessian_shift_alignment.csv", ALIGNMENT_FIELDS, alignment_rows)
 
     summary_payload = {
         "summary": str(summary_path),
@@ -1200,6 +1285,7 @@ def main() -> None:
         ),
         "edm_loss_weights": bool(args.edm_loss_weights),
         "lanczos_iters": args.lanczos_iters,
+        "alignment_top_k": args.alignment_top_k,
         "hvp_mode": args.hvp_mode,
         "fd_eps": args.fd_eps if args.hvp_mode == "finite_diff" else "",
         "shared_noise": bool(args.shared_noise),
@@ -1210,8 +1296,10 @@ def main() -> None:
     (out_root / "summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
     write_csv(out_root / "denoise_hessian_detail.csv", DETAIL_FIELDS, detail_rows)
     write_csv(out_root / "denoise_hessian_delta.csv", DELTA_FIELDS, build_delta_rows(detail_rows))
+    write_csv(out_root / "hessian_shift_alignment.csv", ALIGNMENT_FIELDS, alignment_rows)
     print(f"Saved {out_root / 'denoise_hessian_detail.csv'}", flush=True)
     print(f"Saved {out_root / 'denoise_hessian_delta.csv'}", flush=True)
+    print(f"Saved {out_root / 'hessian_shift_alignment.csv'}", flush=True)
     print(f"Saved {out_root / 'summary.json'}", flush=True)
 
 
@@ -1236,6 +1324,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layers", nargs="+", default=["0", "mid", "last"])
     parser.add_argument("--sites", nargs="+", default=["vae", "0", "mid", "last"])
     parser.add_argument("--lanczos-iters", type=int, default=8)
+    parser.add_argument("--alignment-top-k", type=int, default=5)
     parser.add_argument("--hvp-mode", choices=["autograd", "finite_diff"], default="autograd")
     parser.add_argument("--fd-eps", type=float, default=1e-2)
     parser.add_argument(

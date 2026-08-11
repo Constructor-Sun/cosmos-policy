@@ -5,23 +5,36 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import contextlib
 import gc
+import io
 import json
 import logging
 import os
 import pathlib
 import pickle
 import re
+import site
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+LIBERO_PLUS = pathlib.Path(os.environ.get("LIBERO_PLUS_PATH", ROOT.parent / "LIBERO-plus"))
+if str(LIBERO_PLUS) not in sys.path:
+    sys.path.insert(0, str(LIBERO_PLUS))
+user_site = site.getusersitepackages()
+if user_site in sys.path:
+    sys.path.remove(user_site)
 
 import torch
 from libero.libero import benchmark, get_libero_path
 from libero.libero.benchmark import Task
 
+from phase8_correction_lib import DynamicCorrectionContext, load_corrector
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+
 CHECKPOINT_ROOT = (ROOT / "../../checkpoints").resolve()
 POLICY_DIR = CHECKPOINT_ROOT / "Cosmos-Policy-LIBERO-Predict2-2B"
 
@@ -66,7 +79,16 @@ class VariantLookup:
         if key not in self._cache:
             if suite_name not in self._benchmark_dict:
                 raise ValueError(f"Unknown LIBERO suite: {suite_name}")
-            self._cache[key] = self._benchmark_dict[suite_name](category_value=category)
+            suite_cls = self._benchmark_dict[suite_name]
+            # Some LIBERO-plus versions print thousands of task indices while
+            # constructing a suite; that output obscures rollout progress.
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    self._cache[key] = suite_cls(category_value=category)
+                except TypeError:
+                    # Versions that put all variants directly in the suite
+                    # task map do not expose category_value.
+                    self._cache[key] = suite_cls()
         return self._cache[key]
 
     def task_by_name(self, suite_name: str, category: str, task_name: str) -> tuple[int, Task]:
@@ -115,6 +137,9 @@ class VariantLookup:
 class EvalRuntime:
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self.correction_enabled = False
+        self.corrector = None
+        self.corrector_config: dict[str, Any] | None = None
         patch_checkpoint_db(args.policy_dir)
 
         from cosmos_policy.experiments.robot import cosmos_utils
@@ -151,6 +176,42 @@ class EvalRuntime:
             self.planning_model = None
         self.resize_size = run_libero_eval_mod.get_image_resize_size(cfg.model_family)
 
+        if args.corrector_checkpoint is not None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.corrector, checkpoint = load_corrector(args.corrector_checkpoint, device)
+            target = checkpoint["target"]
+            self.corrector_config = {
+                "checkpoint": str(args.corrector_checkpoint),
+                "layer": int(target["layer"]),
+                "target": str(target["target"]),
+                "target_rms": float(target["target_rms"]),
+                "alpha": float(args.correction_alpha),
+            }
+            original_get_action = run_libero_eval_mod.get_action
+
+            def get_action_with_optional_correction(cfg, model, *action_args, **action_kwargs):
+                if not self.correction_enabled:
+                    return original_get_action(cfg, model, *action_args, **action_kwargs)
+                with DynamicCorrectionContext(
+                    model,
+                    self.corrector,
+                    layer=self.corrector_config["layer"],
+                    target=self.corrector_config["target"],
+                    target_rms=self.corrector_config["target_rms"],
+                    alpha=self.corrector_config["alpha"],
+                    condition_pass_only=True,
+                ):
+                    return original_get_action(cfg, model, *action_args, **action_kwargs)
+
+            run_libero_eval_mod.get_action = get_action_with_optional_correction
+            print(
+                "Loaded rollout corrector: "
+                f"layer={self.corrector_config['layer']} "
+                f"target={self.corrector_config['target']} "
+                f"alpha={self.corrector_config['alpha']}",
+                flush=True,
+            )
+
     def run_single_task(
         self,
         *,
@@ -162,7 +223,10 @@ class EvalRuntime:
         log_dir: pathlib.Path,
         instruction_mode: str,
         base_language: str,
+        apply_correction: bool = False,
     ) -> tuple[float, list[dict[str, Any]], str]:
+        if apply_correction and self.corrector is None:
+            raise RuntimeError("corrected rollout requested without --corrector-checkpoint")
         cfg = make_cfg(self.args, suite_name, num_trials, run_id_note=run_id_note, local_log_dir=str(log_dir))
         self.mod.set_seed_everywhere(cfg.seed)
         T5_CONTEXT["instruction_mode"] = instruction_mode
@@ -178,6 +242,7 @@ class EvalRuntime:
             wandb_entity=cfg.wandb_entity,
             wandb_project=cfg.wandb_project,
         )
+        self.correction_enabled = apply_correction
         try:
             self.mod.log_message(f"Eval config: {cfg}", log_file)
             total_episodes, total_successes = self.mod.run_task(
@@ -202,6 +267,7 @@ class EvalRuntime:
                 log_file,
             )
         finally:
+            self.correction_enabled = False
             log_file.close()
             T5_CONTEXT["instruction_mode"] = "task"
             gc.collect()
@@ -463,6 +529,33 @@ def annotate_episodes(
     return annotated
 
 
+def rollout_recovery_metrics(
+    pert_episodes: list[dict[str, Any]],
+    corrected_episodes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    pert = {int(row["episode"]): bool(row["success"]) for row in pert_episodes}
+    corrected = {int(row["episode"]): bool(row["success"]) for row in corrected_episodes}
+    common = sorted(set(pert) & set(corrected))
+    failed = [ep for ep in common if not pert[ep]]
+    recovered = [ep for ep in failed if corrected[ep]]
+    preserved = [ep for ep in common if pert[ep]]
+    retained = [ep for ep in preserved if corrected[ep]]
+    harmed = [ep for ep in preserved if not corrected[ep]]
+    return {
+        "num_paired_episodes": len(common),
+        "num_pert_failures": len(failed),
+        "num_recovered": len(recovered),
+        "failure_recovery_rate": len(recovered) / len(failed) if failed else None,
+        "recovered_episodes": recovered,
+        "num_pert_successes": len(preserved),
+        "num_preserved_after_correction": len(retained),
+        "preservation_rate": len(retained) / len(preserved) if preserved else None,
+        "num_harmed": len(harmed),
+        "harm_rate": len(harmed) / len(preserved) if preserved else None,
+        "harmed_episodes": harmed,
+    }
+
+
 def read_base_tasks(suites: list[str], task_limit: int, only_tasks: set[tuple[str, str]]) -> list[BaseTaskSpec]:
     specs = []
     bddl_root = pathlib.Path(get_libero_path("bddl_files"))
@@ -478,7 +571,13 @@ def read_base_tasks(suites: list[str], task_limit: int, only_tasks: set[tuple[st
             name = pathlib.Path(line).stem
             if only_tasks and (suite, name) not in only_tasks:
                 continue
-            language = benchmark.grab_language_from_filename(suite, f"{name}.bddl")
+            filename = f"{name}.bddl"
+            try:
+                language = benchmark.grab_language_from_filename(suite, filename)
+            except TypeError:
+                # Compatibility with upstream LIBERO, whose helper does not
+                # take a suite argument.
+                language = benchmark.grab_language_from_filename(filename)
             suite_specs.append(BaseTaskSpec(suite=suite, name=name, language=language))
         if task_limit > 0:
             suite_specs = suite_specs[:task_limit]
@@ -540,41 +639,47 @@ def run_pair(
     )
 
     print(f"\n[{spec.suite}] {spec.name}", flush=True)
-    print(f"  clean: {spec.language}", flush=True)
+    if runtime.corrector is None:
+        print(f"  clean: {spec.language}", flush=True)
     print(f"  pert:  {pert_task.name}", flush=True)
     if used_variant_fallback:
         print(f"  note: preferred variant missing, selected nearest camera variant to {preferred_pert_task_name}", flush=True)
 
-    clean_rate, clean_episodes_raw, clean_log = runtime.run_single_task(
-        suite_name=spec.suite,
-        task=clean_task,
-        init_states=init_states,
-        num_trials=args.num_pairs,
-        run_id_note=f"paired-clean-{args.num_pairs}pair",
-        log_dir=log_dir,
-        instruction_mode="task",
-        base_language=spec.language,
-    )
-    clean_episodes = annotate_episodes(
-        clean_episodes_raw,
-        run_id=run_id,
-        seed=args.seed,
-        deterministic_reset=args.deterministic_reset,
-        deterministic_reset_seed=args.deterministic_reset_seed,
-        suite=spec.suite,
-        base_task=spec.name,
-        condition="clean",
-        category="clean",
-        task_id=None,
-        task_name=spec.name,
-        language=spec.language,
-        log_path=clean_log,
-        instruction_mode="task",
-    )
-    clean_dir = results_dir / "clean"
-    clean_dir.mkdir(parents=True, exist_ok=True)
-    clean_episodes_path = clean_dir / "episodes.json"
-    clean_episodes_path.write_text(json.dumps(clean_episodes, indent=2), encoding="utf-8")
+    clean_rate = None
+    clean_episodes = None
+    clean_log = None
+    clean_episodes_path = None
+    if runtime.corrector is None:
+        clean_rate, clean_episodes_raw, clean_log = runtime.run_single_task(
+            suite_name=spec.suite,
+            task=clean_task,
+            init_states=init_states,
+            num_trials=args.num_pairs,
+            run_id_note=f"paired-clean-{args.num_pairs}pair",
+            log_dir=log_dir,
+            instruction_mode="task",
+            base_language=spec.language,
+        )
+        clean_episodes = annotate_episodes(
+            clean_episodes_raw,
+            run_id=run_id,
+            seed=args.seed,
+            deterministic_reset=args.deterministic_reset,
+            deterministic_reset_seed=args.deterministic_reset_seed,
+            suite=spec.suite,
+            base_task=spec.name,
+            condition="clean",
+            category="clean",
+            task_id=None,
+            task_name=spec.name,
+            language=spec.language,
+            log_path=clean_log,
+            instruction_mode="task",
+        )
+        clean_dir = results_dir / "clean"
+        clean_dir.mkdir(parents=True, exist_ok=True)
+        clean_episodes_path = clean_dir / "episodes.json"
+        clean_episodes_path.write_text(json.dumps(clean_episodes, indent=2), encoding="utf-8")
 
     pert_rate, pert_episodes_raw, pert_log = runtime.run_single_task(
         suite_name=spec.suite,
@@ -607,16 +712,48 @@ def run_pair(
     pert_episodes_path = pert_dir / "episodes.json"
     pert_episodes_path.write_text(json.dumps(pert_episodes, indent=2), encoding="utf-8")
 
-    summary = {
-        "mode": "paired",
-        "run_id": run_id,
-        "suite": spec.suite,
-        "seed": args.seed,
-        "deterministic_reset": args.deterministic_reset,
-        "deterministic_reset_seed": args.deterministic_reset_seed,
-        "num_pairs": args.num_pairs,
-        "base_task": spec.name,
-        "conditions": [
+    corrected_rate = None
+    corrected_episodes = None
+    corrected_episodes_path = None
+    corrected_log = None
+    recovery = None
+    if runtime.corrector is not None:
+        corrected_rate, corrected_episodes_raw, corrected_log = runtime.run_single_task(
+            suite_name=spec.suite,
+            task=pert_task,
+            init_states=init_states,
+            num_trials=args.num_pairs,
+            run_id_note=f"paired-{args.condition}-corrected-{args.num_pairs}pair",
+            log_dir=log_dir,
+            instruction_mode=args.instruction_mode,
+            base_language=spec.language,
+            apply_correction=True,
+        )
+        corrected_episodes = annotate_episodes(
+            corrected_episodes_raw,
+            run_id=run_id,
+            seed=args.seed,
+            deterministic_reset=args.deterministic_reset,
+            deterministic_reset_seed=args.deterministic_reset_seed,
+            suite=spec.suite,
+            base_task=spec.name,
+            condition="corrected",
+            category=f"Corrected {args.category}",
+            task_id=pert_task_id,
+            task_name=pert_task.name,
+            language=pert_task.language,
+            log_path=corrected_log,
+            instruction_mode=args.instruction_mode,
+        )
+        corrected_dir = results_dir / "corrected"
+        corrected_dir.mkdir(parents=True, exist_ok=True)
+        corrected_episodes_path = corrected_dir / "episodes.json"
+        corrected_episodes_path.write_text(json.dumps(corrected_episodes, indent=2), encoding="utf-8")
+        recovery = rollout_recovery_metrics(pert_episodes, corrected_episodes)
+
+    condition_summaries = []
+    if clean_episodes is not None:
+        condition_summaries.append(
             {
                 "condition": "clean",
                 "task_name": spec.name,
@@ -627,34 +764,80 @@ def run_pair(
                 "num_trials": len(clean_episodes),
                 "log_path": clean_log,
                 "episodes_path": str(clean_episodes_path),
-            },
+            }
+        )
+    condition_summaries.append(
+        {
+            "condition": args.condition,
+            "task_name": pert_task.name,
+            "category": args.category,
+            "seed": args.seed,
+            "success_rate": pert_rate,
+            "successes": sum(1 for episode in pert_episodes if episode["success"]),
+            "num_trials": len(pert_episodes),
+            "log_path": pert_log,
+            "episodes_path": str(pert_episodes_path),
+            "instruction_mode": args.instruction_mode,
+        }
+    )
+    if corrected_episodes is not None:
+        condition_summaries.append(
             {
-                "condition": args.condition,
+                "condition": "corrected",
+                "source_condition": args.condition,
                 "task_name": pert_task.name,
-                "category": args.category,
+                "category": f"Corrected {args.category}",
                 "seed": args.seed,
-                "success_rate": pert_rate,
-                "successes": sum(1 for episode in pert_episodes if episode["success"]),
-                "num_trials": len(pert_episodes),
-                "log_path": pert_log,
-                "episodes_path": str(pert_episodes_path),
+                "success_rate": corrected_rate,
+                "successes": sum(1 for episode in corrected_episodes if episode["success"]),
+                "num_trials": len(corrected_episodes),
+                "log_path": corrected_log,
+                "episodes_path": str(corrected_episodes_path),
                 "instruction_mode": args.instruction_mode,
-            },
-        ],
+                "corrector": runtime.corrector_config,
+            }
+        )
+    summary = {
+        "mode": "perturbed_vs_corrected" if runtime.corrector is not None else "paired",
+        "run_id": run_id,
+        "suite": spec.suite,
+        "seed": args.seed,
+        "deterministic_reset": args.deterministic_reset,
+        "deterministic_reset_seed": args.deterministic_reset_seed,
+        "num_pairs": args.num_pairs,
+        "base_task": spec.name,
+        "conditions": condition_summaries,
+        "rollout_recovery": recovery,
         "preferred_pert_task": preferred_pert_task_name,
         "used_variant_fallback": used_variant_fallback,
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if clean_episodes is not None:
+        print(
+            f"  clean success: {condition_summaries[0]['successes']}/{condition_summaries[0]['num_trials']} "
+            f"({clean_rate:.3f})",
+            flush=True,
+        )
+    pert_summary = next(row for row in condition_summaries if row["condition"] == args.condition)
     print(
-        f"  clean success: {summary['conditions'][0]['successes']}/{summary['conditions'][0]['num_trials']} "
-        f"({clean_rate:.3f})",
-        flush=True,
-    )
-    print(
-        f"  pert success:  {summary['conditions'][1]['successes']}/{summary['conditions'][1]['num_trials']} "
+        f"  pert success:  {pert_summary['successes']}/{pert_summary['num_trials']} "
         f"({pert_rate:.3f})",
         flush=True,
     )
+    if corrected_episodes is not None:
+        corrected_summary = next(row for row in condition_summaries if row["condition"] == "corrected")
+        print(
+            f"  corrected success: {corrected_summary['successes']}/{corrected_summary['num_trials']} "
+            f"({corrected_rate:.3f})",
+            flush=True,
+        )
+        failure_recovery_rate = recovery["failure_recovery_rate"]
+        recovery_text = "n/a" if failure_recovery_rate is None else f"{failure_recovery_rate:.3f}"
+        print(
+            f"  failure recovery: {recovery['num_recovered']}/"
+            f"{recovery['num_pert_failures']} ({recovery_text})",
+            flush=True,
+        )
     print(f"  summary: {summary_path}", flush=True)
     return summary_path
 
@@ -703,6 +886,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--t5-extra-embeddings", type=pathlib.Path, default=None)
     parser.add_argument("--t5-fallback-to-base", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--corrector-checkpoint",
+        type=pathlib.Path,
+        default=None,
+        help="compare perturbed and corrected rollouts using this Phase 8 checkpoint; clean is skipped",
+    )
+    parser.add_argument("--correction-alpha", type=float, default=1.0)
     parser.add_argument("--fail-fast", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true", help="Validate task/variant selection without loading the model.")
     return parser
@@ -716,6 +906,10 @@ def main() -> None:
         args.t5_extra_embeddings = args.t5_extra_embeddings.expanduser().resolve()
         if not args.t5_extra_embeddings.exists():
             raise FileNotFoundError(f"Missing extra T5 embeddings: {args.t5_extra_embeddings}")
+    if args.corrector_checkpoint is not None:
+        args.corrector_checkpoint = args.corrector_checkpoint.expanduser().resolve()
+        if not args.corrector_checkpoint.is_file():
+            raise FileNotFoundError(f"Missing corrector checkpoint: {args.corrector_checkpoint}")
     args.output_root.mkdir(parents=True, exist_ok=True)
 
     only_tasks = parse_only_tasks(args.only_task)
@@ -727,7 +921,8 @@ def main() -> None:
     print("Phase 8 fast full rollout", flush=True)
     print(f"  suites: {', '.join(args.suites)}", flush=True)
     print(f"  base tasks: {len(specs)}", flush=True)
-    print(f"  clean+pert rollouts: {expected_rollouts}", flush=True)
+    rollout_modes = "pert+corrected" if args.corrector_checkpoint is not None else "clean+pert"
+    print(f"  {rollout_modes} rollouts: {expected_rollouts}", flush=True)
     print(f"  output: {args.output_root}", flush=True)
     print(f"  save videos: {args.save_videos}", flush=True)
 
@@ -784,6 +979,8 @@ def main() -> None:
         "seed": args.seed,
         "deterministic_reset": args.deterministic_reset,
         "deterministic_reset_seed": args.deterministic_reset_seed,
+        "corrector_checkpoint": str(args.corrector_checkpoint) if args.corrector_checkpoint else None,
+        "correction_alpha": args.correction_alpha if args.corrector_checkpoint else None,
         "base_tasks": len(specs),
         "expected_rollouts": expected_rollouts,
         "summary_count": len(summary_paths),

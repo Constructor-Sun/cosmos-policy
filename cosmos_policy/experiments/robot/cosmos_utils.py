@@ -45,7 +45,9 @@ from cosmos_policy.utils.utils import duplicate_array
 # Initialize important constants
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+# Use PyTorch's current CUDA device so callers can select a GPU with
+# torch.cuda.set_device() before loading the policy.
+DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 COSMOS_IMAGE_SIZE = 224  # Standard image size expected by Cosmos policies
 COSMOS_TEMPORAL_COMPRESSION_FACTOR = 4
 

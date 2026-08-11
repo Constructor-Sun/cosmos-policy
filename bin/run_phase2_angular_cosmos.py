@@ -7,8 +7,8 @@ import argparse, json, os, pathlib, pickle, site, sys, time
 from types import SimpleNamespace
 from typing import Any
 
-os.environ.setdefault("MUJOCO_GL", "osmesa")
-os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("PYTHONNOUSERSITE", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -130,8 +130,11 @@ def discover_pairs(summary_path: pathlib.Path, conditions: set[str], groups: set
         clean_path = source_root / "clean/episodes.json"
         if not clean_path.exists():
             clean_path = resolve_path(by_condition["clean"]["episodes_path"], summary_path.parent)
+        pert_path = resolve_path(info["episodes_path"], summary_path.parent)
+        if not clean_path.exists() or not pert_path.exists():
+            continue
         clean_eps = load_episodes(clean_path)
-        pert_eps = load_episodes(resolve_path(info["episodes_path"], summary_path.parent))
+        pert_eps = load_episodes(pert_path)
         for ep, clean in clean_eps.items():
             pert = pert_eps.get(ep)
             if pert is None:
@@ -144,6 +147,8 @@ def discover_pairs(summary_path: pathlib.Path, conditions: set[str], groups: set
 
 
 def pair_group(clean_success: bool, pert_success: bool) -> str:
+    if clean_success is None or pert_success is None:
+        return "unknown"
     if clean_success and pert_success:
         return "preserved"
     if clean_success and not pert_success:

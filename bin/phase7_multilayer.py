@@ -8,11 +8,13 @@ Core question:
 
 Measurement layers:
   - VAE output  (DiT input):  autograd Jacobian from Phase 5
-  - DiT layer 27 (before FinalLayer):  weight-matrix SVD from Phase 4
+  - DiT layer 27 (before FinalLayer):  strict local Jacobian through
+    FinalLayer's LayerNorm + AdaLN + Linear readout
 
 Method (per perturbation pair):
-  1. Run one denoising step at sigma=80 for clean and perturbed observations.
-  2. Capture VAE latent and L27 hidden states.
+  1. Run one denoising step at sigma=80 for clean and perturbed observations,
+     using the same denoising noise for both branches.
+  2. Capture VAE latent, L27 hidden states, and FinalLayer inputs.
   3. δh = perturbed − clean.
   4. containment = ‖Proj_{S_action} δh‖² / ‖δh‖².
   5. Compare against random baseline = k / D.
@@ -118,10 +120,14 @@ SLOT_FUTURE_PRIMARY = 7
 SLOT_VALUE = 8
 
 VAE_PRIMARY_TEMPORAL = [2, 3]   # temporal indices in VAE latent for primary image region
+L27_VIDEO_TEMPORALS = [SLOT_WRIST, SLOT_PRIMARY]
 L27_ACTION_TEMPORAL = 4          # temporal index in L27 for action slot
 L27_GRID_H = [0, 1]             # grid rows that contribute to action output
 L27_GRID_W = 14                 # all columns contribute
 L27_DIM = 2048                  # hidden dimension per grid position
+L27_SPATIAL = 14
+L27_ACTION_CHANNELS = [0, 16, 32, 48]
+L27_ACTION_SLOT_DIM = L27_SPATIAL * L27_SPATIAL * L27_DIM
 
 DEFAULT_TEXT = "put the black bowl in the bottom drawer of the cabinet and close it"
 
@@ -256,7 +262,7 @@ def get_obs(ep, flip=True):
 class DiTForward:
     """Run one denoising step at a given sigma, capture VAE latent and L27 state."""
 
-    def __init__(self, model, primary, wrist, *, sigma_val=80.0, text=None):
+    def __init__(self, model, primary, wrist, *, sigma_val=80.0, text=None, noise=None):
         self.model = model
         self.sigma_val = sigma_val
 
@@ -288,11 +294,20 @@ class DiTForward:
 
         raw_state, latent_state, condition = model.get_data_and_condition(data_batch)
         self.latent_state = latent_state
-        self.xt = latent_state + torch.randn_like(latent_state) * sigma_val
+        if noise is None:
+            self.noise = torch.randn_like(latent_state)
+        else:
+            if tuple(noise.shape) != tuple(latent_state.shape):
+                raise ValueError(f"noise shape {tuple(noise.shape)} != latent_state shape {tuple(latent_state.shape)}")
+            self.noise = noise.to(device=latent_state.device, dtype=latent_state.dtype)
+        self.xt = latent_state + self.noise * sigma_val
         self.condition = condition
 
         # Outputs populated by run()
         self.h_L27 = None
+        self.final_h = None
+        self.final_emb = None
+        self.final_adaln_lora = None
         self.vae_latent = None
         self.action = None
         self._handles = []
@@ -301,10 +316,19 @@ class DiTForward:
         x = out[0] if isinstance(out, tuple) else out
         self.h_L27 = x.detach().clone()
 
+    def _hook_final_pre(self, _m, inputs):
+        self.final_h = inputs[0].detach().clone()
+        self.final_emb = inputs[1].detach().clone()
+        if len(inputs) > 2 and inputs[2] is not None:
+            self.final_adaln_lora = inputs[2].detach().clone()
+        else:
+            self.final_adaln_lora = None
+
     def run(self):
         """Execute one denoising step and capture intermediates."""
         blocks = self.model.net.blocks
         self._handles.append(blocks[27].register_forward_hook(self._hook_L27))
+        self._handles.append(self.model.net.final_layer.register_forward_pre_hook(self._hook_final_pre))
         try:
             with torch.no_grad():
                 sigma_t = torch.full((1, 1), self.sigma_val, device=device, dtype=torch.float32)
@@ -323,24 +347,98 @@ class DiTForward:
 # Jacobian / projection utilities
 # ═══════════════════════════════════════════════════════════════════
 
-def l27_weight_jacobian(ckpt):
-    """Extract action-sensitive directions from FinalLayer weight matrix.
+def _layernorm_vjp_rows(h_vec, row_vecs, eps):
+    """Exact row-wise VJP through LayerNorm(elementwise_affine=False).
 
-    The FinalLayer maps h [B,1,14,14,2048] → action [112].
-    Only 28 grid positions (h∈{0,1}, w∈{0..13}) × 4 output channels
-    (0,16,32,48) contribute to the action output.
+    For y = LN(h), returns row_vecs @ ∂y/∂h without materializing the
+    2048×2048 LayerNorm Jacobian.
+    """
+    h = h_vec.astype(np.float64, copy=False)
+    rows = row_vecs.astype(np.float64, copy=False)
+    mu = float(np.mean(h))
+    centered = h - mu
+    std = float(np.sqrt(np.mean(centered ** 2) + eps))
+    y = centered / (std + 1e-12)
+    rows_mean = np.mean(rows, axis=1, keepdims=True)
+    rows_y_mean = np.mean(rows * y[None, :], axis=1, keepdims=True)
+    return ((rows - rows_mean - y[None, :] * rows_y_mean) / (std + 1e-12)).astype(np.float32)
+
+
+def _final_layer_scale(final_layer, emb, adaln_lora):
+    """Recompute FinalLayer AdaLN scale for the captured operating point."""
+    with torch.no_grad():
+        with torch.amp.autocast(
+            "cuda",
+            enabled=getattr(final_layer, "use_wan_fp32_strategy", False),
+            dtype=torch.float32,
+        ):
+            if final_layer.use_adaln_lora:
+                if adaln_lora is None:
+                    raise ValueError("FinalLayer uses AdaLN-LoRA but captured adaln_lora is None")
+                mod = final_layer.adaln_modulation(emb)
+                mod = mod + adaln_lora[:, :, : 2 * final_layer.hidden_size]
+            else:
+                mod = final_layer.adaln_modulation(emb)
+        _shift, scale = mod.chunk(2, dim=-1)
+    return scale
+
+
+def l27_strict_jacobian_basis(final_layer, h_final, emb, adaln_lora):
+    """Exact sparse Jacobian basis for action output w.r.t. L27 action slot.
+
+    The full Jacobian ∂a/∂h_L27 has non-zero rows only at temporal slot 4
+    and grid h∈{0,1}, w∈{0..13}. This function stores the exact non-zero
+    4×2048 blocks, including LayerNorm and AdaLN scale at the clean operating
+    point, then exposes their right singular vectors as sparse global basis
+    entries sorted by singular value.
 
     Returns:
-      Vt:  [r, 2048]  top right singular vectors (action-sensitive directions)
-      S:   [r]         singular values
-      r:   int         effective rank
+      dict with:
+        entries: sorted list of sparse right singular vectors
+        blocks:  [28, 4, 2048] exact non-zero Jacobian blocks
+        coords:  [28, 2] grid coordinates for blocks
     """
-    W = ckpt["net.final_layer.linear.weight"].float().numpy()   # [64, 2048]
-    action_ch = [0, 16, 32, 48]
-    W_action = W[action_ch]                                      # [4, 2048]
-    U, S, Vt = np.linalg.svd(W_action, full_matrices=False)
-    r = int(sum(S > S[0] * 1e-6))
-    return Vt[:r], S[:r], r
+    if h_final is None or emb is None:
+        raise ValueError("FinalLayer inputs were not captured")
+
+    W_action = final_layer.linear.weight.detach().float().cpu().numpy()[L27_ACTION_CHANNELS]
+    scale = _final_layer_scale(final_layer, emb, adaln_lora)
+    scale_t = scale[0, L27_ACTION_TEMPORAL].detach().float().cpu().numpy()
+    scaled_rows = W_action * (1.0 + scale_t)[None, :]
+
+    entries = []
+    blocks = []
+    coords = []
+    singular_values = []
+    eps = float(final_layer.layer_norm.eps)
+    h_np = h_final.detach().float().cpu().numpy()
+
+    for h in L27_GRID_H:
+        for w in range(L27_GRID_W):
+            h_vec = h_np[0, L27_ACTION_TEMPORAL, h, w, :]
+            J_block = _layernorm_vjp_rows(h_vec, scaled_rows, eps)  # [4, 2048]
+            _U, S, Vt = np.linalg.svd(J_block, full_matrices=False)
+            r = int(np.sum(S > (S[0] * 1e-6))) if S.size and S[0] > 0 else 0
+            for local_i in range(r):
+                entries.append({
+                    "h": h,
+                    "w": w,
+                    "local_i": local_i,
+                    "singular_value": float(S[local_i]),
+                    "v": Vt[local_i].astype(np.float32, copy=False),
+                })
+            blocks.append(J_block)
+            coords.append((h, w))
+            singular_values.append(S.astype(np.float32, copy=False))
+
+    entries.sort(key=lambda item: item["singular_value"], reverse=True)
+    return {
+        "entries": entries,
+        "blocks": np.stack(blocks, axis=0).astype(np.float32, copy=False),
+        "coords": np.asarray(coords, dtype=np.int16),
+        "singular_values": np.stack(singular_values, axis=0).astype(np.float32, copy=False),
+        "rank": len(entries),
+    }
 
 
 def project_VAE(delta_h_vae, Vt, k):
@@ -360,31 +458,44 @@ def project_VAE(delta_h_vae, Vt, k):
     return float(np.sum(coeffs ** 2)) / (float(np.sum(dh_flat ** 2)) + 1e-12)
 
 
-def project_L27(delta_h_L27, Vt_per_pos):
-    """Project L27-level δh onto action-sensitive directions.
+def project_L27_action(delta_h_L27, basis, k):
+    """Project L27 action-slot δh onto the strict global top-k Jacobian basis."""
+    dh = delta_h_L27.reshape(1, 9, L27_SPATIAL, L27_SPATIAL, L27_DIM)[0]
+    dh_action = dh[L27_ACTION_TEMPORAL]
+    total_sq = float(np.sum(dh_action ** 2))
+    proj_sq = 0.0
+    for entry in basis["entries"][:k]:
+        dh_hw = dh_action[entry["h"], entry["w"]]
+        coeff = float(np.dot(dh_hw, entry["v"]))
+        proj_sq += coeff * coeff
+    return proj_sq / (total_sq + 1e-12)
 
-    Only grid positions that feed into the action output are considered:
-    temporal index = 4 (action slot), h ∈ {0,1}, all w ∈ {0..13}.
 
-    The *total* δh norm is computed over all positions (full tensor);
-    the *projected* norm only over the contributing positions.
+def project_L27_video_readout_alignment(delta_h_L27, basis, k):
+    """Project L27 video-slot δh onto action readout directions as a diagnostic.
 
-    Args:
-      delta_h_L27: [1, 9, 14, 14, 2048] or broadcastable.
-      Vt_per_pos:  [r, 2048] — action-sensitive direction vectors per position.
-
-    Returns:
-      containment ∈ [0, 1].
+    This is not a strict ∂action/∂hidden_video Jacobian containment. At L27 the
+    FinalLayer reads the action slot only, so the true derivative from video
+    slots [2,3] to the immediate action output is exactly zero.
     """
     dh = delta_h_L27.reshape(9, 14, 14, L27_DIM)
-    total_sq = float(np.sum(dh ** 2))
+    dh_video = dh[L27_VIDEO_TEMPORALS]
+    total_sq = float(np.sum(dh_video ** 2))
     proj_sq = 0.0
-    for h in L27_GRID_H:
-        for w in range(L27_GRID_W):
-            dh_hw = dh[L27_ACTION_TEMPORAL, h, w]   # [2048]
-            coeffs = dh_hw @ Vt_per_pos.T             # [r]
-            proj_sq += float(np.sum(coeffs ** 2))
+    for entry in basis["entries"][:k]:
+        for temporal in L27_VIDEO_TEMPORALS:
+            dh_hw = dh[temporal, entry["h"], entry["w"]]
+            coeff = float(np.dot(dh_hw, entry["v"]))
+            proj_sq += coeff * coeff
     return proj_sq / (total_sq + 1e-12)
+
+
+def l27_space_norms(delta_h_L27):
+    dh = delta_h_L27.reshape(9, 14, 14, L27_DIM)
+    return {
+        "norm_L27_video": float(np.linalg.norm(dh[L27_VIDEO_TEMPORALS])),
+        "norm_L27_action": float(np.linalg.norm(dh[L27_ACTION_TEMPORAL])),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -398,6 +509,10 @@ def main():
     p.add_argument("--output-dir", default=str(ROOT / "experiments/phase7_multilayer"))
     p.add_argument("--sigma", type=float, default=80.0)
     p.add_argument("--max-pairs", type=int, default=0)
+    p.add_argument("--l27-k-list", type=int, nargs="+", default=[1, 3, 5, 10, 28, 56, 112],
+                   help="Global top-k strict L27 Jacobian directions to report")
+    p.add_argument("--save-l27-jacobian", action="store_true",
+                   help="Save compact exact non-zero L27 Jacobian blocks per pair")
     args = p.parse_args()
 
     out_dir = pathlib.Path(args.output_dir)
@@ -406,17 +521,12 @@ def main():
 
     # ── Load pre-computed Jacobians ─────────────────────────────
 
-    # L27: from FinalLayer weight SVD (Phase 4)
-    ckpt = torch.load(str(POLICY_DIR / "Cosmos-Policy-LIBERO-Predict2-2B.pt"),
-                      map_location="cpu", weights_only=False)
-    Vt_L27, S_L27, r_L27 = l27_weight_jacobian(ckpt)
-    print(f"L27 (weights): rank={r_L27}, S={S_L27.round(4)}")
-
     # VAE: from autograd Jacobian (Phase 5)
     vae_dir = ROOT / "experiments/phase5_jacobian_autograd"
     Vt_vae = np.load(vae_dir / "right_singular_vectors.npy")     # [112, 25088]
     S_vae = np.load(vae_dir / "singular_values.npy")
     print(f"VAE (autograd): rank={len(S_vae)}, top-5 S={S_vae[:5].round(4)}")
+    print("L27: strict local Jacobian through FinalLayer LayerNorm + AdaLN + Linear")
 
     # ── Load perturbation pairs ─────────────────────────────────
 
@@ -477,9 +587,12 @@ def main():
             else:
                 pp_img, pw_img = get_obs(pair["pert"], flip=True)
 
-            # Run denoising for both clean and perturbed
-            cap_c = DiTForward(model, cp_img, cw_img, sigma_val=args.sigma).run()
-            cap_p = DiTForward(model, pp_img, pw_img, sigma_val=args.sigma).run()
+            # Run denoising for both branches with shared denoising noise.
+            cap_c = DiTForward(model, cp_img, cw_img, sigma_val=args.sigma)
+            cap_c.run()
+            cap_p = DiTForward(model, pp_img, pw_img, sigma_val=args.sigma,
+                               noise=cap_c.noise.detach().clone())
+            cap_p.run()
 
             row = {"condition": cond, "episode": pair["pert"]["episode"],
                    "group": grp}
@@ -496,8 +609,39 @@ def main():
             # --- L27-level containment ---
             if cap_c.h_L27 is not None and cap_p.h_L27 is not None:
                 dh_L27 = (cap_p.h_L27 - cap_c.h_L27).float().cpu().numpy()
-                for k_vec in (1, 2, 3, 4):
-                    row[f"L27_k{k_vec}"] = project_L27(dh_L27, Vt_L27[:k_vec])
+                row.update(l27_space_norms(dh_L27))
+                basis_L27 = l27_strict_jacobian_basis(
+                    model.net.final_layer,
+                    cap_c.final_h,
+                    cap_c.final_emb,
+                    cap_c.final_adaln_lora,
+                )
+                row["L27_strict_rank"] = basis_L27["rank"]
+                row["L27_top_singular"] = (
+                    basis_L27["entries"][0]["singular_value"] if basis_L27["entries"] else 0.0
+                )
+                for k_vec in args.l27_k_list:
+                    kk = min(k_vec, basis_L27["rank"])
+                    row[f"L27_action_gk{k_vec}"] = project_L27_action(dh_L27, basis_L27, kk)
+                    row[f"L27_video_readout_gk{k_vec}"] = project_L27_video_readout_alignment(
+                        dh_L27, basis_L27, kk
+                    )
+                # Strictly, the immediate action output has zero Jacobian w.r.t.
+                # L27 video slots because FinalLayer reads temporal slot 4 only.
+                row["L27_video_strict_jacobian_containment"] = 0.0
+
+                if args.save_l27_jacobian:
+                    stem = f"{cond}_ep{pair['pert']['episode']}_{grp}".replace("/", "_")
+                    np.savez_compressed(
+                        out_dir / f"l27_strict_jacobian_{stem}.npz",
+                        coords=basis_L27["coords"],
+                        blocks=basis_L27["blocks"],
+                        singular_values=basis_L27["singular_values"],
+                        global_singular_values=np.asarray(
+                            [e["singular_value"] for e in basis_L27["entries"]],
+                            dtype=np.float32,
+                        ),
+                    )
 
             results.append(row)
 
@@ -516,22 +660,29 @@ def main():
     # ── Report ──────────────────────────────────────────────────
 
     K_VAE  = [("k1", 1), ("k3", 3), ("k5", 5), ("k10", 10)]
-    K_L27  = [("k1", 1), ("k2", 2), ("k3", 3), ("k4", 4)]
-    DIMS   = {"vae": 25088, "L27": 401408}
+    K_L27  = [(f"gk{k}", k) for k in args.l27_k_list]
+    DIMS   = {"vae": 25088}
 
-    for layer_name, key_prefix, k_list in [("VAE", "vae", K_VAE),
-                                            ("L27", "L27", K_L27)]:
+    for layer_name, key_prefix, k_list, random_dim in [
+        ("VAE", "vae", K_VAE, DIMS["vae"]),
+        ("L27 action slot strict-J", "L27_action", K_L27, L27_ACTION_SLOT_DIM),
+        ("L27 video slots readout-alignment", "L27_video_readout", K_L27, L27_ACTION_SLOT_DIM),
+    ]:
         print(f"\n{'='*70}")
         print(f"  {layer_name} — containment in action-sensitive subspace  (sigma={args.sigma})")
         print(f"{'='*70}")
+        if key_prefix == "L27_video_readout":
+            print("  Note: this is a geometry diagnostic, not ∂action/∂hidden_video; the strict L27 video Jacobian is zero.")
 
         for k_label, k_val in k_list:
-            k_col = f"{key_prefix}_{k_label}"
+            if key_prefix == "vae":
+                k_col = f"{key_prefix}_{k_label}"
+            else:
+                k_col = f"{key_prefix}_{k_label}"
             if not results or k_col not in results[0]:
                 continue
 
-            D = DIMS[key_prefix]
-            rnd = k_val / D
+            rnd = k_val / random_dim
             print(f"\n  --- {k_label}  (top {k_val}, random baseline: {rnd:.6f}) ---")
             print(f"  {'Condition':30s} {'Group':12s} {'N':>4s}  {'containment':>12s}  {'×random':>8s}")
             print(f"  {'-'*68}")
@@ -578,7 +729,10 @@ def main():
         "sigma": args.sigma,
         "n_pairs": len(results),
         "n_errors": len(errors),
-        "l27_rank": r_L27,
+        "l27_jacobian": "strict sparse local Jacobian through FinalLayer LayerNorm + AdaLN + Linear",
+        "l27_k_list": args.l27_k_list,
+        "l27_action_slot_dim": L27_ACTION_SLOT_DIM,
+        "l27_video_strict_jacobian": "zero: FinalLayer reads temporal action slot only",
         "vae_rank": len(S_vae),
     }, indent=2))
 
