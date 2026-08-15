@@ -10,40 +10,59 @@ SEED=${SEED:-7}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/run_libero_smoke_test.py}
 ROBOTINIT_GPU=${ROBOTINIT_GPU:-7}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_robotinit_single}
-COSMOS_ROLLOUT_SUBDIR=${COSMOS_ROLLOUT_SUBDIR:-08-06}
+COSMOS_ROLLOUT_SUBDIR=${COSMOS_ROLLOUT_SUBDIR:-08-12}
 
-# --- Action offset (patch, disabled by default) ---
-# AMOUNT = total 6-dim offset over the entire duration (not per-step):
-#   dx,dy,dz,droll,dpitch,dyaw  (m, m, m, rad, rad, rad)
-#   dx>0 = forward, dy>0 = left, dz>0 = up
-# DURATION = number of steps to spread the total offset across (default 16 = 1 chunk)
-# Set COSMOS_OFFSET_START_T to a non-negative timestep to enable.
-# Example: 1cm forward at t=160 over 1 chunk → START_T=160, AMOUNT="0.01,0,0,0,0,0", DURATION=16
-COSMOS_OFFSET_START_T=${COSMOS_OFFSET_START_T:-80}
-COSMOS_OFFSET_AMOUNT=${COSMOS_OFFSET_AMOUNT:-"-5,-4,1,0,0,-15"}
-COSMOS_OFFSET_DURATION=${COSMOS_OFFSET_DURATION:-16}
 # --- Data collection (save trajectory HDF5 for offline analysis) ---
 COSMOS_DATA_COLLECTION=${COSMOS_DATA_COLLECTION:-}
 # --- Vector DB (save VAE latents + proprio at action chunk boundaries) ---
 COSMOS_VECTOR_DB=${COSMOS_VECTOR_DB:-}
 COSMOS_VECTOR_DB_DIR=${COSMOS_VECTOR_DB_DIR:-}
+# --- Automatic online detection and correction (disabled by default) ---
+COSMOS_ONLINE_DETECTION=${COSMOS_ONLINE_DETECTION:-}
+COSMOS_TARGET_DEMOS=${COSMOS_TARGET_DEMOS:-5}
+# --- Score first-chunk deviation from early demo memory (score-only) ---
+COSMOS_EARLY_MANIFOLD_SCORE=${COSMOS_EARLY_MANIFOLD_SCORE:-1}
+# Set to 1 to inject after chunk 1 when score is below the threshold.
+COSMOS_EARLY_MANIFOLD_INJECT=${COSMOS_EARLY_MANIFOLD_INJECT:-0}
+COSMOS_EARLY_MANIFOLD_THRESHOLD=${COSMOS_EARLY_MANIFOLD_THRESHOLD:-0.1}
+# Early correction: cap each total 6D component at 28 and spread it over 2 chunks.
+COSMOS_EARLY_MANIFOLD_MAX_OFFSET=${COSMOS_EARLY_MANIFOLD_MAX_OFFSET:-15}
+COSMOS_EARLY_MANIFOLD_CORRECTION_CHUNKS=${COSMOS_EARLY_MANIFOLD_CORRECTION_CHUNKS:-1}
 # --- Init state offset (default 0 = first init state) ---
 # Episode N = init_state_index N-1. Set OFFSET=2 for episode 3.
 COSMOS_INIT_STATE_OFFSET=${COSMOS_INIT_STATE_OFFSET:-4}
 
-mkdir -p "$OUTPUT_ROOT/robotinit" "$OUTPUT_ROOT/tmp-robotinit"
+# --- Robot init state (default 274) ---
+ROBOTINIT_STATE=${ROBOTINIT_STATE:-274}
+
+if [ "$COSMOS_ONLINE_DETECTION" = "1" ]; then
+    RESULT_NAME=robotinit_online-auto
+    MODE_NAME=online-auto
+else
+    RESULT_NAME=robotinit
+    MODE_NAME=normal
+fi
+
+mkdir -p "$OUTPUT_ROOT/$RESULT_NAME" "$OUTPUT_ROOT/tmp-robotinit"
 
 cd "$REPO_ROOT"
 
+# Legacy manual-injection controls are deliberately unsupported.
+unset COSMOS_OFFSET_START_T COSMOS_OFFSET_AMOUNT COSMOS_OFFSET_DURATION COSMOS_ONLINE_INJECT
+
 COSMOS_ROLLOUT_SUBDIR="$COSMOS_ROLLOUT_SUBDIR" \
 COSMOS_SKIP_PLAIN_ROLLOUT=1 \
-COSMOS_OFFSET_START_T="$COSMOS_OFFSET_START_T" \
-COSMOS_OFFSET_AMOUNT="$COSMOS_OFFSET_AMOUNT" \
-COSMOS_OFFSET_DURATION="$COSMOS_OFFSET_DURATION" \
 COSMOS_INIT_STATE_OFFSET="$COSMOS_INIT_STATE_OFFSET" \
 SMOKE_DATA_COLLECTION="$COSMOS_DATA_COLLECTION" \
 COSMOS_VECTOR_DB="$COSMOS_VECTOR_DB" \
 COSMOS_VECTOR_DB_DIR="$COSMOS_VECTOR_DB_DIR" \
+COSMOS_ONLINE_DETECTION="$COSMOS_ONLINE_DETECTION" \
+COSMOS_TARGET_DEMOS="$COSMOS_TARGET_DEMOS" \
+COSMOS_EARLY_MANIFOLD_SCORE="$COSMOS_EARLY_MANIFOLD_SCORE" \
+COSMOS_EARLY_MANIFOLD_INJECT="$COSMOS_EARLY_MANIFOLD_INJECT" \
+COSMOS_EARLY_MANIFOLD_THRESHOLD="$COSMOS_EARLY_MANIFOLD_THRESHOLD" \
+COSMOS_EARLY_MANIFOLD_MAX_OFFSET="$COSMOS_EARLY_MANIFOLD_MAX_OFFSET" \
+COSMOS_EARLY_MANIFOLD_CORRECTION_CHUNKS="$COSMOS_EARLY_MANIFOLD_CORRECTION_CHUNKS" \
 TMPDIR="$OUTPUT_ROOT/tmp-robotinit" \
 SMOKE_PYTHON_SCRIPT="$SMOKE_PYTHON_SCRIPT" \
 GPU_ID="$ROBOTINIT_GPU" \
@@ -54,10 +73,10 @@ SMOKE_PAIR_BASE_TASK="$TASK" \
 SMOKE_PAIR_CLEAN_LANGUAGE="$LANGUAGE" \
 SMOKE_PAIR_PERT_NAME=robot_initial_states \
 SMOKE_PAIR_PERT_CATEGORY="Robot Initial States" \
-SMOKE_PAIR_PERT_TASK="${TASK}_view_0_0_100_0_0_initstate_274" \
+SMOKE_PAIR_PERT_TASK="${TASK}_view_0_0_100_0_0_initstate_${ROBOTINIT_STATE}" \
 SMOKE_NUM_PAIRS="$NUM_CASES" \
 SMOKE_SEED="$SEED" \
-SMOKE_RESULTS_DIR="$OUTPUT_ROOT/robotinit" \
-SMOKE_RUN_ID="robotinit_single_gpu${ROBOTINIT_GPU}" \
+SMOKE_RESULTS_DIR="$OUTPUT_ROOT/$RESULT_NAME" \
+SMOKE_RUN_ID="robotinit_single_${MODE_NAME}_gpu${ROBOTINIT_GPU}" \
 sh ./run_libero_smoke_test.sh
 # echo "Robotinit single case evaluation complete: $OUTPUT_ROOT"

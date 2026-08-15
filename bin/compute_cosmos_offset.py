@@ -5,14 +5,12 @@ The LIBERO rollout HDF5 proprio layout used by this repository is:
 
     [gripper_qpos(2), eef_position_xyz(3), eef_quaternion_xyzw(4)]
 
-Translations are expressed in the world / robot-base frame. Rotations are
-expressed as world-frame xyz Euler increments. This matches robosuite's OSC
-controller, which updates its position goal as ``current_position + delta``.
+Translations are expressed as vectors in the world / robot-base frame.
+Rotations are world-frame rotation vectors, matching robosuite's OSC input.
 
 The source episode's following action chunk is used to estimate world-frame
-action-to-displacement scales. By default, the script keeps only the largest
-translation axis among world x/y and the largest rotation axis among world
-roll/yaw, then prints a COSMOS_OFFSET_AMOUNT ready for a rollout.
+action-to-displacement scales. Rotation actions are composed as rotations in
+time order; translation actions remain additive vectors.
 
 Example:
 
@@ -33,11 +31,11 @@ import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-
 POSITION_SLICE = slice(2, 5)
 QUATERNION_SLICE = slice(5, 9)
 TRANSLATION_NAMES = ("x", "y", "z")
-ROTATION_NAMES = ("roll", "pitch", "yaw")
+ROTATION_NAMES = ("x", "y", "z")
+OSC_ROTATION_SCALE_RAD = 0.5
 
 
 @dataclass(frozen=True)
@@ -114,8 +112,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rotation-axes",
-        default="roll,yaw",
-        help="Eligible world rotation axes, comma-separated (default: roll,yaw)",
+        default="x,z",
+        help="Eligible world rotation-vector axes, comma-separated (default: x,z)",
     )
     parser.add_argument(
         "--precision",
@@ -200,10 +198,17 @@ def calibrate(
 
     source_position, source_rotation = pose_at(episode, source_t)
     end_position, end_rotation = pose_at(episode, end_t)
-    action_sum = episode.actions[source_t:end_t, :6].sum(axis=0)
+    action_window = episode.actions[source_t:end_t, :6]
+    action_sum = action_window.sum(axis=0)
+    rotation_matrix = np.eye(3)
+    for rotation_action in action_window[:, 3:6]:
+        rotation_matrix = (
+            Rotation.from_rotvec(OSC_ROTATION_SCALE_RAD * rotation_action).as_matrix() @ rotation_matrix
+        )
+    action_sum[3:6] = Rotation.from_matrix(rotation_matrix).as_rotvec() / OSC_ROTATION_SCALE_RAD
 
     position_delta_world = end_position - source_position
-    rotation_delta_world = (end_rotation * source_rotation.inv()).as_euler("xyz")
+    rotation_delta_world = (end_rotation * source_rotation.inv()).as_rotvec()
 
     small_action_axes = np.flatnonzero(np.abs(action_sum) < 1e-8)
     if small_action_axes.size:
@@ -237,7 +242,7 @@ def compute_offset(
     target_position, target_rotation = pose_at(target, target_t)
     position_delta_world = target_position - source_position
     position_delta_local = source_rotation.inv().apply(position_delta_world)
-    rotation_delta_world = (target_rotation * source_rotation.inv()).as_euler("xyz")
+    rotation_delta_world = (target_rotation * source_rotation.inv()).as_rotvec()
 
     translation_axis = choose_largest(position_delta_world, translation_axes)
     rotation_axis = choose_largest(rotation_delta_world, rotation_axes)
@@ -322,7 +327,7 @@ def main() -> None:
         raise SystemExit(f"error: {error}") from error
 
     if not args.shell_only:
-        source_rpy = source_rotation.as_euler("xyz")
+        source_rotvec = source_rotation.as_rotvec()
         print(f"Source HDF5: {args.source_hdf5}")
         print(f"Target HDF5: {args.target_hdf5}")
         print(f"Source HDF5 t: {args.source_t}")
@@ -331,7 +336,7 @@ def main() -> None:
             f"(HDF5 t + {args.rollout_wait_steps} unrecorded wait steps)"
         )
         print(f"Source EE xyz (world): {array_text(source_position)}")
-        print(f"Source EE rpy (world rad): {array_text(source_rpy)}")
+        print(f"Source EE rotvec (world rad): {array_text(source_rotvec)}")
         print()
         print(
             f"Calibration window: [{args.source_t}:{args.source_t + args.calibration_steps}] "
@@ -343,7 +348,7 @@ def main() -> None:
             f"{array_text(calibration.position_delta_world)}"
         )
         print(
-            "Observed rotation delta (world xyz rad): "
+            "Observed rotation-vector delta (world xyz rad): "
             f"{array_text(calibration.rotation_delta_world)}"
         )
         print(f"Position scale (world m/action): {array_text(calibration.position_scale)}")
@@ -368,7 +373,7 @@ def main() -> None:
             print(f"Target t: {target_t}")
             print(f"Position delta (world m): {array_text(position_delta_world)}")
             print(f"Position delta (source-local m, diagnostic): {array_text(position_delta_local)}")
-            print(f"Rotation delta (world xyz rad): {array_text(rotation_delta_world)}")
+            print(f"Rotation-vector delta (world xyz rad): {array_text(rotation_delta_world)}")
             print(
                 "Selected axes: "
                 f"world {TRANSLATION_NAMES[translation_axis]}, "

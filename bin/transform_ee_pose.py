@@ -3,8 +3,8 @@
 Compute the relative 6D transform between two end-effector poses, expressed in
 both world frame and the end-effector's local frame at the source timestep.
 
-The local-frame result is what you would use to reason about COSMOS_OFFSET_AMOUNT
--- it tells you the delta [dx, dy, dz, droll, dpitch, dyaw] needed in action
+The world-frame result is what you would use to reason about COSMOS_OFFSET_AMOUNT
+-- it tells you the delta [dx, dy, dz, drx, dry, drz] needed in action
 space, assuming a perfect 1:1 controller (which the OSC controller is NOT; see
 note at the bottom).
 
@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-import sys
 
 import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation
+
+OSC_ROTATION_SCALE_RAD = 0.5
 
 
 def load_pose(hdf5_path: pathlib.Path, t: int) -> tuple[np.ndarray, Rotation]:
@@ -32,8 +33,8 @@ def load_pose(hdf5_path: pathlib.Path, t: int) -> tuple[np.ndarray, Rotation]:
         proprio = f["proprio"][:]                 # (T, 9)
         if t < 0 or t >= proprio.shape[0]:
             raise IndexError(f"t={t} out of range [0, {proprio.shape[0] - 1}]")
-        pos = proprio[t, :3].copy()               # world-frame xyz
-        quat_xyzw = proprio[t, 3:7].copy()        # scipy format: x,y,z,w
+        pos = proprio[t, 2:5].copy()               # world-frame xyz
+        quat_xyzw = proprio[t, 5:9].copy()         # scipy format: x,y,z,w
     return pos, Rotation.from_quat(quat_xyzw)
 
 
@@ -53,12 +54,12 @@ def main() -> None:
     print(f"Source: {args.ep1.name}")
     print(f"  t={args.t1}")
     print(f"  pos (world xyz):     {p_src.round(4).tolist()}")
-    print(f"  rpy  (world xyz, °): {np.rad2deg(R_src.as_euler('xyz')).round(2).tolist()}")
+    print(f"  rotvec (world xyz, °): {np.rad2deg(R_src.as_rotvec()).round(2).tolist()}")
     print()
     print(f"Target: {args.ep2.name}")
     print(f"  t={args.t2}")
     print(f"  pos (world xyz):     {p_tgt.round(4).tolist()}")
-    print(f"  rpy  (world xyz, °): {np.rad2deg(R_tgt.as_euler('xyz')).round(2).tolist()}")
+    print(f"  rotvec (world xyz, °): {np.rad2deg(R_tgt.as_rotvec()).round(2).tolist()}")
 
     # ── 1. Relative transform in WORLD frame ────────────────────────
     dp_world = p_tgt - p_src                           # position delta
@@ -68,7 +69,7 @@ def main() -> None:
     print("─" * 72)
     print("1. WORLD-frame relative transform (A → B)")
     print(f"   Δpos   = {dp_world.round(4).tolist()} m")
-    print(f"   Δrpy   = {np.rad2deg(dR_world.as_euler('xyz')).round(2).tolist()}°")
+    print(f"   Δrotvec = {np.rad2deg(dR_world.as_rotvec()).round(2).tolist()}°")
 
     # ── 2. Relative transform in END-EFFECTOR LOCAL frame at A ──────
     # R_src columns = local axes expressed in world:
@@ -88,21 +89,18 @@ def main() -> None:
     print(f"     z (up):      {R_mat[:, 2].round(3).tolist()}")
     print()
     print(f"   Δpos_local [前后, 左右, 上下] = {dp_local.round(4).tolist()} m")
-    print(f"   Δrpy_local                  = {np.rad2deg(dR_local.as_euler('xyz')).round(2).tolist()}°")
+    print(f"   Δrotvec_local               = {np.rad2deg(dR_local.as_rotvec()).round(2).tolist()}°")
 
     # ── 3. Theoretical COSMOS_OFFSET_AMOUNT ─────────────────────────
-    # Position:  local frame delta (what you want the end-effector to do)
-    # Rotation:  world-frame delta euler (OSC controller interprets
-    #             rotation actions as world-frame increments)
+    # Position:  additive world-frame translation vector
+    # Rotation:  world-frame rotation vector used by the OSC controller
     print()
     print("─" * 72)
-    print("3. Theoretical COSMOS_OFFSET_AMOUNT (world Δrot convention)")
-    print(f"   dx     = {dp_local[0]:+.4f}   # local forward")
-    print(f"   dy     = {dp_local[1]:+.4f}   # local left")
-    print(f"   dz     = {dp_local[2]:+.4f}   # local up")
-    print(f"   droll  = {dR_world.as_euler('xyz')[0]:+.4f}   # world-frame delta roll (rad)")
-    print(f"   dpitch = {dR_world.as_euler('xyz')[1]:+.4f}   # world-frame delta pitch (rad)")
-    print(f"   dyaw   = {dR_world.as_euler('xyz')[2]:+.4f}   # world-frame delta yaw (rad)")
+    print("3. Theoretical COSMOS_OFFSET_AMOUNT (world-frame convention)")
+    for name, value in zip(("dx", "dy", "dz"), dp_world):
+        print(f"   {name:3s} = {value:+.4f}   # world translation (m)")
+    for name, value in zip(("drx", "dry", "drz"), dR_world.as_rotvec()):
+        print(f"   {name:3s} = {value:+.4f}   # world rotation vector (rad)")
 
     # ── 4. Verification ─────────────────────────────────────────────
     p_check = p_src + dp_world
@@ -121,27 +119,34 @@ def main() -> None:
         proprio = f["proprio"][:]
 
     if args.t1 + 16 < proprio.shape[0]:
-        act16 = actions[args.t1:args.t1 + 16, :6].sum(axis=0)
-        dp16 = proprio[args.t1 + 16, :3] - proprio[args.t1, :3]
-        R16_s = Rotation.from_quat(proprio[args.t1, 3:7])
-        R16_e = Rotation.from_quat(proprio[args.t1 + 16, 3:7])
+        action_window = actions[args.t1:args.t1 + 16, :6]
+        act16 = action_window.sum(axis=0)
+        rotation_matrix = np.eye(3)
+        for rotation_action in action_window[:, 3:6]:
+            rotation_matrix = (
+                Rotation.from_rotvec(OSC_ROTATION_SCALE_RAD * rotation_action).as_matrix() @ rotation_matrix
+            )
+        act16[3:6] = Rotation.from_matrix(rotation_matrix).as_rotvec() / OSC_ROTATION_SCALE_RAD
+        dp16 = proprio[args.t1 + 16, 2:5] - proprio[args.t1, 2:5]
+        R16_s = Rotation.from_quat(proprio[args.t1, 5:9])
+        R16_e = Rotation.from_quat(proprio[args.t1 + 16, 5:9])
         dr16 = R16_e * R16_s.inv()
 
         print()
         print("─" * 72)
         print("5. Action→displacement calibration at source t1 (16-step window)")
-        print(f"   Action sum [dx,dy,dz,dr,dp,dy] = {act16.round(2).tolist()}")
+        print(f"   Action total [dx,dy,dz,drx,dry,drz] = {act16.round(2).tolist()}")
         print(f"   Actual Δpos                     = {dp16.round(4).tolist()} m")
-        print(f"   Actual Δrpy                     = {np.rad2deg(dr16.as_euler('xyz')).round(2).tolist()}°")
+        print(f"   Actual Δrotvec                  = {np.rad2deg(dr16.as_rotvec()).round(2).tolist()}°")
 
         pos_scale = dp16 / (act16[:3] + 1e-8)
-        rot_scale = dr16.as_euler('xyz') / (act16[3:6] + 1e-8)
+        rot_scale = dr16.as_rotvec() / (act16[3:6] + 1e-8)
         print(f"   Pos scale (m / action unit):  {pos_scale.round(6).tolist()}")
         print(f"   Rot scale (rad / action unit): {rot_scale.round(6).tolist()}")
 
         # Calibrated estimate
         calibrated_dpos = dp_world / pos_scale
-        calibrated_drot = dR_world.as_euler('xyz') / rot_scale
+        calibrated_drot = dR_world.as_rotvec() / rot_scale
         print()
         print(f"   → Calibrated COSMOS_OFFSET (pos) = {calibrated_dpos.round(1).tolist()}")
         print(f"   → Calibrated COSMOS_OFFSET (rot) = {calibrated_drot.round(1).tolist()}")

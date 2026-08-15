@@ -68,6 +68,69 @@ class Detection:
     details: dict
 
 
+def score_early_manifold(
+    actions: np.ndarray,
+    chunk_size: int,
+    current_delta: np.ndarray,
+    memory_deltas: np.ndarray,
+    memory_chunk_indices: np.ndarray,
+) -> dict | None:
+    """Score the first completed action chunk against early demo memory."""
+    if len(actions) != chunk_size:
+        return None
+
+    current = np.asarray(current_delta, dtype=np.float32).reshape(-1)
+    memory = np.asarray(memory_deltas, dtype=np.float32)
+    chunk_indices = np.asarray(memory_chunk_indices, dtype=np.int64)
+    if memory.ndim != 2 or memory.shape[1] != current.size:
+        raise ValueError("current and memory VAE deltas have incompatible shapes")
+    if chunk_indices.shape != (len(memory),):
+        raise ValueError("memory chunk indices do not align with memory deltas")
+
+    candidates = np.flatnonzero(chunk_indices == 1)
+    current_norm = np.linalg.norm(current)
+    if candidates.size == 0 or current_norm <= 1e-8:
+        return None
+
+    candidate_deltas = memory[candidates]
+    denominators = np.linalg.norm(candidate_deltas, axis=1) * current_norm
+    valid = denominators > 1e-8
+    if not np.any(valid):
+        return None
+
+    similarities = np.full(candidates.size, -np.inf, dtype=np.float32)
+    similarities[valid] = candidate_deltas[valid] @ current / denominators[valid]
+    winner_position = int(np.argmax(similarities))
+    winner = int(candidates[winner_position])
+    return {
+        "best_similarity": float(similarities[winner_position]),
+        "best_memory_index": winner,
+        "best_chunk_index": int(chunk_indices[winner]),
+        "candidate_count": int(candidates.size),
+    }
+
+
+def detect_early_manifold_deviation(
+    actions: np.ndarray,
+    chunk_size: int,
+    current_delta: np.ndarray,
+    memory_deltas: np.ndarray,
+    memory_chunk_indices: np.ndarray,
+    similarity_threshold: float = 0.1,
+) -> Detection | None:
+    """Trigger once when the first action chunk falls outside early memory."""
+    score = score_early_manifold(
+        actions, chunk_size, current_delta, memory_deltas, memory_chunk_indices
+    )
+    if score is None or score["best_similarity"] >= similarity_threshold:
+        return None
+    return Detection(
+        t_star=chunk_size,
+        trigger_type="early_manifold_deviation",
+        details={**score, "similarity_threshold": float(similarity_threshold)},
+    )
+
+
 def load_chunk_size(config_path: Path) -> int:
     """Read the model action horizon from ``config.json``."""
     with config_path.open(encoding="utf-8") as fh:
@@ -281,20 +344,6 @@ def detect_intervention(
 
     if not detections:
         return None
-
-    if (
-        stagnation is not None
-        and empty_grasp is not None
-        and abs(stagnation.t_star - empty_grasp.t_star) <= chunk_size
-    ):
-        return Detection(
-            t_star=min(stagnation.t_star, empty_grasp.t_star),
-            trigger_type="both",
-            details={
-                "stagnation": stagnation.details,
-                "double_empty_grasp": empty_grasp.details,
-            },
-        )
 
     return min(detections, key=lambda item: item.t_star)
 

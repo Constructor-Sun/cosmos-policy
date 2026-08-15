@@ -109,11 +109,13 @@ Usage examples:
 import json
 import logging
 import os
+import sys
 import time
 import traceback
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 import draccus
@@ -152,6 +154,18 @@ from cosmos_policy.experiments.robot.robot_utils import (
     setup_logging,
 )
 from cosmos_policy.utils.utils import jpeg_encode_image, set_seed_everywhere
+from scipy.spatial.transform import Rotation
+
+# Import detection from bin/
+_BIN = str(Path(__file__).resolve().parents[4] / "bin")
+if _BIN not in sys.path:
+    sys.path.insert(0, _BIN)
+from detect_intervention_point import (
+    Thresholds,
+    detect_early_manifold_deviation,
+    detect_intervention,
+    score_early_manifold,
+)
 
 # Cosmos Policy latent sequence indices
 # 0: blank, 1: curr proprio, 2: curr wrist img, 3: curr primary img, 4: action, 5: future proprio, 6: future wrist img, 7: future primary img, 8: value
@@ -342,6 +356,51 @@ def prepare_observation(obs, resize_size, flip_images: bool = False):
     return observation  # Return processed observation
 
 
+def _load_target_demos(task_desc, demos_dir, num_demos):
+    """Preload K target demos with each delta's action-chunk index."""
+    # Strip perturb suffix (e.g. "view 0 0 100 0 0 initstate 274") if present
+    import re as _re
+    base_desc = _re.sub(r'\s+view\s+\d+.*$', '', task_desc).strip()
+    du = base_desc.replace(" ", "_")
+    fps = [f for f in Path(demos_dir).glob("chunks_*.pt")
+           if du in f.name[len("chunks_"):f.name.index("_demo_")]]
+    if not fps:
+        return None
+    dv, pr, sc, ci = [], [], [], []
+    for fp in sorted(fps)[:num_demos]:
+        chunks = torch.load(fp, weights_only=False)
+        chunks.sort(key=lambda c: c["step_index"])
+        v0 = chunks[0]["vae_video"].float().flatten()
+        for i, c in enumerate(chunks):
+            delta_vae = c["vae_video"].float().flatten() - v0
+            if torch.linalg.vector_norm(delta_vae) <= 1e-8:
+                continue
+            dv.append(delta_vae)
+            ci.append(i)
+            pr.append(c["proprio"].float())
+            if i + 1 < len(chunks):
+                p0, p1 = chunks[i]["proprio"].float(), chunks[i + 1]["proprio"].float()
+                a = c["action_chunk"].float()
+                pd_ = p1[2:5] - p0[2:5]
+                asp = a[:, :3].sum(dim=0)
+                r0 = Rotation.from_quat(p0[5:9].numpy())
+                rd = (Rotation.from_quat(p1[5:9].numpy()) * r0.inv()).as_rotvec()
+                rm = np.eye(3)
+                for ra in a[:, 3:6].numpy():
+                    rm = Rotation.from_rotvec(0.5 * ra).as_matrix() @ rm
+                asr = Rotation.from_matrix(rm).as_rotvec() / 0.5
+                s = np.zeros(6, dtype=np.float32)
+                for j in range(3):
+                    s[j] = float(pd_[j] / asp[j]) if abs(float(asp[j])) > 1e-8 else 1.0
+                    s[3 + j] = float(rd[j] / asr[j]) if abs(float(asr[j])) > 1e-8 else 1.0
+            else:
+                s = np.ones(6, dtype=np.float32)
+            sc.append(torch.from_numpy(s))
+    if not dv:
+        return None
+    return torch.stack(dv), torch.stack(pr), torch.stack(sc), torch.tensor(ci)
+
+
 def run_episode(
     cfg: PolicyEvalConfig,
     env,
@@ -377,6 +436,49 @@ def run_episode(
         )
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
     offset_gripper_action = None
+
+    # Automatic online detection/correction setup
+    _online = os.environ.get("COSMOS_ONLINE_DETECTION", "").lower() in ("1", "true", "yes")
+    _early_score = os.environ.get("COSMOS_EARLY_MANIFOLD_SCORE", "").lower() in ("1", "true", "yes")
+    _early_inject = os.environ.get("COSMOS_EARLY_MANIFOLD_INJECT", "").lower() in ("1", "true", "yes")
+    _early_threshold = float(os.environ.get("COSMOS_EARLY_MANIFOLD_THRESHOLD", "0.1"))
+    _early_max_offset = float(os.environ.get("COSMOS_EARLY_MANIFOLD_MAX_OFFSET", "28"))
+    _early_correction_chunks = int(os.environ.get("COSMOS_EARLY_MANIFOLD_CORRECTION_CHUNKS", "2"))
+    if not np.isfinite(_early_max_offset) or _early_max_offset <= 0:
+        raise ValueError("COSMOS_EARLY_MANIFOLD_MAX_OFFSET must be a positive finite number")
+    if _early_correction_chunks <= 0:
+        raise ValueError("COSMOS_EARLY_MANIFOLD_CORRECTION_CHUNKS must be positive")
+    _need_memory = _online or _early_score or _early_inject
+    if _need_memory:
+        _demo_dir = os.environ.get(
+            "COSMOS_TARGET_DEMOS_DIR",
+            str(Path(__file__).resolve().parents[4] / "vector_db_demos"),
+        )
+        _nd = int(os.environ.get("COSMOS_TARGET_DEMOS") or "5")
+        if _nd <= 0:
+            raise ValueError("COSMOS_TARGET_DEMOS must be positive")
+        _mem = _load_target_demos(task_description, _demo_dir, _nd)
+        if _mem is None:
+            raise FileNotFoundError(
+                f"No valid target demos found for task {task_description!r} in {_demo_dir}"
+            )
+        _vae_init = None
+        _online_prop = []
+        _online_act = []
+        log_message(
+            f"[MEMORY] Loaded {_mem[0].shape[0]} demo chunks for task {task_description!r}",
+            log_file,
+        )
+    else:
+        _mem = None
+    _early_done = False
+    _online_done = False
+    _correction_kind = None
+    _correction_per_step = None
+    _correction_steps_remaining = 0
+    _online_debug = _online  # log first detection check per episode
+    if _online:
+        _online_th = Thresholds()
 
     # Setup
     t = 0
@@ -423,50 +525,48 @@ def run_episode(
                 wrist_images_list.append(observation["wrist_image"])
                 proprio_list.append(observation["proprio"])
 
-            # During an external offset, pause policy inference and execute only
-            # the injected motion. Discard pre-offset actions so the policy is
-            # requeried from the post-offset observation when control resumes.
-            _offset_start_t = int(os.environ.get("COSMOS_OFFSET_START_T", "-1"))
-            _offset_duration = int(os.environ.get("COSMOS_OFFSET_DURATION", "16"))
-            if _offset_duration <= 0:
-                raise ValueError("COSMOS_OFFSET_DURATION must be positive")
-            _offset_active = _offset_start_t >= 0 and _offset_start_t <= t < _offset_start_t + _offset_duration
-            if _offset_active:
-                _amount_str = os.environ.get("COSMOS_OFFSET_AMOUNT", "0.01,0,0,0,0,0")
-                _total = np.asarray([float(x.strip()) for x in _amount_str.split(",")], dtype=np.float32)
-                if _total.shape != (6,):
-                    raise ValueError("COSMOS_OFFSET_AMOUNT must contain exactly 6 comma-separated values")
-                _per_step = _total / _offset_duration
+            _correction_active = (
+                (_online or _early_inject) and _correction_steps_remaining > 0
+            )
+            if _need_memory and not _correction_active:
+                _online_prop.append(observation["proprio"].copy())
 
-                if t == _offset_start_t:
-                    offset_gripper_action = (
-                        float(action_queue[0][6]) if action_queue else float(get_libero_dummy_action(cfg.model_family)[6])
-                    )
-                    action_queue.clear()
-                    log_message(
-                        f"[OFFSET] t={t}: pausing policy and injecting {_total.tolist()} "
-                        f"over {_offset_duration} steps (per_step={_per_step.tolist()})",
-                        log_file,
-                    )
-
+            # Once online detection starts a correction, pause policy inference
+            # for the configured duration. Correction actions are deliberately
+            # excluded from the online detector's policy-action history.
+            if _correction_active:
                 action = np.zeros(7, dtype=np.float32)
-                action[:6] = _per_step
+                action[:6] = _correction_per_step
                 action[6] = offset_gripper_action
-                print(f"t: {t}\t external action: {action}")
+                print(f"t: {t}\t automatic correction action: {action}")
 
                 if cfg.data_collection:
                     actions_list.append(action.copy())
 
                 obs, reward, done, info = env.step(action.tolist())
+                _correction_steps_remaining -= 1
+                if _correction_steps_remaining == 0:
+                    _finished_kind = _correction_kind
+                    offset_gripper_action = None
+                    _correction_per_step = None
+                    _correction_kind = None
+                    if _finished_kind == "early_manifold":
+                        # Start both online detectors from the first post-correction
+                        # policy observation. This prevents the two correction
+                        # chunks from looking like double-empty-grasp or stagnation.
+                        _online_prop.clear()
+                        _online_act.clear()
+                        _online_debug = _online
+                    log_message(
+                        f"[CORRECTION] t={t}: {_finished_kind} correction finished; "
+                        "resuming policy",
+                        log_file,
+                    )
                 if done:
                     success = True
                     break
                 t += 1
                 continue
-
-            if _offset_start_t >= 0 and t == _offset_start_t + _offset_duration:
-                offset_gripper_action = None
-                log_message(f"[OFFSET] t={t}: finished; resuming policy from current observation", log_file)
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
@@ -474,13 +574,15 @@ def run_episode(
                 best_future_predictions = None
 
                 # Capture VAE latent during the first model forward pass in get_action()
-                if cfg.save_vector_db:
+                _capture_vae = cfg.save_vector_db or _need_memory
+                if _capture_vae:
                     _captured_latent = []
                     _orig_gdac = model.get_data_and_condition
                     def _hook_gdac(data_batch):
                         raw, latent, cond = _orig_gdac(data_batch)
+                        lat = latent.detach().cpu()
                         if not _captured_latent:
-                            _captured_latent.append(latent.detach().cpu())
+                            _captured_latent.append(lat)
                         return raw, latent, cond
                     model.get_data_and_condition = _hook_gdac
 
@@ -659,7 +761,6 @@ def run_episode(
                 log_message(f"t={t}: Selected seed {best_seed} with value = {best_value_predictions:.4f}", log_file)
 
                 if cfg.save_vector_db:
-                    model.get_data_and_condition = _orig_gdac
                     if _captured_latent:
                         vae_video = _captured_latent[0][0, :, [2, 3], :, :].half()
                         vector_db_chunks.append({
@@ -669,17 +770,167 @@ def run_episode(
                             "step_index": t,
                         })
 
-            # Get action from queue
-            action = action_queue.popleft()
+                # --- Online detection & offset computation ---
+                if _online and _mem is not None and not _online_done and _captured_latent:
+                    _vae_cur = _captured_latent[0]
+                    if _vae_init is None:
+                        _vae_init = _vae_cur
+                    else:
+                        prop = np.array(_online_prop)
+                        acts = np.array(_online_act)
+                        det = detect_intervention(prop, acts, cfg.chunk_size, _online_th)
+                        if det is None:
+                            if _online_debug:
+                                _online_debug = False
+                                log_message(
+                                    f"[ONLINE DEBUG] t={t}: detector ran (buffer={len(prop)} steps) but no intervention detected",
+                                    log_file,
+                                )
+                        else:
+                            # VAE delta: current - initial
+                            _vae_d = (_vae_cur[0, :, [2, 3], :, :].float().flatten()
+                                      - _vae_init[0, :, [2, 3], :, :].float().flatten())
+                            if torch.linalg.vector_norm(_vae_d) <= 1e-8:
+                                log_message(
+                                    f"[ONLINE INJECT] t={t}: skipped zero VAE delta",
+                                    log_file,
+                                )
+                            else:
+                                _online_done = True
+                                # Argmax cosine similarity with all demo chunks
+                                sim = torch.nn.functional.cosine_similarity(
+                                    _vae_d.unsqueeze(0), _mem[0])
+                                bi = sim.argmax().item()
+                                tp, ts = _mem[1][bi], _mem[2][bi]
+                                # Current EE pose
+                                cp = torch.tensor(_online_prop[-1][2:5], dtype=torch.float32)
+                                cq = torch.tensor(_online_prop[-1][5:9], dtype=torch.float32)
+                                # World-frame delta
+                                pos_d = tp[2:5] - cp
+                                rot_d = torch.tensor(
+                                    (Rotation.from_quat(tp[5:9].numpy())
+                                     * Rotation.from_quat(cq.numpy()).inv()).as_rotvec(),
+                                    dtype=torch.float32)
+                                # Convert to action units
+                                amt = np.zeros(6, dtype=np.float32)
+                                for j in range(3):
+                                    amt[j] = float(pos_d[j] / ts[j]) if abs(float(ts[j])) > 1e-8 else 0.0
+                                    amt[3 + j] = float(rot_d[j] / ts[3 + j]) if abs(float(ts[3 + j])) > 1e-8 else 0.0
+                                amt = np.clip(amt, -15.0, 15.0)
+                                _correction_kind = det.trigger_type
+                                _correction_steps_remaining = cfg.chunk_size
+                                _correction_per_step = amt / _correction_steps_remaining
+                                offset_gripper_action = (
+                                    float(action_queue[0][6]) if action_queue
+                                    else float(get_libero_dummy_action(cfg.model_family)[6]))
+                                action_queue.clear()
+                                log_message(
+                                    f"[ONLINE INJECT] t={t}: {det.trigger_type}, best_chunk={bi}, "
+                                    f"offset={amt}, steps={_correction_steps_remaining}",
+                                    log_file,
+                                )
+                # --- End online detection ---
+                if (_early_score or _early_inject) and not _online and _vae_init is None and _captured_latent:
+                    _vae_init = _captured_latent[0]
+                if (
+                    (_early_score or _early_inject)
+                    and not _early_done
+                    and _vae_init is not None
+                    and _captured_latent
+                ):
+                    _early_delta = (
+                        _captured_latent[0][0, :, [2, 3], :, :].float().flatten()
+                        - _vae_init[0, :, [2, 3], :, :].float().flatten()
+                    )
+                    _early_result = score_early_manifold(
+                        np.asarray(_online_act), cfg.chunk_size, _early_delta.numpy(),
+                        _mem[0].numpy(), _mem[3].numpy(),
+                    )
+                    if _early_result is not None:
+                        # Early-manifold scoring/injection is a one-shot decision
+                        # made from the first completed policy action chunk.
+                        _early_done = True
+                        log_message(
+                            "[EARLY MANIFOLD SCORE] "
+                            f"episode={episode_index + 1} "
+                            f"score={_early_result['best_similarity']:.6f} "
+                            f"best_memory={_early_result['best_memory_index']} "
+                            f"best_chunk={_early_result['best_chunk_index']} "
+                            f"candidates={_early_result['candidate_count']}",
+                            log_file,
+                        )
+                    if _early_inject:
+                        _early_det = detect_early_manifold_deviation(
+                            np.asarray(_online_act), cfg.chunk_size, _early_delta.numpy(),
+                            _mem[0].numpy(), _mem[3].numpy(), _early_threshold,
+                        )
+                        if _early_det is not None:
+                            bi = _early_det.details["best_memory_index"]
+                            tp, ts = _mem[1][bi], _mem[2][bi]
+                            cp = torch.tensor(_online_prop[-1][2:5], dtype=torch.float32)
+                            cq = torch.tensor(_online_prop[-1][5:9], dtype=torch.float32)
+                            pos_d = tp[2:5] - cp
+                            rot_d = torch.tensor(
+                                (Rotation.from_quat(tp[5:9].numpy())
+                                 * Rotation.from_quat(cq.numpy()).inv()).as_rotvec(),
+                                dtype=torch.float32)
+                            amt = np.zeros(6, dtype=np.float32)
+                            for j in range(3):
+                                amt[j] = float(pos_d[j] / ts[j]) if abs(float(ts[j])) > 1e-8 else 0.0
+                                amt[3 + j] = float(rot_d[j] / ts[3 + j]) if abs(float(ts[3 + j])) > 1e-8 else 0.0
+                            amt = np.clip(amt, -_early_max_offset, _early_max_offset)
+                            _correction_kind = "early_manifold"
+                            _correction_steps_remaining = cfg.chunk_size * _early_correction_chunks
+                            _correction_per_step = amt / _correction_steps_remaining
+                            offset_gripper_action = float(action_queue[0][6])
+                            action_queue.clear()
+                            log_message(
+                                f"[EARLY MANIFOLD INJECT] t={t}: score="
+                                f"{_early_det.details['best_similarity']:.6f} < "
+                                f"{_early_threshold:.6f}, best_memory={bi}, "
+                                f"best_chunk={_early_det.details['best_chunk_index']}, "
+                                f"offset={amt}, steps={_correction_steps_remaining}",
+                                log_file,
+                            )
+
+                if _capture_vae:
+                    model.get_data_and_condition = _orig_gdac
+
+            # A newly detected correction begins immediately on this timestep.
+            _is_correction_action = (
+                (_online or _early_inject) and _correction_steps_remaining > 0
+            )
+            if _is_correction_action:
+                action = np.zeros(7, dtype=np.float32)
+                action[:6] = _correction_per_step
+                action[6] = offset_gripper_action
+                _correction_steps_remaining -= 1
+            else:
+                action = action_queue.popleft()
 
             # Process action
             print(f"t: {t}\t action: {action}")
 
             if cfg.data_collection:
                 actions_list.append(action.copy())
+            if _need_memory and not _is_correction_action:
+                _online_act.append(action.copy())
 
             # Execute action in environment
             obs, reward, done, info = env.step(action.tolist())
+            if (_online or _early_inject) and _correction_per_step is not None and _correction_steps_remaining == 0:
+                _finished_kind = _correction_kind
+                offset_gripper_action = None
+                _correction_per_step = None
+                _correction_kind = None
+                if _finished_kind == "early_manifold":
+                    _online_prop.clear()
+                    _online_act.clear()
+                    _online_debug = _online
+                log_message(
+                    f"[CORRECTION] t={t}: {_finished_kind} correction finished; resuming policy",
+                    log_file,
+                )
             if done:
                 success = True
                 break

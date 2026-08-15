@@ -5,6 +5,7 @@ experiments/
 archieve/
 dataset/
 vector_db/
+vector_db_*/
 __pycache__/
 LIBERO-Cosmos-Policy/
 LIBERO-plus/
