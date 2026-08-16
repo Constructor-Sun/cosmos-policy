@@ -1,2 +1,14 @@
 /.cuda-name
 /build
+
+dataset/
+vector_db*/
+rollouts/
+LIBERO-plus/
+LIBERO-Cosmos-Policy/
+counterfactual_experiments/
+experiments/
+outputs/
+
+*.pyc
+*.log

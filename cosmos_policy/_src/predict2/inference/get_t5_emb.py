@@ -29,7 +29,12 @@ class CosmosT5TextEncoder(torch.nn.Module):
     """Handles T5 text encoding operations."""
 
     def __init__(
-        self, model_name: str = "google-t5/t5-11b", device: str = "cuda", cache_dir=None, local_files_only=False
+        self,
+        model_name: str = "google-t5/t5-11b",
+        device: str = "cuda",
+        cache_dir=None,
+        local_files_only=False,
+        use_safetensors: Optional[bool] = None,
     ):
         """Initializes the T5 tokenizer and encoder.
 
@@ -41,9 +46,13 @@ class CosmosT5TextEncoder(torch.nn.Module):
         self.tokenizer = T5TokenizerFast.from_pretrained(
             model_name, cache_dir=cache_dir, local_files_only=local_files_only
         )
-        self.text_encoder = T5EncoderModel.from_pretrained(
-            model_name, cache_dir=cache_dir, local_files_only=local_files_only
-        ).to(device)
+        model_kwargs = {
+            "cache_dir": cache_dir,
+            "local_files_only": local_files_only,
+        }
+        if use_safetensors is not None:
+            model_kwargs["use_safetensors"] = use_safetensors
+        self.text_encoder = T5EncoderModel.from_pretrained(model_name, **model_kwargs).to(device)
         self.text_encoder.eval()
         self.device = device
 
