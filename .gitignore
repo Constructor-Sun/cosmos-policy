@@ -9,6 +9,7 @@ LIBERO-Cosmos-Policy/
 counterfactual_experiments/
 experiments/
 outputs/
+skill_memory/
 
 *.pyc
 *.log

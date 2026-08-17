@@ -3,7 +3,7 @@
 set -eu
 
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-CHECKPOINT_ROOT=$(CDPATH= cd -- "$REPO_ROOT/../../checkpoints" && pwd)
+CHECKPOINT_ROOT=$(CDPATH= cd -- "$REPO_ROOT/../../../checkpoints" && pwd)
 BASE_MODEL_DIR="$CHECKPOINT_ROOT/Cosmos-Predict2-2B-Video2World"
 POLICY_MODEL_DIR="$CHECKPOINT_ROOT/Cosmos-Policy-LIBERO-Predict2-2B"
 POLICY_CKPT_PATH=${SMOKE_POLICY_CKPT_PATH:-$POLICY_MODEL_DIR/Cosmos-Policy-LIBERO-Predict2-2B.pt}
@@ -70,7 +70,7 @@ export MUJOCO_GL="$SMOKE_GL_BACKEND"
 export PYOPENGL_PLATFORM="$SMOKE_GL_BACKEND"
 export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="../LIBERO-plus${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="../../LIBERO-plus${PYTHONPATH:+:$PYTHONPATH}"
 export NUMBA_CACHE_DIR="${TMPDIR:-/tmp}/cosmospolicy-numba"
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/cosmospolicy-matplotlib"
 export HF_HUB_CACHE="$CHECKPOINT_ROOT/huggingface-hub"

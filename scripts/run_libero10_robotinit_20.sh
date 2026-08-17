@@ -6,11 +6,11 @@ REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TASK=${LIBERO10_TASK:-KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it}
 LANGUAGE=${LIBERO10_LANGUAGE:-put the black bowl in the bottom drawer of the cabinet and close it}
 NUM_CASES=${NUM_CASES:-1}
-SEED=${SEED:-7}
+SEED=${SEED:-0}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/run_libero_smoke_test.py}
-ROBOTINIT_GPU=${ROBOTINIT_GPU:-7}
+ROBOTINIT_GPU=${ROBOTINIT_GPU:-0}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_robotinit_single}
-COSMOS_ROLLOUT_SUBDIR=${COSMOS_ROLLOUT_SUBDIR:-08-12}
+COSMOS_ROLLOUT_SUBDIR=${COSMOS_ROLLOUT_SUBDIR:-08-17}
 
 # --- Data collection (save trajectory HDF5 for offline analysis) ---
 COSMOS_DATA_COLLECTION=${COSMOS_DATA_COLLECTION:-}

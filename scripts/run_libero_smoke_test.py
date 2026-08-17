@@ -238,6 +238,7 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
     data_collection = os.environ.get("COSMOS_DATA_COLLECTION", "").lower() in {"1", "true", "yes"}
     save_vector_db = os.environ.get("COSMOS_VECTOR_DB", "").lower() in {"1", "true", "yes"}
     vector_db_output_dir = os.environ.get("COSMOS_VECTOR_DB_DIR", "")
+    enable_phase_verifier = os.environ.get("COSMOS_PHASE_VERIFIER", "").lower() in {"1", "true", "yes"}
     return PolicyEvalConfig(
         config="cosmos_predict2_2b_480p_libero__inference_only",
         ckpt_path=policy_ckpt_path,
@@ -257,6 +258,7 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
         data_collection=data_collection,
         save_vector_db=save_vector_db,
         vector_db_output_dir=vector_db_output_dir,
+        enable_phase_verifier=enable_phase_verifier,
     )
 
 
