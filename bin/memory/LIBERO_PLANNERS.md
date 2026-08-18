@@ -224,6 +224,12 @@ segments[]
   success_vae
   success_state_source
   success_embedding_source
+  completion_sequence_start/end
+  completion_success_offset
+  completion_frame_indices
+  completion_vae_sequence
+  completion_sequence_valid
+  completion_sequence_source
   chunks[]
     vae_video
     proprio
@@ -238,6 +244,12 @@ action chunk 长度为 16，且不会跨越 skill 边界。片段不足 16 帧�
 action 补齐，`valid_length` 保存真实长度。旧 manifest 没有
 `terminal_start` 时输出 v1；v2 保留原 `chunks`，并增加
 `terminal_chunks`。
+
+`completion_vae_sequence` 保留从 `terminal_start` 到 `success_end` 的逐帧
+VAE，不做时间平均，供后续直接计算时间差分和 DTW。`success_vae` 继续保留为
+静态 baseline。若成功只存在于缺少 RGB 的 replayed terminal state，序列仍会
+保留成功前的视觉帧，但 `completion_sequence_valid=false`，不得作为成功 DTW
+模板。新增字段保持向后兼容，仍使用 `libero_skill_memory_v2` 格式标识。
 
 不提供 `--segments-manifest` 时，builder 保持 whole-demo vector DB 行为；
 因此默认直接运行并不会生成 skill memory。

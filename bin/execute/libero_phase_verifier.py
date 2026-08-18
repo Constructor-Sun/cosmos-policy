@@ -88,7 +88,7 @@ class LiberoPhaseVerifier:
         cluster_radius_px: float = 32.0,
         ambiguity_ratio: float = 0.9,
         wrong_way_tolerance_px: float = 5.0,
-        wrong_way_updates: int = 2,
+        wrong_way_updates: int = 1,
     ):
         if not scales or any(scale <= 0 for scale in scales):
             raise ValueError("scales must contain positive values")

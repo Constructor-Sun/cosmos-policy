@@ -63,6 +63,8 @@ def load_phase_plans(path: str | Path) -> dict[str, tuple[PhaseSpec, ...]]:
         task_name = str(record["task_name"])
         task_phases = phases.setdefault(task_name, {})
         for segment in record.get("segments", []):
+            if segment.get("status") == "already_satisfied":
+                continue
             step_id = int(segment["planner_step_id"])
             spec = PhaseSpec(
                 step_id,

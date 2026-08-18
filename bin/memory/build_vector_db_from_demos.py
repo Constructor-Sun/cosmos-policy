@@ -209,10 +209,12 @@ def main():
                 for segment in record["segments"]:
                     start = min(max(int(segment["start"]), 0), T - 1)
                     end = min(max(int(segment["end"]), start), T)
-                    terminal_success = int(segment["success_start"]) >= T
+                    success_start = int(segment["success_start"])
+                    success_end = int(segment["success_end"])
+                    terminal_success = success_start >= T
                     success_frames = range(
-                        min(int(segment["success_start"]), T - 1),
-                        min(max(int(segment["success_end"]), 1), T),
+                        min(success_start, T - 1),
+                        min(max(success_end, 1), T),
                     )
                     success_latents = [vae_at(frame).float() for frame in success_frames]
                     if not success_latents:
@@ -239,6 +241,30 @@ def main():
                     if terminal_start is not None and ready_frame is not None:
                         terminal_start = min(max(int(terminal_start), start), end)
                         ready_frame = min(max(int(ready_frame), start), T - 1)
+                        completion_end = min(max(success_end, terminal_start), T)
+                        completion_frames = list(range(terminal_start, completion_end))
+                        completion_latents = [vae_at(frame) for frame in completion_frames]
+                        has_visual_success = success_start < T
+                        memory.update({
+                            "completion_sequence_start": terminal_start,
+                            "completion_sequence_end": completion_end,
+                            "completion_success_offset": success_start - terminal_start,
+                            "completion_frame_indices": completion_frames,
+                            "completion_vae_sequence": (
+                                torch.stack(completion_latents).half()
+                                if completion_latents else None
+                            ),
+                            "completion_sequence_valid": bool(
+                                has_visual_success and len(completion_latents) >= 2
+                            ),
+                            "completion_sequence_source": (
+                                "recorded_terminal_transition"
+                                if success_end <= T else
+                                "truncated_success_window"
+                                if has_visual_success else
+                                "terminal_rgb_missing"
+                            ),
+                        })
                         memory["ready_vae"] = vae_at(ready_frame)
                         memory["terminal_chunks"] = [
                             make_chunk(
@@ -249,6 +275,15 @@ def main():
                     else:
                         memory["ready_vae"] = None
                         memory["terminal_chunks"] = []
+                        memory.update({
+                            "completion_sequence_start": None,
+                            "completion_sequence_end": None,
+                            "completion_success_offset": None,
+                            "completion_frame_indices": [],
+                            "completion_vae_sequence": None,
+                            "completion_sequence_valid": False,
+                            "completion_sequence_source": "terminal_start_missing",
+                        })
                     memories.append(memory)
                 has_ready_boundaries = any(
                     "terminal_start" in segment for segment in record["segments"]

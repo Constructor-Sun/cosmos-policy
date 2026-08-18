@@ -283,7 +283,7 @@ class PolicyEvalConfig:
     jpeg_compress: bool = True                                           # If True, apply JPEG compression to images before saving
     save_vector_db: bool = False                                         # If True, save VAE latents + proprio at action chunk boundaries
     vector_db_output_dir: str = ""                                       # Output directory for vector DB .pt files
-    enable_phase_verifier: bool = False                                  # Enable both observation-only verifier stages; never modifies actions
+    enable_phase_verifier: bool = False                                  # Enable the sequential observation-only verifier; never modifies actions
 
     # fmt: on
 
@@ -318,39 +318,40 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
             raise ValueError("Visual verifier memory requires flip_images=True")
 
 
-def _create_phase_monitor(cfg: PolicyEvalConfig):
-    """Load the fixed LIBERO-10 phase memory."""
+def _create_execution_monitor(cfg: PolicyEvalConfig):
+    """Build the sequential phase -> feasible -> completion monitor."""
     phase_targets = _REPO_ROOT / "skill_memory/libero_10/phase_targets.pt"
     segments_manifest = _REPO_ROOT / "skill_memory/libero_10/segments_ready_fixed16.json"
-    missing = [path for path in (phase_targets, segments_manifest) if not path.is_file()]
+    wrist_completion_targets = _REPO_ROOT / "skill_memory/libero_10/wrist_completion_targets.pt"
+    missing = [path for path in (phase_targets, segments_manifest) if not path.exists()]
     if missing:
-        raise FileNotFoundError(f"Missing phase verifier inputs: {missing}")
+        raise FileNotFoundError(f"Missing sequential verifier inputs: {missing}")
+    if not wrist_completion_targets.exists():
+        raise FileNotFoundError(f"Missing wrist completion targets: {wrist_completion_targets}")
 
-    from execute.libero_phase_monitor import LiberoPhaseMonitor
-
-    return LiberoPhaseMonitor(phase_targets, segments_manifest)
-
-
-def _create_feasible_region_verifier(cfg: PolicyEvalConfig):
-    """Load an independent positive-only ready-distance verifier."""
-    phase_targets = _REPO_ROOT / "skill_memory/libero_10/phase_targets.pt"
-    segments_manifest = _REPO_ROOT / "skill_memory/libero_10/segments_ready_fixed16.json"
-    missing = [path for path in (phase_targets, segments_manifest) if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"Missing feasible-region verifier inputs: {missing}")
-
+    from execute.libero_execution_monitor import LiberoExecutionMonitor
     from execute.libero_feasible_region_verifier import LiberoFeasibleRegionVerifier
+    from execute.libero_phase_monitor import load_phase_plans
+    from execute.libero_phase_verifier import LiberoPhaseVerifier
+    from execute.libero_skill_completion_verifier_geo import LiberoSkillCompletionVerifierGeo
 
-    return LiberoFeasibleRegionVerifier(phase_targets, segments_manifest)
+    return LiberoExecutionMonitor(
+        load_phase_plans(segments_manifest),
+        LiberoPhaseVerifier(phase_targets),
+        LiberoFeasibleRegionVerifier(phase_targets, segments_manifest),
+        LiberoSkillCompletionVerifierGeo(
+            phase_targets, wrist_completion_targets=wrist_completion_targets
+        ),
+    )
 
 
-def _resolve_phase_task_name(task_name: str, phase_monitor) -> str:
+def _resolve_phase_task_name(task_name: str, execution_monitor) -> str:
     """Map a LIBERO-plus perturbation task back to its unique base task."""
-    if task_name in phase_monitor.plans:
+    if task_name in execution_monitor.plans:
         return task_name
     matches = [
         base_task
-        for base_task in phase_monitor.plans
+        for base_task in execution_monitor.plans
         if task_name.startswith(f"{base_task}_")
     ]
     if len(matches) != 1:
@@ -405,6 +406,20 @@ def _feasible_result_payload(result):
     }
 
 
+def _completion_result_payload(result):
+    if result is None:
+        return None
+    return {
+        "status": result.status,
+        "reason": result.reason,
+        "distance": result.distance,
+        "success_radius": result.success_radius,
+        "memory_count": result.memory_count,
+        "confirmation_count": result.confirmation_count,
+        "details": result.details,
+    }
+
+
 def _phase_json_default(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -430,28 +445,18 @@ def _project_gripper_xy(obs, camera_transform, flip_images: bool) -> np.ndarray:
     return np.asarray([col, row], dtype=np.float32)
 
 
-def _phase_overlay_payload(phase_monitor, phase_result) -> dict:
-    active_spec = phase_monitor.current_phase
-    active_result = (
-        phase_result.next
-        if phase_result.switched and phase_result.next is not None
-        else phase_result.current
-    )
+def _phase_overlay_payload(active_spec, phase_result) -> dict:
     return {
         "step_id": active_spec.planner_step_id,
         "skill": active_spec.skill,
-        "status": active_result.status,
-        "progress_px": active_result.progress_px,
-        "confidence": active_result.confidence,
-        "votes": active_result.match_count,
-        "next_step_id": (
-            phase_monitor.next_phase.planner_step_id
-            if phase_monitor.next_phase is not None
-            else None
-        ),
-        "switch_evidence": phase_result.switch_evidence,
-        "switched": phase_result.switched,
-        "deviation_candidate": phase_result.deviation_candidate,
+        "status": phase_result.status,
+        "progress_px": phase_result.progress_px,
+        "confidence": phase_result.confidence,
+        "votes": phase_result.match_count,
+        "next_step_id": None,
+        "switch_evidence": 0,
+        "switched": False,
+        "deviation_candidate": phase_result.status == "PHASE_ERROR",
     }
 
 
@@ -560,9 +565,8 @@ def run_episode(
     initial_state=None,
     log_file=None,
     episode_index=0,
-    phase_monitor=None,
+    execution_monitor=None,
     phase_task_name=None,
-    feasible_region_verifier=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -577,27 +581,20 @@ def run_episode(
     else:
         obs = env.get_observation()
 
-    # The phase verifier is observation-only. It is sampled once whenever a
-    # new policy action chunk is requested and never changes the action queue.
-    episode_phase_monitor = phase_monitor
-    phase_monitor_started = False
-    phase_monitor_error = None
+    # Phase/feasible checks run at policy chunk boundaries. Completion
+    # consumes per-step gripper geometry only and remains observation-only.
+    episode_execution_monitor = execution_monitor
+    execution_monitor_started = False
+    execution_monitor_error = None
+    verifier_records = []
     phase_camera_transform = None
     phase_overlay = None
     phase_overlay_renderer = None
-    episode_feasible_verifier = feasible_region_verifier
-    feasible_phase_key = None
-    feasible_records = []
-    feasible_verifier_error = None
-    if episode_feasible_verifier is not None and episode_phase_monitor is None:
-        raise ValueError(
-            "The eval-loop feasible adapter needs a phase monitor to provide target geometry"
-        )
-    if episode_phase_monitor is not None:
+    if episode_execution_monitor is not None:
         if not phase_task_name:
-            raise ValueError("phase_task_name is required when the phase verifier is enabled")
-        episode_phase_monitor.start_episode(phase_task_name)
-        phase_monitor_started = True
+            raise ValueError("phase_task_name is required when the verifier is enabled")
+        episode_execution_monitor.start_episode(phase_task_name)
+        execution_monitor_started = True
         from robosuite.utils.camera_utils import get_camera_transform_matrix
         from utils.visualize_libero_skill_segments import render_phase_verifier_overlay
 
@@ -607,14 +604,9 @@ def run_episode(
         )
         phase_overlay_renderer = render_phase_verifier_overlay
         log_message(
-            f"[PHASE] enabled task={phase_task_name!r} episode={episode_index + 1}",
+            f"[VERIFIER] enabled task={phase_task_name!r} episode={episode_index + 1}",
             log_file,
         )
-        if episode_feasible_verifier is not None:
-            log_message(
-                f"[FEASIBLE] enabled task={phase_task_name!r} episode={episode_index + 1}",
-                log_file,
-            )
 
     # Initialize action queue
     if cfg.num_open_loop_steps != cfg.chunk_size:
@@ -625,6 +617,7 @@ def run_episode(
         )
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
     offset_gripper_action = None
+    last_gripper_closed = None
 
     # Automatic online detection/correction setup
     _online = os.environ.get("COSMOS_ONLINE_DETECTION", "").lower() in ("1", "true", "yes")
@@ -686,6 +679,10 @@ def run_episode(
         proprio_list = []
         actions_list = []
     vector_db_chunks: list = []  # always created; populated only when save_vector_db=True
+    _dump_wrist_dir = os.environ.get("COSMOS_DUMP_WRIST_DIR")
+    _wrist_dump: list = []
+    if _dump_wrist_dir:
+        os.makedirs(_dump_wrist_dir, exist_ok=True)
 
     # Run episode
     success = False
@@ -705,6 +702,15 @@ def run_episode(
 
             # Prepare observation
             observation = prepare_observation(obs, resize_size, cfg.flip_images)
+            if _dump_wrist_dir is not None:
+                _wrist_dump.append((
+                    t,
+                    np.asarray(obs["robot0_eye_in_hand_image"], dtype=np.uint8).copy(),
+                    np.asarray(obs["agentview_image"], dtype=np.uint8).copy(),
+                    np.asarray(obs["robot0_eef_pos"], dtype=np.float32).copy(),
+                    np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32).copy(),
+                    last_gripper_closed,
+                ))
             replay_images.append(
                 phase_overlay_renderer(observation["primary_image"], phase_overlay)
                 if phase_overlay_renderer is not None
@@ -717,6 +723,65 @@ def run_episode(
                 primary_images_list.append(observation["primary_image"])
                 wrist_images_list.append(observation["wrist_image"])
                 proprio_list.append(observation["proprio"])
+
+            # The policy still runs per chunk; geometric completion consumes
+            # per-step gripper geometry only (no VAE encoding).
+            if (
+                episode_execution_monitor is not None
+                and action_queue
+                and episode_execution_monitor.stage != "PLAN_COMPLETE"
+            ):
+                try:
+                    active_spec = episode_execution_monitor.current_phase
+                    gripper_xy = _project_gripper_xy(
+                        obs, phase_camera_transform, cfg.flip_images
+                    )
+                    step_result = episode_execution_monitor.observe_vae(
+                        None, gripper_closed=last_gripper_closed,
+                        gripper_xy=gripper_xy, timestep=t,
+                        wrist_image=observation["wrist_image"],
+                    )
+                    if step_result is not None:
+                        verifier_record = {
+                            "task_name": phase_task_name,
+                            "episode": episode_index + 1,
+                            "timestep": t,
+                            "rollout_frame_index": len(replay_images) - 1,
+                            "active_phase": _phase_spec_payload(active_spec),
+                            "observed_step_id": step_result.observed_step_id,
+                            "active_step_id": step_result.active_step_id,
+                            "stage_before": step_result.stage_before,
+                            "stage_after": step_result.stage_after,
+                            "reason": step_result.reason,
+                            "phase_advanced": step_result.phase_advanced,
+                            "plan_complete": step_result.plan_complete,
+                            "gripper_xy": gripper_xy,
+                            "gripper_closed": last_gripper_closed,
+                            "phase": None,
+                            "feasible": None,
+                            "completion": _completion_result_payload(
+                                step_result.completion_result
+                            ),
+                        }
+                        verifier_records.append(verifier_record)
+                        if step_result.phase_advanced:
+                            phase_overlay = None
+                        log_message(
+                            "[COMPLETION] " + json.dumps(
+                                verifier_record, ensure_ascii=False, sort_keys=True,
+                                default=_phase_json_default,
+                            ),
+                            log_file,
+                        )
+                except Exception as verifier_error:
+                    execution_monitor_error = str(verifier_error)
+                    episode_execution_monitor = None
+                    phase_overlay = None
+                    log_message(
+                        f"[VERIFIER ERROR] t={t}: {verifier_error}; "
+                        "disabling sequential verifier for this episode",
+                        log_file,
+                    )
 
             _correction_active = (
                 (_online or _early_inject) and _correction_steps_remaining > 0
@@ -736,6 +801,7 @@ def run_episode(
                 if cfg.data_collection:
                     actions_list.append(action.copy())
 
+                last_gripper_closed = bool(float(action[6]) > 0.0)
                 obs, reward, done, info = env.step(action.tolist())
                 _correction_steps_remaining -= 1
                 if _correction_steps_remaining == 0:
@@ -763,124 +829,14 @@ def run_episode(
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
-                if episode_phase_monitor is not None:
-                    phase_result = None
-                    gripper_xy = None
-                    try:
-                        current_spec = episode_phase_monitor.current_phase
-                        next_spec = episode_phase_monitor.next_phase
-                        gripper_xy = _project_gripper_xy(
-                            obs, phase_camera_transform, cfg.flip_images
-                        )
-                        phase_result = episode_phase_monitor.observe(
-                            observation["primary_image"], gripper_xy, timestep=t
-                        )
-                        phase_overlay = _phase_overlay_payload(
-                            episode_phase_monitor, phase_result
-                        )
-                        replay_images[-1] = phase_overlay_renderer(
-                            observation["primary_image"], phase_overlay
-                        )
-                        phase_record = {
-                            "task_name": phase_task_name,
-                            "episode": episode_index + 1,
-                            "timestep": t,
-                            "rollout_frame_index": len(replay_images) - 1,
-                            "gripper_xy": gripper_xy,
-                            "current_phase": _phase_spec_payload(current_spec),
-                            "next_phase": _phase_spec_payload(next_spec),
-                            "current": _phase_result_payload(phase_result.current),
-                            "next": _phase_result_payload(phase_result.next),
-                            "active_step_id": phase_result.active_step_id,
-                            "switch_evidence": phase_result.switch_evidence,
-                            "switched": phase_result.switched,
-                            "deviation_candidate": phase_result.deviation_candidate,
-                            "reason": phase_result.reason,
-                        }
-                        log_message(
-                            "[PHASE] "
-                            + json.dumps(
-                                phase_record,
-                                ensure_ascii=False,
-                                sort_keys=True,
-                                default=_phase_json_default,
-                            ),
-                            log_file,
-                        )
-                    except Exception as phase_error:
-                        phase_monitor_error = str(phase_error)
-                        episode_phase_monitor = None
-                        phase_overlay = None
-                        log_message(
-                            f"[PHASE ERROR] t={t}: {phase_error}; disabling phase verifier for this episode",
-                            log_file,
-                        )
-
-                    if (
-                        phase_result is not None
-                        and episode_phase_monitor is not None
-                        and episode_feasible_verifier is not None
-                    ):
-                        try:
-                            active_spec = episode_phase_monitor.current_phase
-                            active_phase_result = (
-                                phase_result.next
-                                if phase_result.switched and phase_result.next is not None
-                                else phase_result.current
-                            )
-                            active_key = (
-                                phase_task_name,
-                                active_spec.planner_step_id,
-                                active_spec.skill,
-                                tuple(sorted(active_spec.arguments.items())),
-                            )
-                            if active_key != feasible_phase_key:
-                                episode_feasible_verifier.reset(
-                                    phase_task_name,
-                                    active_spec.planner_step_id,
-                                    active_spec.skill,
-                                    active_spec.arguments,
-                                )
-                                feasible_phase_key = active_key
-                            feasible_result = episode_feasible_verifier.update(
-                                active_phase_result.target_xy,
-                                active_phase_result.details.get("matched_bbox_xyxy"),
-                                gripper_xy,
-                                confidence=active_phase_result.confidence,
-                                timestep=t,
-                            )
-                            feasible_record = {
-                                "task_name": phase_task_name,
-                                "episode": episode_index + 1,
-                                "timestep": t,
-                                "active_phase": _phase_spec_payload(active_spec),
-                                **_feasible_result_payload(feasible_result),
-                            }
-                            feasible_records.append(feasible_record)
-                            log_message(
-                                "[FEASIBLE] "
-                                + json.dumps(
-                                    feasible_record,
-                                    ensure_ascii=False,
-                                    sort_keys=True,
-                                    default=_phase_json_default,
-                                ),
-                                log_file,
-                            )
-                        except Exception as feasible_error:
-                            feasible_verifier_error = str(feasible_error)
-                            episode_feasible_verifier = None
-                            log_message(
-                                f"[FEASIBLE ERROR] t={t}: {feasible_error}; "
-                                "disabling feasible-region verifier for this episode",
-                                log_file,
-                            )
-
                 best_actions = None
                 best_future_predictions = None
 
                 # Capture VAE latent during the first model forward pass in get_action()
-                _capture_vae = cfg.save_vector_db or _need_memory
+                _capture_vae = (
+                    cfg.save_vector_db
+                    or _need_memory
+                )
                 if _capture_vae:
                     _captured_latent = []
                     _orig_gdac = model.get_data_and_condition
@@ -1199,6 +1155,80 @@ def run_episode(
                                 log_file,
                             )
 
+                if episode_execution_monitor is not None:
+                    try:
+                        active_spec = episode_execution_monitor.current_phase
+                        gripper_xy = _project_gripper_xy(
+                            obs, phase_camera_transform, cfg.flip_images
+                        )
+                        execution_result = episode_execution_monitor.observe_vae(
+                            None, gripper_closed=last_gripper_closed,
+                            gripper_xy=gripper_xy, timestep=t,
+                            wrist_image=observation["wrist_image"],
+                        )
+                        if execution_result is None:
+                            execution_result = episode_execution_monitor.observe(
+                                observation["primary_image"],
+                                gripper_xy,
+                                gripper_closed=last_gripper_closed,
+                                timestep=t,
+                                wrist_image=observation["wrist_image"],
+                            )
+                        if execution_result.phase_result is not None:
+                            phase_overlay = _phase_overlay_payload(
+                                active_spec, execution_result.phase_result
+                            )
+                            replay_images[-1] = phase_overlay_renderer(
+                                observation["primary_image"], phase_overlay
+                            )
+                        elif execution_result.phase_advanced:
+                            phase_overlay = None
+                        verifier_record = {
+                            "task_name": phase_task_name,
+                            "episode": episode_index + 1,
+                            "timestep": t,
+                            "rollout_frame_index": len(replay_images) - 1,
+                            "active_phase": _phase_spec_payload(active_spec),
+                            "observed_step_id": execution_result.observed_step_id,
+                            "active_step_id": execution_result.active_step_id,
+                            "stage_before": execution_result.stage_before,
+                            "stage_after": execution_result.stage_after,
+                            "reason": execution_result.reason,
+                            "phase_advanced": execution_result.phase_advanced,
+                            "plan_complete": execution_result.plan_complete,
+                            "gripper_xy": gripper_xy,
+                            "gripper_closed": last_gripper_closed,
+                            "phase": _phase_result_payload(execution_result.phase_result),
+                            "feasible": _feasible_result_payload(execution_result.feasible_result),
+                            "completion": _completion_result_payload(execution_result.completion_result),
+                        }
+                        verifier_records.append(verifier_record)
+                        tag = (
+                            "PHASE" if execution_result.phase_result is not None
+                            else "FEASIBLE" if execution_result.feasible_result is not None
+                            else "COMPLETION" if execution_result.completion_result is not None
+                            else "VERIFIER"
+                        )
+                        log_message(
+                            f"[{tag}] "
+                            + json.dumps(
+                                verifier_record,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=_phase_json_default,
+                            ),
+                            log_file,
+                        )
+                    except Exception as verifier_error:
+                        execution_monitor_error = str(verifier_error)
+                        episode_execution_monitor = None
+                        phase_overlay = None
+                        log_message(
+                            f"[VERIFIER ERROR] t={t}: {verifier_error}; "
+                            "disabling sequential verifier for this episode",
+                            log_file,
+                        )
+
                 if _capture_vae:
                     model.get_data_and_condition = _orig_gdac
 
@@ -1223,6 +1253,7 @@ def run_episode(
                 _online_act.append(action.copy())
 
             # Execute action in environment
+            last_gripper_closed = bool(float(action[6]) > 0.0)
             obs, reward, done, info = env.step(action.tolist())
             if (_online or _early_inject) and _correction_per_step is not None and _correction_steps_remaining == 0:
                 _finished_kind = _correction_kind
@@ -1247,46 +1278,28 @@ def run_episode(
         traceback_str = traceback.format_exc()
         log_message(f"{error_msg}\nFull traceback:\n{traceback_str}", log_file)
 
-    if phase_monitor_started:
-        phase_summary = phase_monitor.finish_episode(success)
-        phase_summary.update(
-            {
-                "episode": episode_index + 1,
-                "monitor_error": phase_monitor_error,
-            }
-        )
-        log_message(
-            "[PHASE SUMMARY] "
-            + json.dumps(
-                phase_summary,
-                ensure_ascii=False,
-                sort_keys=True,
-                default=_phase_json_default,
-            ),
-            log_file,
-        )
-
-    if feasible_region_verifier is not None:
-        feasible_summary = {
+    if execution_monitor_started:
+        verifier_summary = {
             "task_name": phase_task_name,
             "episode": episode_index + 1,
-            "observations": len(feasible_records),
-            "feasible_observations": sum(
-                item["status"] == "FEASIBLE" for item in feasible_records
-            ),
-            "not_feasible_observations": sum(
-                item["status"] == "NOT_FEASIBLE" for item in feasible_records
-            ),
-            "ready_entries": sum(
-                item["reason"] == "entered_ready_radius" for item in feasible_records
-            ),
-            "verifier_error": feasible_verifier_error,
+            "observations": len(verifier_records),
+            "stage_observations": {
+                stage: sum(item["stage_before"] == stage for item in verifier_records)
+                for stage in ("PHASE_CHECK", "FEASIBLE_CHECK", "COMPLETION_CHECK")
+            },
+            "completed_steps": [
+                item["observed_step_id"]
+                for item in verifier_records
+                if item["phase_advanced"] or item["plan_complete"]
+            ],
+            "plan_complete": any(item["plan_complete"] for item in verifier_records),
+            "monitor_error": execution_monitor_error,
             "success": success,
         }
         log_message(
-            "[FEASIBLE SUMMARY] "
+            "[VERIFIER SUMMARY] "
             + json.dumps(
-                feasible_summary,
+                verifier_summary,
                 ensure_ascii=False,
                 sort_keys=True,
                 default=_phase_json_default,
@@ -1333,6 +1346,18 @@ def run_episode(
             chunk["init_state_index"] = state_idx
         torch.save(vector_db_chunks, os.path.join(out_dir, fname))
 
+    if _wrist_dump:
+        import numpy as _np
+        _np.savez(
+            os.path.join(_dump_wrist_dir, f"ep{episode_index + 1}.npz"),
+            times=_np.asarray([r[0] for r in _wrist_dump]),
+            wrist=_np.stack([r[1] for r in _wrist_dump]),
+            agentview=_np.stack([r[2] for r in _wrist_dump]),
+            eef=_np.stack([r[3] for r in _wrist_dump]),
+            qpos=_np.stack([r[4] for r in _wrist_dump]),
+            closed=_np.asarray([r[5] for r in _wrist_dump]),
+        )
+
     return success, replay_images, replay_wrist_images, future_image_predictions_list, collected_data
 
 
@@ -1348,15 +1373,14 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
-    phase_monitor=None,
-    feasible_region_verifier=None,
+    execution_monitor=None,
 ):
     """Run evaluation for a single task."""
     # Get task
     task = task_suite.get_task(task_id)
     phase_task_name = None
-    if phase_monitor is not None:
-        phase_task_name = _resolve_phase_task_name(task.name, phase_monitor)
+    if execution_monitor is not None:
+        phase_task_name = _resolve_phase_task_name(task.name, execution_monitor)
         if phase_task_name != task.name:
             log_message(
                 f"[PHASE] mapped perturbation task {task.name!r} to {phase_task_name!r}",
@@ -1406,9 +1430,8 @@ def run_task(
             initial_state,
             log_file,
             episode_index=episode_idx,
-            phase_monitor=phase_monitor,
+            execution_monitor=execution_monitor,
             phase_task_name=phase_task_name,
-            feasible_region_verifier=feasible_region_verifier,
         )
 
         # Update counters
@@ -1598,14 +1621,12 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks = task_suite.n_tasks
 
-    phase_monitor = None
-    feasible_region_verifier = None
+    execution_monitor = None
     if cfg.enable_phase_verifier:
-        phase_monitor = _create_phase_monitor(cfg)
-        feasible_region_verifier = _create_feasible_region_verifier(cfg)
+        execution_monitor = _create_execution_monitor(cfg)
         log_message(
-            "Two-stage verifier enabled in observation-only mode; phase and feasible "
-            "states remain independent and policy actions remain unchanged",
+            "Sequential phase -> feasible -> completion verifier enabled in "
+            "observation-only mode; policy actions remain unchanged",
             log_file,
         )
 
@@ -1630,8 +1651,7 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
-            phase_monitor=phase_monitor,
-            feasible_region_verifier=feasible_region_verifier,
+            execution_monitor=execution_monitor,
         )
 
     # Calculate final success rate
