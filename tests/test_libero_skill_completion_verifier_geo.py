@@ -89,14 +89,13 @@ class GeoVerifierTest(unittest.TestCase):
         self.assertEqual(r.reason, "completion_candidate")
         self.assertEqual(r.confirmation_count, 1)
 
-    def test_place_requires_release_inside_region(self):
+    def test_place_completes_on_release(self):
         self.v.reset("T", 3, "PlaceIn", {"item": "obj", "target": "t"})
         bbox = (130, 80, 250, 200)
         self._step(True, np.asarray([160.0, 100.0]), bbox=bbox)
         r1 = self._step(False, np.asarray([161.0, 101.0]), bbox=bbox)
-        self.assertEqual(r1.reason, "released_inside_region")
-        r2 = self._step(False, np.asarray([162.0, 102.0]), bbox=bbox)
-        self.assertEqual(r2.status, SKILL_COMPLETE)
+        self.assertEqual(r1.status, SKILL_COMPLETE)
+        self.assertEqual(r1.reason, "confirmed_complete")
 
     def test_close_latches_inside_anchor_cluster(self):
         # Close anchors are (100,150).
@@ -116,6 +115,26 @@ class GeoVerifierTest(unittest.TestCase):
         r = self._step(True, np.asarray([100.0, 150.0]))
         self.assertEqual(r.status, COMPLETION_UNKNOWN)
         self.assertEqual(r.reason, "no_geometric_completion_rule")
+
+    def test_pick_moved_uses_cumulative_eef_displacement(self):
+        # Movement is latched once cumulative 3D EEF displacement reaches 0.04.
+        self.v.reset("T", 2, "Pick", {"item": "obj"})
+        dummy_wrist = np.zeros((16, 16, 3), dtype=np.uint8)
+        self.v.update(
+            None, gripper_closed=True, gripper_xy=np.asarray([0.0, 0.0]),
+            wrist_image=dummy_wrist, eef_pos=np.asarray([0.0, 0.0, 0.0]),
+        )
+        self.assertFalse(self.v.pick_moved)
+        self.v.update(
+            None, gripper_closed=True, gripper_xy=np.asarray([0.0, 0.0]),
+            wrist_image=dummy_wrist, eef_pos=np.asarray([0.02, 0.0, 0.0]),
+        )
+        self.assertFalse(self.v.pick_moved)
+        self.v.update(
+            None, gripper_closed=True, gripper_xy=np.asarray([0.0, 0.0]),
+            wrist_image=dummy_wrist, eef_pos=np.asarray([0.05, 0.0, 0.0]),
+        )
+        self.assertTrue(self.v.pick_moved)
 
 
 if __name__ == "__main__":

@@ -99,26 +99,27 @@ normalized_distance = distance(gripper, target_center) / bbox_diagonal
 
 ### 3.2 Wrist Memory
 
-新 memory 文件：
+`skill_memory/libero_10/wrist_completion_targets.pt` 仍由 `bin/memory/build_libero_phase_targets.py` 生成。
 
-`skill_memory/libero_10/wrist_completion_targets.pt`
-
-由 `bin/memory/build_libero_phase_targets.py` 生成，保存 success 帧附近的 wrist 物体 crop、mask、SIFT 特征。
+当前 Pick 判断不再使用 SIFT 每帧重检测，只使用模板里的 `target_center_xy` 作为初始 ROI 中心先验。
 
 ### 3.3 Pick 完成条件
 
 ```text
 夹爪闭合
-+ 夹爪闭合后发生过移动
-+ wrist 图像中存在与 memory 中“已抓取物体”匹配的区域
-+ 物体中心在 wrist 中 drift <= 6px
-+ 连续 3 个低层 action step 满足
++ 3D EEF 从闭合位置开始的累积位移 >= 0.04
++ qpos gap > 0.003
++ wrist 固定 ROI 内 GFTT + LK 光流 + RANSAC 单应性
++ 光流内点比例 flow_inlier_ratio >= 0.5
++ 物体中心无单帧跳变（<= 10px）
++ 最近 5 帧中至少 4 帧满足
 ```
 
 核心信号是：
 
-- 夹爪移动时，物体中心在 wrist 图像中保持稳定；
-- 如果没抓住，夹爪移动时物体中心会漂移或消失。
+- 夹爪移动时，wrist 固定 ROI 内的物体表面点表现为一致刚体运动；
+- RANSAC 内点比例高说明物体仍被稳定抓取；
+- 如果脱落、晃动或跟踪丢失，内点比例会下降或中心跳变。
 
 ### 3.4 Place 完成条件
 
@@ -173,7 +174,7 @@ intervention_reason: str | None
 intervention_reason = "no_completion_within_two_chunks_after_feasible"
 ```
 
-当前只记录信号，不执行恢复。
+当前 `should_intervene` 信号会触发 pose recovery，具体见 [CORRECTION.md](./CORRECTION.md)。
 
 ### 4.4 日志
 
@@ -224,7 +225,7 @@ python bin/memory/build_libero_phase_targets.py \
 ## 七、当前已知问题与下一步
 
 1. Feasible verifier 阈值偏松，基本进入即 `FEASIBLE`，后续需要更严格的可行域定义。
-2. Completion verifier 仍依赖手工阈值和 wrist memory 匹配，需要更多真实 rollout 校准。
+2. Pick 的光流 ROI 目前使用模板 target_center_xy 或 wrist 图像中心；如果模板中心偏离实际抓取位置，ROI 可能不包含完整物体，需要更多真实 rollout 校准。
 3. Open / Close / TurnOn 的完成判断尚未用 wrist 实现。
-4. 恢复策略尚未实现；当前 `should_intervene` 只提供信号。
+4. 恢复策略已接入 `phase_pose_recovery`，但 PlaceOn 的 2D 方向判定仍偏严格，可能造成反复 recovery，具体见 [CORRECTION.md](./CORRECTION.md)。
 5. 下一步可以接入 policy value / future prediction，用于更早判断“下一个动作是否可能成功”。

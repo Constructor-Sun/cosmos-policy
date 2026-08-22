@@ -224,7 +224,9 @@ def build_task(args, task_name: str) -> dict[str, Any]:
         camera_widths=args.resolution,
     )
     env.reset()
-    templates, failures, warnings, wrist_templates = [], [], [], []
+    templates, failures, warnings, wrist_templates, wrist_feasible_templates = (
+        [], [], [], [], []
+    )
     camera_matrix = get_camera_transform_matrix(
         env.sim, "agentview", args.resolution, args.resolution
     )
@@ -319,6 +321,37 @@ def build_task(args, task_name: str) -> dict[str, Any]:
                                     "frame": wrist_frame,
                                     "warning": "wrist completion template unavailable",
                                 })
+                    if getattr(args, "wrist_feasible_output", None):
+                        ready_frame = segment.get("ready_frame")
+                        if ready_frame is not None:
+                            wrist_frame = min(max(int(ready_frame), 0), len(states) - 1)
+                            wrist_obs = env.regenerate_obs_from_state(states[wrist_frame])
+                            wrist_rgb = decode_jpeg(wrist_images[wrist_frame])
+                            wrist_template = make_wrist_template(
+                                wrist_obs, wrist_rgb, instance_id, args.flip_images, args
+                            )
+                            if wrist_template is not None:
+                                wrist_template.update({
+                                    "task_name": task_name,
+                                    "demo_id": record["demo_id"],
+                                    "planner_step_id": int(segment["planner_step_id"]),
+                                    "skill": segment["skill"],
+                                    "arguments": dict(segment.get("arguments", {})),
+                                    "target_role": role,
+                                    "target_argument": argument,
+                                    "instance_name": instance,
+                                    "instance_source": source,
+                                    "frame": wrist_frame,
+                                    "frame_role": "ready",
+                                })
+                                wrist_feasible_templates.append(wrist_template)
+                            else:
+                                warnings.append({
+                                    "demo_id": record["demo_id"],
+                                    "planner_step_id": segment.get("planner_step_id"),
+                                    "frame": wrist_frame,
+                                    "warning": "wrist feasible template unavailable",
+                                })
                     if len(templates) == template_count:
                         raise ValueError(f"no usable target mask in frames {frames}")
                 except (KeyError, ValueError) as error:
@@ -328,7 +361,13 @@ def build_task(args, task_name: str) -> dict[str, Any]:
                         "error": str(error),
                     })
     env.close()
-    return {"templates": templates, "failures": failures, "warnings": warnings, "wrist_templates": wrist_templates}
+    return {
+        "templates": templates,
+        "failures": failures,
+        "warnings": warnings,
+        "wrist_templates": wrist_templates,
+        "wrist_feasible_templates": wrist_feasible_templates,
+    }
 
 
 def parse_args():
@@ -340,6 +379,7 @@ def parse_args():
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--flip-images", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wrist-completion-output", type=Path)
+    parser.add_argument("--wrist-feasible-output", type=Path)
     parser.add_argument("--min-wrist-visible-pixels", type=int, default=200)
     parser.add_argument("--min-wrist-crop-size", type=int, default=16)
     parser.add_argument("--max-wrist-crop-ratio", type=float, default=0.9)
@@ -353,6 +393,8 @@ def main() -> int:
     args.output = args.output.resolve()
     if args.wrist_completion_output is not None:
         args.wrist_completion_output = args.wrist_completion_output.resolve()
+    if args.wrist_feasible_output is not None:
+        args.wrist_feasible_output = args.wrist_feasible_output.resolve()
     if args.task:
         result = build_task(args, args.task)
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -372,12 +414,24 @@ def main() -> int:
             }, args.wrist_completion_output)
             print(f"Wrote {len(result.get('wrist_templates', []))} wrist completion templates "
                   f"to {args.wrist_completion_output}")
+        if args.wrist_feasible_output is not None:
+            args.wrist_feasible_output.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "format": "libero_wrist_feasible_targets_v1",
+                "templates": result.get('wrist_feasible_templates', []),
+                "failures": result.get("failures", []),
+                "warnings": result.get("warnings", []),
+            }, args.wrist_feasible_output)
+            print(f"Wrote {len(result.get('wrist_feasible_templates', []))} wrist feasible templates "
+                  f"to {args.wrist_feasible_output}")
         print(f"{args.task}: {len(result['templates'])} templates, "
               f"{len(result['failures'])} failures, {len(result['warnings'])} warnings")
         return 0
     manifest = json.loads(args.segments_manifest.read_text())
     tasks = sorted({item["task_name"] for item in manifest["records"] if item.get("valid")})
-    templates, failures, warnings, wrist_templates = [], [], [], []
+    templates, failures, warnings, wrist_templates, wrist_feasible_templates = (
+        [], [], [], [], []
+    )
     with tempfile.TemporaryDirectory(prefix="libero_phase_targets_") as temporary:
         for index, task in enumerate(tasks):
             part = Path(temporary) / f"part_{index}.pt"
@@ -394,8 +448,14 @@ def main() -> int:
                 "--resolution", str(args.resolution),
                 "--flip-images" if args.flip_images else "--no-flip-images",
             ]
+            wrist_feasible_part = (
+                Path(temporary) / f"wrist_feasible_part_{index}.pt"
+                if args.wrist_feasible_output is not None else None
+            )
             if wrist_part is not None:
                 command += ["--wrist-completion-output", str(wrist_part)]
+            if wrist_feasible_part is not None:
+                command += ["--wrist-feasible-output", str(wrist_feasible_part)]
             subprocess.run(command, check=True)
             payload = torch.load(part, map_location="cpu", weights_only=False)
             templates.extend(payload["templates"])
@@ -407,6 +467,13 @@ def main() -> int:
                 warnings.extend(
                     {"task_name": task, **item}
                     for item in wrist_payload.get("warnings", [])
+                )
+            if wrist_feasible_part is not None:
+                wrist_feasible_payload = torch.load(wrist_feasible_part, map_location="cpu", weights_only=False)
+                wrist_feasible_templates.extend(wrist_feasible_payload.get("templates", []))
+                warnings.extend(
+                    {"task_name": task, **item}
+                    for item in wrist_feasible_payload.get("warnings", [])
                 )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -429,6 +496,16 @@ def main() -> int:
         }, args.wrist_completion_output)
         print(f"Wrote {len(wrist_templates)} wrist completion templates "
               f"to {args.wrist_completion_output}")
+    if args.wrist_feasible_output is not None:
+        args.wrist_feasible_output.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "format": "libero_wrist_feasible_targets_v1",
+            "templates": wrist_feasible_templates,
+            "failures": failures,
+            "warnings": warnings,
+        }, args.wrist_feasible_output)
+        print(f"Wrote {len(wrist_feasible_templates)} wrist feasible templates "
+              f"to {args.wrist_feasible_output}")
     return 0
 
 

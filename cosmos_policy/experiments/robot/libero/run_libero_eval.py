@@ -260,6 +260,7 @@ class PolicyEvalConfig:
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL                      # Task suite (must be one of: LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_10, LIBERO_90, LIBERO_MIX)
     unnorm_key: str = ""                                                 # Optional action un-normalization key override (e.g., use libero_10 for LIBERO-plus)
     num_trials_per_task: int = 50                                        # Number of rollouts per task
+    task_filter: str = ""                                                 # If non-empty, only run tasks whose name contains this substring
     initial_states_path: str = "DEFAULT"                                 # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                                               # Resolution for rendering environment images (not policy input resolution)
 
@@ -284,6 +285,8 @@ class PolicyEvalConfig:
     save_vector_db: bool = False                                         # If True, save VAE latents + proprio at action chunk boundaries
     vector_db_output_dir: str = ""                                       # Output directory for vector DB .pt files
     enable_phase_verifier: bool = False                                  # Enable the sequential observation-only verifier; never modifies actions
+    enable_phase_recovery: bool = False                                 # Enable retrieval-based PHASE_ERROR pose recovery
+    enable_feasible_recovery: bool = False                              # Enable retrieval-based FEASIBLE_ERROR pose recovery
 
     # fmt: on
 
@@ -323,11 +326,14 @@ def _create_execution_monitor(cfg: PolicyEvalConfig):
     phase_targets = _REPO_ROOT / "skill_memory/libero_10/phase_targets.pt"
     segments_manifest = _REPO_ROOT / "skill_memory/libero_10/segments_ready_fixed16.json"
     wrist_completion_targets = _REPO_ROOT / "skill_memory/libero_10/wrist_completion_targets.pt"
+    wrist_feasible_targets = _REPO_ROOT / "skill_memory/libero_10/feasible_wrist_targets.pt"
     missing = [path for path in (phase_targets, segments_manifest) if not path.exists()]
     if missing:
         raise FileNotFoundError(f"Missing sequential verifier inputs: {missing}")
     if not wrist_completion_targets.exists():
         raise FileNotFoundError(f"Missing wrist completion targets: {wrist_completion_targets}")
+    if cfg.enable_feasible_recovery and not wrist_feasible_targets.exists():
+        raise FileNotFoundError(f"Missing wrist feasible targets: {wrist_feasible_targets}")
 
     from execute.libero_execution_monitor import LiberoExecutionMonitor
     from execute.libero_feasible_region_verifier import LiberoFeasibleRegionVerifier
@@ -338,7 +344,12 @@ def _create_execution_monitor(cfg: PolicyEvalConfig):
     return LiberoExecutionMonitor(
         load_phase_plans(segments_manifest),
         LiberoPhaseVerifier(phase_targets),
-        LiberoFeasibleRegionVerifier(phase_targets, segments_manifest),
+        LiberoFeasibleRegionVerifier(
+            phase_targets, segments_manifest,
+            wrist_feasible_targets=(
+                wrist_feasible_targets if cfg.enable_feasible_recovery else None
+            ),
+        ),
         LiberoSkillCompletionVerifierGeo(
             phase_targets, wrist_completion_targets=wrist_completion_targets
         ),
@@ -440,8 +451,10 @@ def _project_gripper_xy(obs, camera_transform, flip_images: bool) -> np.ndarray:
         width,
     )
     row, col = int(row_col[0]), int(row_col[1])
-    if flip_images:
-        row = height - 1 - row
+    # NOTE: The phase verifier / replay images used in this pipeline are in the
+    # same orientation as the raw agentview image (verified against the saved
+    # rollout video). Do NOT apply the flip_images row mirror here, otherwise
+    # gripper_xy will be inconsistent with the verifier's target_xy/bbox.
     return np.asarray([col, row], dtype=np.float32)
 
 
@@ -567,6 +580,8 @@ def run_episode(
     episode_index=0,
     execution_monitor=None,
     phase_task_name=None,
+    pose_recovery=None,
+    feasible_recovery=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -626,6 +641,7 @@ def run_episode(
     _early_threshold = float(os.environ.get("COSMOS_EARLY_MANIFOLD_THRESHOLD", "0.1"))
     _early_max_offset = float(os.environ.get("COSMOS_EARLY_MANIFOLD_MAX_OFFSET", "28"))
     _early_correction_chunks = int(os.environ.get("COSMOS_EARLY_MANIFOLD_CORRECTION_CHUNKS", "2"))
+    _max_phase_corrections = int(os.environ.get("COSMOS_MAX_CORRECTIONS_PER_PHASE", "2"))
     if not np.isfinite(_early_max_offset) or _early_max_offset <= 0:
         raise ValueError("COSMOS_EARLY_MANIFOLD_MAX_OFFSET must be a positive finite number")
     if _early_correction_chunks <= 0:
@@ -657,10 +673,46 @@ def run_episode(
     _online_done = False
     _correction_kind = None
     _correction_per_step = None
+    _correction_controller = None
     _correction_steps_remaining = 0
+    _correction_step_index = 0
+    _phase_correction_count = 0
+    _captured_latent = None
     _online_debug = _online  # log first detection check per episode
     if _online:
         _online_th = Thresholds()
+
+    _wrong_grasp_open_steps = int(os.environ.get("COSMOS_WRONG_GRASP_OPEN_STEPS", "8"))
+
+    def _start_wrong_grasp_correction(t_now: int, obs_now, log_fh) -> None:
+        """Stage 1 of the wrong-object grasp correction: open the gripper in
+        place (the object was just touched, not lifted yet), then the
+        correction-finish handler chains stage 2 (nearest-ready move) and hands
+        back to the feasible gate.  Uses its own budget, not the phase budget."""
+        nonlocal _correction_kind, _correction_per_step, _correction_controller
+        nonlocal _correction_steps_remaining, _correction_step_index
+        nonlocal offset_gripper_action, action_queue, phase_overlay
+        if episode_execution_monitor is None:
+            return
+        _correction_kind = "wrong_grasp_open"
+        _correction_steps_remaining = _wrong_grasp_open_steps
+        _correction_per_step = np.zeros(
+            (_wrong_grasp_open_steps, 6), dtype=np.float32
+        )
+        _correction_controller = None
+        _correction_step_index = 0
+        offset_gripper_action = -1.0  # force open: do NOT preserve a closed grip
+        action_queue.clear()
+        if hasattr(episode_execution_monitor.completion_verifier,
+                   "begin_wrong_grasp_recovery"):
+            episode_execution_monitor.completion_verifier.begin_wrong_grasp_recovery()
+        phase_overlay = None
+        log_message(
+            f"[WRONG GRASP] t={t_now}: close edge outside ready anchor cluster; "
+            f"opening gripper in place ({_wrong_grasp_open_steps} steps), "
+            f"then moving to nearest ready pose",
+            log_fh,
+        )
 
     # Setup
     t = 0
@@ -740,6 +792,8 @@ def run_episode(
                         None, gripper_closed=last_gripper_closed,
                         gripper_xy=gripper_xy, timestep=t,
                         wrist_image=observation["wrist_image"],
+                        gripper_qpos=obs["robot0_gripper_qpos"],
+                        eef_pos=obs["robot0_eef_pos"],
                     )
                     if step_result is not None:
                         verifier_record = {
@@ -765,6 +819,7 @@ def run_episode(
                         }
                         verifier_records.append(verifier_record)
                         if step_result.phase_advanced:
+                            _phase_correction_count = 0
                             phase_overlay = None
                         log_message(
                             "[COMPLETION] " + json.dumps(
@@ -773,6 +828,12 @@ def run_episode(
                             ),
                             log_file,
                         )
+                        if (
+                            step_result.should_intervene
+                            and step_result.intervention_reason == "wrong_grasp_close"
+                            and feasible_recovery is not None
+                        ):
+                            _start_wrong_grasp_correction(t, obs, log_file)
                 except Exception as verifier_error:
                     execution_monitor_error = str(verifier_error)
                     episode_execution_monitor = None
@@ -784,7 +845,8 @@ def run_episode(
                     )
 
             _correction_active = (
-                (_online or _early_inject) and _correction_steps_remaining > 0
+                _correction_steps_remaining > 0
+                and (_correction_per_step is not None or _correction_controller is not None)
             )
             if _need_memory and not _correction_active:
                 _online_prop.append(observation["proprio"].copy())
@@ -793,9 +855,30 @@ def run_episode(
             # for the configured duration. Correction actions are deliberately
             # excluded from the online detector's policy-action history.
             if _correction_active:
-                action = np.zeros(7, dtype=np.float32)
-                action[:6] = _correction_per_step
-                action[6] = offset_gripper_action
+                if _correction_controller is not None:
+                    # Step-level closed loop: regenerate the action from the
+                    # current measured EE pose every step.
+                    _current_ee_states = np.concatenate([
+                        obs["robot0_eef_pos"],
+                        Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+                    ]).astype(np.float32)
+                    _step_action = _correction_controller.step(_current_ee_states)
+                elif np.ndim(_correction_per_step) == 2:
+                    _step_action = _correction_per_step[
+                        min(_correction_step_index, _correction_per_step.shape[0] - 1)
+                    ]
+                else:
+                    _step_action = _correction_per_step
+                if np.ndim(_step_action) == 1 and _step_action.shape[0] == 7:
+                    action = _step_action.astype(np.float32).copy()
+                    # Recovery trajectories must not change the gripper state.
+                    # Always preserve the gripper command captured before correction.
+                    if offset_gripper_action is not None:
+                        action[-1] = offset_gripper_action
+                else:
+                    action = np.zeros(7, dtype=np.float32)
+                    action[:6] = _step_action
+                    action[6] = offset_gripper_action
                 print(f"t: {t}\t automatic correction action: {action}")
 
                 if cfg.data_collection:
@@ -804,10 +887,13 @@ def run_episode(
                 last_gripper_closed = bool(float(action[6]) > 0.0)
                 obs, reward, done, info = env.step(action.tolist())
                 _correction_steps_remaining -= 1
+                _correction_step_index += 1
                 if _correction_steps_remaining == 0:
                     _finished_kind = _correction_kind
                     offset_gripper_action = None
                     _correction_per_step = None
+                    _correction_controller = None
+                    _correction_step_index = 0
                     _correction_kind = None
                     if _finished_kind == "early_manifold":
                         # Start both online detectors from the first post-correction
@@ -816,6 +902,39 @@ def run_episode(
                         _online_prop.clear()
                         _online_act.clear()
                         _online_debug = _online
+                    if _finished_kind == "feasible_pose_recovery" and episode_execution_monitor is not None:
+                        episode_execution_monitor.mark_feasible_after_recovery(timestep=t)
+                    if _finished_kind == "wrong_grasp_open":
+                        # Stage 2: move to the nearest ready pose with the
+                        # gripper open, then hand back to the feasible gate.
+                        if feasible_recovery is not None and episode_execution_monitor is not None:
+                            _current_ee = np.concatenate([
+                                obs["robot0_eef_pos"],
+                                Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+                            ]).astype(np.float32)
+                            _spec = episode_execution_monitor.current_phase
+                            _recovery = feasible_recovery.compute_nearest_ready(
+                                phase_task_name,
+                                _spec.planner_step_id, _spec.skill, _spec.arguments,
+                                _current_ee,
+                            )
+                            if _recovery is not None:
+                                _correction_kind = "wrong_grasp_nearest_ready"
+                                _correction_steps_remaining = _recovery.correction_steps
+                                _correction_per_step = _recovery.correction_per_step
+                                _correction_controller = _recovery.controller
+                                _correction_step_index = 0
+                                offset_gripper_action = -1.0  # keep open while moving
+                                log_message(
+                                    f"[WRONG GRASP] t={t}: moving to nearest ready pose "
+                                    f"(demo={_recovery.demo_ids}, steps={_recovery.correction_steps})",
+                                    log_file,
+                                )
+                            else:
+                                episode_execution_monitor.mark_wrong_grasp_recovery_finished(timestep=t)
+                    elif _finished_kind == "wrong_grasp_nearest_ready":
+                        if episode_execution_monitor is not None:
+                            episode_execution_monitor.mark_wrong_grasp_recovery_finished(timestep=t)
                     log_message(
                         f"[CORRECTION] t={t}: {_finished_kind} correction finished; "
                         "resuming policy",
@@ -836,6 +955,8 @@ def run_episode(
                 _capture_vae = (
                     cfg.save_vector_db
                     or _need_memory
+                    or (cfg.enable_phase_recovery and episode_execution_monitor is not None)
+                    or (cfg.enable_feasible_recovery and episode_execution_monitor is not None)
                 )
                 if _capture_vae:
                     _captured_latent = []
@@ -1033,7 +1154,8 @@ def run_episode(
                         })
 
                 # --- Online detection & offset computation ---
-                if _online and _mem is not None and not _online_done and _captured_latent:
+                if (_online and _mem is not None and not _online_done and _captured_latent
+                        and _phase_correction_count < _max_phase_corrections):
                     _vae_cur = _captured_latent[0]
                     if _vae_init is None:
                         _vae_init = _vae_cur
@@ -1059,6 +1181,7 @@ def run_episode(
                                 )
                             else:
                                 _online_done = True
+                                _phase_correction_count += 1
                                 # Argmax cosine similarity with all demo chunks
                                 sim = torch.nn.functional.cosine_similarity(
                                     _vae_d.unsqueeze(0), _mem[0])
@@ -1082,6 +1205,7 @@ def run_episode(
                                 _correction_kind = det.trigger_type
                                 _correction_steps_remaining = cfg.chunk_size
                                 _correction_per_step = amt / _correction_steps_remaining
+                                _correction_step_index = 0
                                 offset_gripper_action = (
                                     float(action_queue[0][6]) if action_queue
                                     else float(get_libero_dummy_action(cfg.model_family)[6]))
@@ -1144,6 +1268,7 @@ def run_episode(
                             _correction_kind = "early_manifold"
                             _correction_steps_remaining = cfg.chunk_size * _early_correction_chunks
                             _correction_per_step = amt / _correction_steps_remaining
+                            _correction_step_index = 0
                             offset_gripper_action = float(action_queue[0][6])
                             action_queue.clear()
                             log_message(
@@ -1165,6 +1290,8 @@ def run_episode(
                             None, gripper_closed=last_gripper_closed,
                             gripper_xy=gripper_xy, timestep=t,
                             wrist_image=observation["wrist_image"],
+                            gripper_qpos=obs["robot0_gripper_qpos"],
+                            eef_pos=obs["robot0_eef_pos"],
                         )
                         if execution_result is None:
                             execution_result = episode_execution_monitor.observe(
@@ -1173,7 +1300,161 @@ def run_episode(
                                 gripper_closed=last_gripper_closed,
                                 timestep=t,
                                 wrist_image=observation["wrist_image"],
+                                gripper_qpos=obs["robot0_gripper_qpos"],
+                                eef_pos=obs["robot0_eef_pos"],
                             )
+                        if (
+                            execution_result.should_intervene
+                            and execution_result.intervention_reason == "wrong_grasp_close"
+                            and feasible_recovery is not None
+                        ):
+                            _start_wrong_grasp_correction(t, obs, log_file)
+                        if (
+                            execution_result.should_intervene
+                            and execution_result.intervention_reason == "phase_error"
+                            and pose_recovery is not None
+                            and _captured_latent
+                            and _phase_correction_count < _max_phase_corrections
+                        ):
+                            _phase_correction_count += 1
+                            current_vae_main = _captured_latent[0][0, :, 3:4, :, :]
+                            current_ee_states = np.concatenate([
+                                obs["robot0_eef_pos"],
+                                Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+                            ]).astype(np.float32)
+                            recovery = pose_recovery.compute(
+                                phase_task_name,
+                                active_spec.planner_step_id,
+                                active_spec.skill,
+                                active_spec.arguments,
+                                current_vae_main,
+                                current_ee_states,
+                            )
+                            if recovery is not None:
+                                _correction_kind = "phase_pose_recovery"
+                                _correction_steps_remaining = recovery.correction_steps
+                                _correction_per_step = recovery.correction_per_step
+                                _correction_controller = recovery.controller
+                                _correction_step_index = 0
+                                offset_gripper_action = float(bool(last_gripper_closed))
+                                action_queue.clear()
+                                episode_execution_monitor.retry_current_phase()
+                                phase_overlay = None
+                                log_message(
+                                    f"[PHASE RECOVERY] t={t}: current={current_ee_states.tolist()} "
+                                    f"target={recovery.target_ee_states.tolist()} "
+                                    f"per_step={recovery.correction_per_step[0].tolist() if recovery.correction_per_step.ndim == 2 else recovery.correction_per_step.tolist()} "
+                                    f"per_step_last={recovery.correction_per_step[-1].tolist() if recovery.correction_per_step.ndim == 2 else ''} "
+                                    f"sim={recovery.similarity:.3f} demos={recovery.demo_ids}",
+                                    log_file,
+                                )
+                            else:
+                                _correction_kind = "phase_retry"
+                                _correction_steps_remaining = 1
+                                _correction_per_step = np.zeros(6, dtype=np.float32)
+                                _correction_step_index = 0
+                                offset_gripper_action = float(bool(last_gripper_closed))
+                                action_queue.clear()
+                                episode_execution_monitor.retry_current_phase()
+                                phase_overlay = None
+                                log_message(
+                                    f"[PHASE RECOVERY] t={t}: no confident target; retry phase",
+                                    log_file,
+                                )
+                        if (
+                            execution_result.should_intervene
+                            and execution_result.intervention_reason == "feasible_error"
+                            and feasible_recovery is not None
+                            and _captured_latent
+                        ):
+                            if _phase_correction_count < _max_phase_corrections:
+                                _phase_correction_count += 1
+                                current_vae_main = _captured_latent[0][0, :, 3:4, :, :]
+                                current_vae_wrist = _captured_latent[0][0, :, 2:3, :, :]
+                                current_ee_states = np.concatenate([
+                                    obs["robot0_eef_pos"],
+                                    Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+                                ]).astype(np.float32)
+                                recovery = feasible_recovery.compute(
+                                    phase_task_name,
+                                    active_spec.planner_step_id,
+                                    active_spec.skill,
+                                    active_spec.arguments,
+                                    current_vae_main,
+                                    current_vae_wrist,
+                                    current_ee_states,
+                                )
+                                if recovery is not None:
+                                    _correction_kind = "feasible_pose_recovery"
+                                    _correction_steps_remaining = recovery.correction_steps
+                                    _correction_per_step = recovery.correction_per_step
+                                    _correction_controller = recovery.controller
+                                    _correction_step_index = 0
+                                    offset_gripper_action = float(bool(last_gripper_closed))
+                                    action_queue.clear()
+                                    episode_execution_monitor.mark_feasible_after_recovery()
+                                    phase_overlay = None
+                                    log_message(
+                                        f"[FEASIBLE RECOVERY] t={t}: current={current_ee_states.tolist()} "
+                                        f"target={recovery.target_ee_states.tolist()} "
+                                        f"per_step={recovery.correction_per_step[0].tolist() if recovery.correction_per_step.ndim == 2 else recovery.correction_per_step.tolist()} "
+                                        f"per_step_last={recovery.correction_per_step[-1].tolist() if recovery.correction_per_step.ndim == 2 else ''} "
+                                        f"sim={recovery.similarity:.3f} demos={recovery.demo_ids}",
+                                        log_file,
+                                    )
+                                else:
+                                    feasible_result = execution_result.feasible_result
+                                    far = (
+                                        feasible_result is not None
+                                        and feasible_result.current_distance is not None
+                                        and feasible_result.ready_distance is not None
+                                        and feasible_result.current_distance > feasible_result.ready_distance * 2.5
+                                    )
+                                    recovery = (
+                                        feasible_recovery.compute_nearest_ready(
+                                            phase_task_name,
+                                            active_spec.planner_step_id,
+                                            active_spec.skill,
+                                            active_spec.arguments,
+                                            current_ee_states,
+                                        )
+                                        if far else None
+                                    )
+                                    if recovery is not None:
+                                        _correction_kind = "feasible_nearest_ready"
+                                        _correction_steps_remaining = recovery.correction_steps
+                                        _correction_per_step = recovery.correction_per_step
+                                        _correction_controller = recovery.controller
+                                        _correction_step_index = 0
+                                        offset_gripper_action = float(bool(last_gripper_closed))
+                                        action_queue.clear()
+                                        episode_execution_monitor.retry_current_phase()
+                                        phase_overlay = None
+                                        log_message(
+                                            f"[FEASIBLE NEAREST READY] t={t}: far={far} "
+                                            f"target={recovery.target_ee_states.tolist()} "
+                                            f"demos={recovery.demo_ids}",
+                                            log_file,
+                                        )
+                                    else:
+                                        _correction_kind = "feasible_retry"
+                                        _correction_steps_remaining = 1
+                                        _correction_per_step = np.zeros(6, dtype=np.float32)
+                                        _correction_step_index = 0
+                                        offset_gripper_action = float(bool(last_gripper_closed))
+                                        action_queue.clear()
+                                        episode_execution_monitor.retry_current_phase()
+                                        phase_overlay = None
+                                        log_message(
+                                            f"[FEASIBLE RECOVERY] t={t}: no confident target; retry phase",
+                                            log_file,
+                                        )
+                            else:
+                                log_message(
+                                    f"[FEASIBLE RECOVERY] t={t}: skip feasible correction; "
+                                    "limit reached for this phase",
+                                    log_file,
+                                )
                         if execution_result.phase_result is not None:
                             phase_overlay = _phase_overlay_payload(
                                 active_spec, execution_result.phase_result
@@ -1182,6 +1463,7 @@ def run_episode(
                                 observation["primary_image"], phase_overlay
                             )
                         elif execution_result.phase_advanced:
+                            _phase_correction_count = 0
                             phase_overlay = None
                         verifier_record = {
                             "task_name": phase_task_name,
@@ -1218,6 +1500,7 @@ def run_episode(
                                 default=_phase_json_default,
                             ),
                             log_file,
+                            console=(tag != "PHASE"),
                         )
                     except Exception as verifier_error:
                         execution_monitor_error = str(verifier_error)
@@ -1234,13 +1517,32 @@ def run_episode(
 
             # A newly detected correction begins immediately on this timestep.
             _is_correction_action = (
-                (_online or _early_inject) and _correction_steps_remaining > 0
+                _correction_steps_remaining > 0
+                and (_correction_per_step is not None or _correction_controller is not None)
             )
             if _is_correction_action:
-                action = np.zeros(7, dtype=np.float32)
-                action[:6] = _correction_per_step
-                action[6] = offset_gripper_action
+                if _correction_controller is not None:
+                    # Step-level closed loop: regenerate the action from the
+                    # current measured EE pose every step.
+                    _current_ee_states = np.concatenate([
+                        obs["robot0_eef_pos"],
+                        Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+                    ]).astype(np.float32)
+                    _step_action = _correction_controller.step(_current_ee_states)
+                elif np.ndim(_correction_per_step) == 2:
+                    _step_action = _correction_per_step[
+                        min(_correction_step_index, _correction_per_step.shape[0] - 1)
+                    ]
+                else:
+                    _step_action = _correction_per_step
+                if np.ndim(_step_action) == 1 and _step_action.shape[0] == 7:
+                    action = _step_action.astype(np.float32).copy()
+                else:
+                    action = np.zeros(7, dtype=np.float32)
+                    action[:6] = _step_action
+                    action[6] = offset_gripper_action
                 _correction_steps_remaining -= 1
+                _correction_step_index += 1
             else:
                 action = action_queue.popleft()
 
@@ -1255,15 +1557,19 @@ def run_episode(
             # Execute action in environment
             last_gripper_closed = bool(float(action[6]) > 0.0)
             obs, reward, done, info = env.step(action.tolist())
-            if (_online or _early_inject) and _correction_per_step is not None and _correction_steps_remaining == 0:
+            if (_correction_per_step is not None or _correction_controller is not None) and _correction_steps_remaining == 0:
                 _finished_kind = _correction_kind
                 offset_gripper_action = None
                 _correction_per_step = None
+                _correction_controller = None
+                _correction_step_index = 0
                 _correction_kind = None
                 if _finished_kind == "early_manifold":
                     _online_prop.clear()
                     _online_act.clear()
                     _online_debug = _online
+                if _finished_kind == "feasible_pose_recovery" and episode_execution_monitor is not None:
+                    episode_execution_monitor.mark_feasible_after_recovery(timestep=t)
                 log_message(
                     f"[CORRECTION] t={t}: {_finished_kind} correction finished; resuming policy",
                     log_file,
@@ -1305,6 +1611,7 @@ def run_episode(
                 default=_phase_json_default,
             ),
             log_file,
+            console=False,
         )
 
     # Fill data collection buffers
@@ -1374,6 +1681,8 @@ def run_task(
     total_successes=0,
     log_file=None,
     execution_monitor=None,
+    pose_recovery=None,
+    feasible_recovery=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -1432,6 +1741,8 @@ def run_task(
             episode_index=episode_idx,
             execution_monitor=execution_monitor,
             phase_task_name=phase_task_name,
+            pose_recovery=pose_recovery,
+            feasible_recovery=feasible_recovery,
         )
 
         # Update counters
@@ -1629,6 +1940,30 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
             "observation-only mode; policy actions remain unchanged",
             log_file,
         )
+    pose_recovery = None
+    if cfg.enable_phase_recovery:
+        if execution_monitor is None:
+            raise ValueError("enable_phase_recovery requires enable_phase_verifier=True")
+        from execute.libero_pose_recovery import LiberoPoseRecovery
+        pose_recovery = LiberoPoseRecovery(
+            _REPO_ROOT / "skill_memory/libero_10/recovery_targets.pt"
+        )
+        log_message(
+            "Phase-error pose recovery enabled",
+            log_file,
+        )
+    feasible_recovery = None
+    if cfg.enable_feasible_recovery:
+        if execution_monitor is None:
+            raise ValueError("enable_feasible_recovery requires enable_phase_verifier=True")
+        from execute.libero_feasible_recovery import LiberoFeasibleRecovery
+        feasible_recovery = LiberoFeasibleRecovery(
+            _REPO_ROOT / "skill_memory/libero_10/feasible_recovery_targets.pt"
+        )
+        log_message(
+            "Feasible-error pose recovery enabled",
+            log_file,
+        )
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
     log_message(f"Number of tasks: {num_tasks}", log_file)
@@ -1636,6 +1971,9 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
     # Start evaluation
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks)):
+        task = task_suite.get_task(task_id)
+        if cfg.task_filter and cfg.task_filter not in task.name:
+            continue
         (
             total_episodes,
             total_successes,
@@ -1652,6 +1990,8 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
             total_successes,
             log_file,
             execution_monitor=execution_monitor,
+            pose_recovery=pose_recovery,
+            feasible_recovery=feasible_recovery,
         )
 
     # Calculate final success rate

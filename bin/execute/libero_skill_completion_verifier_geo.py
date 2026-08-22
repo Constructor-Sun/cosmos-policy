@@ -2,6 +2,7 @@
 """Wrist/geometric skill-completion verifier for LIBERO."""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -14,27 +15,33 @@ import torch
 SKILL_COMPLETE = "SKILL_COMPLETE"
 COMPLETION_UNKNOWN = "COMPLETION_UNKNOWN"
 
-# Existing framework constants.
-TOLERANCE_PX = 5.0      # phase verifier's 5px tolerance
-CONFIRMATIONS = 2       # existing two-consecutive-evidence rule
-MIN_DEMO_VOTES = 2      # existing cross-demo consensus rule
+TOLERANCE_PX = 5.0
+CONFIRMATIONS = 2
+MIN_DEMO_VOTES = 2
 
 PICK_SKILLS = {"Pick"}
 PLACE_SKILLS = {"PlaceIn", "PlaceOn"}
 ANCHOR_SKILLS = {"Pick", "Open", "Close"}
 
-# Wrist-based completion heuristics.
 WRIST_HISTORY = 5
 WRIST_DIFF_THRESHOLD = 6.0
-WRIST_STABLE_RATIO = 0.75
-WRIST_PICK_CONFIRMATIONS = 3
-WRIST_MIN_INLIERS = 5
-WRIST_RATIO_TEST = 0.75
-WRIST_OBJECT_MIN_FRAMES = 2
-WRIST_OBJECT_MAX_CENTER_DRIFT = 6.0
-WRIST_GRIPPER_MOVE_THRESHOLD = 2.0
+PICK_MOVE_DIST = 0.04
 PLACE_STABLE_DROP = 0.15
 PLACE_MOTION_THRESHOLD = 8.0
+FLOW_ROI_HALF = 40
+FLOW_MIN_POINTS = 8
+FLOW_INLIER_THRESHOLD = 0.5
+
+EMPTY_CLOSED_GAP = 0.003
+CENTER_JUMP_THRESHOLD = 10.0
+PICK_N_OF_M = 4
+PICK_M_OF_M = 5
+
+# Wrong-object grasp guard: a Pick close command whose gripper is outside the
+# demo ready-anchor cluster is treated as an invalid (wrong-object) grasp.
+CLOSE_GRACE_STEPS = 5      # steps after the close edge before judging (let feasible latch first)
+ANCHOR_TOL_PX = 25.0       # tolerance outside the demo anchor cluster (data: ok<=12px, wrong>=58px)
+WRONG_GRASP_MAX = 2        # per-phase budget for wrong-grasp interventions (separate from phase corrections)
 
 
 @dataclass(frozen=True)
@@ -60,24 +67,16 @@ def _phase_key(task: str, step: int, skill: str, arguments: dict[str, Any]):
 class LiberoSkillCompletionVerifierGeo:
     """Per-skill completion verifier.
 
-    When a wrist image is available:
-      Pick: gripper closed + wrist image becomes stable (object held still);
-      PlaceIn/On: release transition + gripper open; motion metrics are logged.
-
-    Without a wrist image, it falls back to the previous geometric rules:
-      Pick/Open/Close: gripper_xy inside the demo ready-anchor cluster;
-      PlaceIn/On: release transition inside the target bbox;
-      other: always UNKNOWN.
-
-    A phase completes after CONFIRMATIONS consecutive observations meet the
-    gate; any miss resets the count.
+    The execution monitor decides when COMPLETION_CHECK starts.  This class only
+    decides whether an observation is completion evidence and whether enough
+    evidence has accumulated.
     """
 
     def __init__(self, phase_targets: str | Path,
                  wrist_completion_targets: str | Path | None = None):
         self._ready_anchors: dict[tuple, tuple[tuple[str, np.ndarray], ...]] = {}
-        self._load_ready_anchors(phase_targets)
         self._wrist_memory: dict[tuple, list[dict[str, Any]]] = {}
+        self._load_ready_anchors(phase_targets)
         if wrist_completion_targets is not None:
             self._load_wrist_completion_targets(wrist_completion_targets)
         self.skill = ""
@@ -89,12 +88,20 @@ class LiberoSkillCompletionVerifierGeo:
         self.completed = False
         self.wrist_history: list[np.ndarray] = []
         self.prev_stable_ratio: float | None = None
-        self.object_centers: list[tuple[int, int]] = []
-        self.object_bbox: tuple[int, int, int, int] | None = None
-        self.prev_gripper_xy: np.ndarray | None = None
-        self.gripper_moved_since_close = False
-        self.sift = cv2.SIFT_create(nfeatures=1024)
-        self.matcher = cv2.BFMatcher(cv2.NORM_L2)
+        self.pick_close_xyz: np.ndarray | None = None
+        self.pick_moved = False
+        self.pick_last_center = None
+        self.flow_prev_gray: np.ndarray | None = None
+        self.flow_prev_pts: np.ndarray | None = None
+        self.flow_inlier_ratio = 0.0
+        self.pick_confirmations: deque[bool] = deque(maxlen=PICK_M_OF_M)
+        # Wrong-object grasp guard state (reset per phase).
+        self._edge_prev_closed: bool | None = None
+        self.pick_edge_t: int | None = None
+        self.pick_close_xy2d: np.ndarray | None = None
+        self._edge_resolved = False
+        self.wrong_grasp_pending = False
+        self.wrong_grasp_count = 0
 
     # ------------------------------------------------------------------ #
     def _load_ready_anchors(self, phase_targets: str | Path) -> None:
@@ -117,10 +124,8 @@ class LiberoSkillCompletionVerifierGeo:
     def _load_wrist_completion_targets(self, path: str | Path) -> None:
         payload = torch.load(path, map_location="cpu", weights_only=False)
         for tpl in payload.get("templates", []):
-            key = _phase_key(
-                tpl["task_name"], tpl["planner_step_id"],
-                tpl["skill"], tpl.get("arguments", {}),
-            )
+            key = _phase_key(tpl["task_name"], tpl["planner_step_id"],
+                             tpl["skill"], tpl.get("arguments", {}))
             self._wrist_memory.setdefault(key, []).append(tpl)
 
     def _select_wrist_templates(
@@ -147,16 +152,18 @@ class LiberoSkillCompletionVerifierGeo:
               exclude_demo_ids: Iterable[str] = ()) -> None:
         self.skill = str(skill)
         excluded = {str(item) for item in exclude_demo_ids}
+        key = _phase_key(task, step, skill, arguments)
         self.ready_anchors = tuple(
-            item for item in self._ready_anchors.get(
-                _phase_key(task, step, skill, arguments), ())
-            if item[0] not in excluded)
-        if not self.ready_anchors:  # fall back to same task+skill+arguments
+            item for item in self._ready_anchors.get(key, ())
+            if item[0] not in excluded
+        )
+        if not self.ready_anchors:
             args_key = _arguments_key(arguments)
             self.ready_anchors = tuple(
                 item for (name, _s, kind, args), items in self._ready_anchors.items()
                 if name == task and kind == skill and args == args_key
-                for item in items if item[0] not in excluded)
+                for item in items if item[0] not in excluded
+            )
         self.wrist_templates = self._select_wrist_templates(
             task, step, skill, arguments, exclude_demo_ids
         )
@@ -166,12 +173,20 @@ class LiberoSkillCompletionVerifierGeo:
         self.completed = False
         self.wrist_history.clear()
         self.prev_stable_ratio = None
-        self.object_centers.clear()
-        self.object_bbox = None
-        self.prev_gripper_xy = None
-        self.gripper_moved_since_close = False
+        self.pick_close_xyz = None
+        self.pick_moved = False
+        self.pick_last_center = None
+        self.flow_prev_gray = None
+        self.flow_prev_pts = None
+        self.flow_inlier_ratio = 0.0
+        self.pick_confirmations.clear()
+        self._edge_prev_closed = None
+        self.pick_edge_t = None
+        self.pick_close_xy2d = None
+        self._edge_resolved = False
+        self.wrong_grasp_pending = False
+        self.wrong_grasp_count = 0
 
-    # Interface compatibility with the sequential monitor (VAE-era no-ops).
     def calibrate(self, current_vae: Any | None = None) -> None:
         pass
 
@@ -196,10 +211,11 @@ class LiberoSkillCompletionVerifierGeo:
                        float(max(xs)), float(max(ys)))
             inside = (cluster[0] <= gripper_xy[0] <= cluster[2]
                       and cluster[1] <= gripper_xy[1] <= cluster[3])
-            details = {"anchor_cluster": cluster,
-                       "anchor_count": len(self.ready_anchors)}
             return inside, ("inside_anchor_cluster" if inside
-                            else "outside_anchor_cluster"), details
+                            else "outside_anchor_cluster"), {
+                "anchor_cluster": cluster,
+                "anchor_count": len(self.ready_anchors),
+            }
         if self.skill in PLACE_SKILLS:
             if self.target_bbox is None:
                 return False, "target_bbox_unknown", {}
@@ -208,18 +224,61 @@ class LiberoSkillCompletionVerifierGeo:
             inside = self._inside(gripper_xy, self.target_bbox)
             return inside, ("open_inside_region" if inside
                             else "gripper_outside_region"), {}
-        if self.skill in ANCHOR_SKILLS:
-            if not gripper_closed:
-                return False, "gripper_not_closed", {}
-            dists = [float(np.hypot(*(gripper_xy - anchor)))
-                     for _demo, anchor in self.ready_anchors]
-            votes = sum(1 for dist in dists if dist <= TOLERANCE_PX)
-            details = {"anchor_votes": votes,
-                       "nearest_anchor_px": min(dists) if dists else None}
-            return (votes >= MIN_DEMO_VOTES,
-                    ("ready_anchor_votes" if votes >= MIN_DEMO_VOTES
-                     else "ready_anchor_far"), details)
         return False, "no_geometric_completion_rule", {}
+
+    # ------------------------------------------------------------------ #
+    def _inside_anchor_cluster(self, gripper_xy) -> bool:
+        """True if the (projected) gripper is inside the demo ready-anchor
+        cluster inflated by ANCHOR_TOL_PX.  The anchors come from the demos
+        (last gripper pose of the phase), so this check is immune to the
+        runtime phase-verifier match quality."""
+        if len(self.ready_anchors) < MIN_DEMO_VOTES:
+            return True
+        xs = [float(anchor[0]) for _demo, anchor in self.ready_anchors]
+        ys = [float(anchor[1]) for _demo, anchor in self.ready_anchors]
+        return (min(xs) - ANCHOR_TOL_PX <= float(gripper_xy[0]) <= max(xs) + ANCHOR_TOL_PX
+                and min(ys) - ANCHOR_TOL_PX <= float(gripper_xy[1]) <= max(ys) + ANCHOR_TOL_PX)
+
+    def evaluate_close_edge(self, gripper_closed: bool | None,
+                            gripper_xy: Any = None,
+                            timestep: int | None = None) -> None:
+        """Step-level close-edge monitor, run in every stage (not only during
+        COMPLETION_CHECK).
+
+        On the rising edge of the close command, the projected gripper
+        position is remembered.  After CLOSE_GRACE_STEPS (during which the
+        normal feasible/wrist state machine may latch), if the gripper is
+        outside the demo ready-anchor cluster of the current Pick phase, the
+        close is flagged as a wrong-object grasp (wrong_grasp_pending) so the
+        caller can intervene before the object is lifted away.
+        """
+        if self.skill not in PICK_SKILLS:
+            return
+        edge = gripper_closed is True and self._edge_prev_closed is not True
+        self._edge_prev_closed = bool(gripper_closed)
+        if edge and self.pick_edge_t is None:
+            self.pick_edge_t = timestep
+            if gripper_xy is not None:
+                self.pick_close_xy2d = np.asarray(gripper_xy, dtype=np.float32).reshape(2)
+        if (self.pick_edge_t is not None and not self._edge_resolved
+                and timestep is not None and timestep - self.pick_edge_t >= CLOSE_GRACE_STEPS):
+            self._edge_resolved = True
+            if (self.wrong_grasp_count < WRONG_GRASP_MAX
+                    and self.pick_close_xy2d is not None
+                    and not self._inside_anchor_cluster(self.pick_close_xy2d)):
+                self.wrong_grasp_pending = True
+
+    def begin_wrong_grasp_recovery(self) -> None:
+        """Clear grasp + edge state when a wrong-object grasp correction starts."""
+        self._edge_prev_closed = None
+        self.pick_edge_t = None
+        self.pick_close_xy2d = None
+        self._edge_resolved = False
+        self.wrong_grasp_pending = False
+        self.pick_close_xyz = None
+        self.pick_moved = False
+        self.pick_last_center = None
+        self.pick_confirmations.clear()
 
     # ------------------------------------------------------------------ #
     def _update_wrist_metrics(self, wrist_image: Any) -> dict[str, float] | None:
@@ -244,137 +303,64 @@ class LiberoSkillCompletionVerifierGeo:
             "mean_diff": float(np.mean(diff)),
         }
 
-    def _update_object_tracking(self, wrist_image: Any) -> dict[str, Any] | None:
-        if not self.wrist_templates:
-            return None
-        image = np.asarray(wrist_image)
-        if image.ndim == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        elif image.ndim == 2:
-            gray = image
-        else:
-            return None
-        keypoints, descriptors = self.sift.detectAndCompute(gray, None)
-        if descriptors is None or len(keypoints) < 4:
-            self.object_centers.clear()
-            self.object_bbox = None
-            return {
-                "present": False, "score": 0.0, "frame_count": 0,
-                "center_drift": 0.0, "reason": "few_wrist_features",
-            }
-
-        best = None
-        for tpl in self.wrist_templates:
-            tdes = tpl.get("descriptors")
-            if tdes is None or len(tdes) < 2:
-                continue
-            pairs = self.matcher.knnMatch(
-                np.asarray(tdes, dtype=np.float32), descriptors, k=2
-            )
-            good = [
-                first for first, second in pairs
-                if first.distance < WRIST_RATIO_TEST * second.distance
-            ]
-            if len(good) < WRIST_MIN_INLIERS:
-                continue
-            src = np.float32(
-                [tpl["keypoints_xy"][m.queryIdx] for m in good]
-            ).reshape(-1, 1, 2)
-            dst = np.float32(
-                [keypoints[m.trainIdx].pt for m in good]
-            ).reshape(-1, 1, 2)
-            homography, _mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-            bbox = None
-            if homography is not None:
-                height, width = tpl["crop_rgb"].shape[:2]
-                corners = np.float32(
-                    [[0, 0], [width, 0], [width, height], [0, height]]
-                ).reshape(-1, 1, 2)
-                projected = cv2.perspectiveTransform(corners, homography).reshape(-1, 2)
-                x0 = max(0, int(projected[:, 0].min()))
-                y0 = max(0, int(projected[:, 1].min()))
-                x1 = min(gray.shape[1], int(projected[:, 0].max()) + 1)
-                y1 = min(gray.shape[0], int(projected[:, 1].max()) + 1)
-                if x1 - x0 >= 8 and y1 - y0 >= 8:
-                    bbox = (x0, y0, x1, y1)
-            if bbox is None:
-                xs = [keypoints[m.trainIdx].pt[0] for m in good]
-                ys = [keypoints[m.trainIdx].pt[1] for m in good]
-                x0 = max(0, int(min(xs)))
-                y0 = max(0, int(min(ys)))
-                x1 = min(gray.shape[1], int(max(xs)) + 1)
-                y1 = min(gray.shape[0], int(max(ys)) + 1)
-                if x1 - x0 >= 8 and y1 - y0 >= 8:
-                    bbox = (x0, y0, x1, y1)
-            score = len(good)
-            if best is None or score > best[0]:
-                best = (score, bbox)
-
-        if best is None or best[1] is None:
-            self.object_centers.clear()
-            self.object_bbox = None
-            return {
-                "present": False, "score": 0.0, "frame_count": 0,
-                "center_drift": 0.0, "reason": "wrist_object_no_memory_match",
-            }
-
-        score, bbox = best
-        x0, y0, x1, y1 = bbox
-        cx = int(round((x0 + x1) / 2.0))
-        cy = int(round((y0 + y1) / 2.0))
-        self.object_centers.append((cx, cy))
-        self.object_centers = self.object_centers[-WRIST_HISTORY:]
-        self.object_bbox = bbox
-
-        center_drift = 0.0
-        if len(self.object_centers) >= 2:
-            drifts = [
-                np.hypot(
-                    self.object_centers[i + 1][0] - self.object_centers[i][0],
-                    self.object_centers[i + 1][1] - self.object_centers[i][1],
-                )
-                for i in range(len(self.object_centers) - 1)
-            ]
-            center_drift = float(np.mean(drifts))
-
-        return {
-            "present": True,
-            "score": float(score),
-            "frame_count": len(self.object_centers),
-            "center_drift": center_drift,
-            "reason": "wrist_object_memory_match",
-            "bbox": bbox,
-        }
-
-    def _wrist_pick_gate(self, gripper_closed: bool | None,
-                         metrics: dict[str, float],
-                         wrist_image: Any = None) -> tuple[bool, str, dict[str, Any]]:
-        if gripper_closed is not True:
-            return False, "gripper_not_closed", dict(metrics)
-        details = dict(metrics)
+    def _pick_center(self, wrist_image):
+        gray = cv2.cvtColor(wrist_image, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape[:2]
         if self.wrist_templates:
-            tracking = self._update_object_tracking(wrist_image)
-            if tracking is None:
-                return False, "no_object_tracking", details
-            details.update({
-                "wrist_match_score": tracking["score"],
-                "wrist_match_reason": tracking["reason"],
-                "object_frame_count": tracking["frame_count"],
-                "object_center_drift": tracking.get("center_drift", 0.0),
-                "object_bbox": tracking.get("bbox"),
-            })
-            if not tracking["present"]:
-                return False, tracking["reason"], details
-            if tracking["frame_count"] < WRIST_OBJECT_MIN_FRAMES:
-                return False, "object_tracking_warmup", details
-            if not self.gripper_moved_since_close:
-                return False, "gripper_not_moved_since_close", details
-            if tracking.get("center_drift", 0.0) > WRIST_OBJECT_MAX_CENTER_DRIFT:
-                return False, "object_center_drifting", details
-            return True, "object_center_stable_with_object", details
-        if metrics["stable_ratio"] < WRIST_STABLE_RATIO:
-            return False, "wrist_not_stable", dict(metrics)
-        return True, "wrist_stable_after_grasp", dict(metrics)
+            tpl = self.wrist_templates[0]
+            cx = int(round(float(tpl["target_center_xy"][0])))
+            cy = int(round(float(tpl["target_center_xy"][1])))
+        else:
+            cx, cy = w // 2, h // 2
+        x0 = max(0, cx - FLOW_ROI_HALF)
+        y0 = max(0, cy - FLOW_ROI_HALF)
+        x1 = min(w, cx + FLOW_ROI_HALF)
+        y1 = min(h, cy + FLOW_ROI_HALF)
+
+        if self.flow_prev_pts is None or len(self.flow_prev_pts) < FLOW_MIN_POINTS:
+            mask = np.zeros_like(gray)
+            mask[y0:y1, x0:x1] = 255
+            pts = cv2.goodFeaturesToTrack(
+                gray, maxCorners=100, qualityLevel=0.01,
+                minDistance=10, mask=mask,
+            )
+            self.flow_prev_pts = pts
+            self.flow_prev_gray = gray
+            self.flow_inlier_ratio = 0.0
+            return None
+
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.flow_prev_gray, gray, self.flow_prev_pts, None
+        )
+        if curr_pts is None:
+            self.flow_prev_pts = None
+            self.flow_inlier_ratio = 0.0
+            return None
+
+        prev_ok = self.flow_prev_pts[status.flatten() == 1]
+        curr_ok = curr_pts[status.flatten() == 1]
+        if len(prev_ok) < FLOW_MIN_POINTS:
+            self.flow_prev_pts = None
+            self.flow_inlier_ratio = 0.0
+            return None
+
+        H, mask = cv2.findHomography(prev_ok, curr_ok, cv2.RANSAC, 3.0)
+        if H is None or mask is None:
+            self.flow_prev_pts = None
+            self.flow_inlier_ratio = 0.0
+            return None
+
+        inliers = curr_ok[mask.flatten() == 1]
+        self.flow_inlier_ratio = float(len(inliers) / len(curr_ok))
+        if self.flow_inlier_ratio < FLOW_INLIER_THRESHOLD or len(inliers) < FLOW_MIN_POINTS:
+            self.flow_prev_pts = None
+            self.flow_inlier_ratio = 0.0
+            return None
+
+        center = inliers.reshape(-1, 2).mean(axis=0)
+        self.flow_prev_pts = inliers.reshape(-1, 1, 2)
+        self.flow_prev_gray = gray
+        return (int(round(center[0])), int(round(center[1])))
 
     def _wrist_place_gate(self, gripper_closed: bool | None,
                           metrics: dict[str, float]) -> tuple[bool, str, dict[str, Any]]:
@@ -391,13 +377,9 @@ class LiberoSkillCompletionVerifierGeo:
             or stable_drop > PLACE_STABLE_DROP
         )
         details["moving"] = moving
-        # The release transition is handled by the caller; once the gripper is
-        # open after a release, count it as completion evidence. The motion
-        # metrics are logged for diagnostics and can be tightened later.
         return True, ("wrist_object_released" if moving else "wrist_open_after_release"), details
 
     def observe_wrist(self, wrist_image: Any = None) -> None:
-        """Warm up wrist-history without affecting completion state."""
         if wrist_image is None:
             return
         metrics = self._update_wrist_metrics(wrist_image)
@@ -407,7 +389,8 @@ class LiberoSkillCompletionVerifierGeo:
     def update(self, current_vae: Any | None = None, *,
                gripper_closed: bool | None = None, gripper_xy: Any = None,
                target_bbox: Any = None, timestep: int | None = None,
-               wrist_image: Any = None) -> SkillCompletionResult:
+               wrist_image: Any = None, gripper_qpos: Any = None,
+               eef_pos: Any = None) -> SkillCompletionResult:
         gxy = (np.asarray(gripper_xy, dtype=np.float32)
                if gripper_xy is not None else None)
         details: dict[str, Any] = {}
@@ -420,35 +403,83 @@ class LiberoSkillCompletionVerifierGeo:
                 self._update_wrist_metrics(wrist_image)
                 if wrist_image is not None else None
             )
-            if gripper_xy is not None:
-                gxy_arr = np.asarray(gripper_xy, dtype=np.float32).reshape(2)
-                if gripper_closed is True:
+            if gripper_closed is True:
+                if eef_pos is not None:
+                    eef = np.asarray(eef_pos, dtype=np.float32).reshape(3)
                     if self._prev_closed is not True:
-                        self.gripper_moved_since_close = False
-                    elif (
-                        not self.gripper_moved_since_close
-                        and self.prev_gripper_xy is not None
-                        and np.linalg.norm(gxy_arr - self.prev_gripper_xy)
-                        > WRIST_GRIPPER_MOVE_THRESHOLD
-                    ):
-                        self.gripper_moved_since_close = True
-                self.prev_gripper_xy = gxy_arr.copy()
+                        self.pick_close_xyz = eef.copy()
+                        self.pick_moved = False
+                        self.pick_last_center = None
+                        self.pick_confirmations.clear()
+                    elif not self.pick_moved and self.pick_close_xyz is not None:
+                        if np.linalg.norm(eef - self.pick_close_xyz) >= PICK_MOVE_DIST:
+                            self.pick_moved = True
+            else:
+                self.pick_close_xyz = None
+                self.pick_moved = False
+                self.pick_last_center = None
+                self.pick_confirmations.clear()
             specific = False
             if wrist_metrics is not None and self.skill in PICK_SKILLS:
-                met, reason, details = self._wrist_pick_gate(
-                    gripper_closed, wrist_metrics, wrist_image
+                center = self._pick_center(wrist_image)
+                jump = float("inf")
+                if center is not None:
+                    if self.pick_last_center is not None:
+                        jump = float(np.hypot(
+                            center[0] - self.pick_last_center[0],
+                            center[1] - self.pick_last_center[1],
+                        ))
+                    self.pick_last_center = center
+                gap = None
+                if gripper_qpos is not None:
+                    try:
+                        gap = float(gripper_qpos[0]) - float(gripper_qpos[1])
+                    except Exception:
+                        gap = None
+                met = bool(
+                    gripper_closed is True
+                    and center is not None
+                    and self.pick_moved
+                    and jump <= CENTER_JUMP_THRESHOLD
+                    and self.flow_inlier_ratio >= FLOW_INLIER_THRESHOLD
+                    and (gap is None or gap > EMPTY_CLOSED_GAP)
+                    and (self.pick_close_xy2d is None
+                         or self._inside_anchor_cluster(self.pick_close_xy2d))
                 )
-                if met:
-                    self.confirmation_count += 1
-                else:
-                    self.confirmation_count = 0
+                details = dict(
+                    wrist_metrics,
+                    object_center=center,
+                    pick_moved=self.pick_moved,
+                    gap=gap,
+                    flow_inlier_ratio=self.flow_inlier_ratio,
+                    close_xy2d=(
+                        self.pick_close_xy2d.tolist()
+                        if self.pick_close_xy2d is not None else None
+                    ),
+                )
+                reason = (
+                    "object_center_stable_with_object" if met
+                    else "gripper_not_closed" if gripper_closed is not True
+                    else "gripper_empty_close" if gap is not None and gap <= EMPTY_CLOSED_GAP
+                    else "object_center_unknown" if center is None
+                    else "gripper_not_moved_since_close" if not self.pick_moved
+                    else "gripper_outside_target_anchor" if (
+                        self.pick_close_xy2d is not None
+                        and not self._inside_anchor_cluster(self.pick_close_xy2d)
+                    )
+                    else "object_center_jump"
+                )
+                self.pick_confirmations.append(met)
+                self.confirmation_count = sum(self.pick_confirmations)
             elif wrist_metrics is not None and self.skill in PLACE_SKILLS:
                 released = self._prev_closed is True and gripper_closed is False
                 met, reason, details = self._wrist_place_gate(
                     gripper_closed, wrist_metrics
                 )
-                if released and met:
-                    self.confirmation_count = max(self.confirmation_count, 1)
+                # We intentionally do not try to repair a failed release in the
+                # current Place phase. Treat any release as completion.
+                if released:
+                    self.confirmation_count = max(self.confirmation_count, CONFIRMATIONS)
                     reason = "released_wrist_object"
                     specific = True
                 elif met and self.confirmation_count >= 1:
@@ -459,8 +490,8 @@ class LiberoSkillCompletionVerifierGeo:
                 met, reason, details = self._gate_met(gripper_closed, gxy)
                 if self.skill in PLACE_SKILLS:
                     released = self._prev_closed is True and gripper_closed is False
-                    if released and met:
-                        self.confirmation_count = max(self.confirmation_count, 1)
+                    if released:
+                        self.confirmation_count = max(self.confirmation_count, CONFIRMATIONS)
                         reason = "released_inside_region"
                         specific = True
                     elif met and self.confirmation_count >= 1:
@@ -476,7 +507,7 @@ class LiberoSkillCompletionVerifierGeo:
             self._prev_closed = (None if gripper_closed is None
                                  else bool(gripper_closed))
             required_confirmations = (
-                WRIST_PICK_CONFIRMATIONS
+                PICK_N_OF_M
                 if wrist_metrics is not None and self.skill in PICK_SKILLS
                 else CONFIRMATIONS
             )
@@ -493,5 +524,6 @@ class LiberoSkillCompletionVerifierGeo:
              "gripper_closed": gripper_closed,
              "gripper_xy": (gxy.tolist() if gxy is not None else None),
              "target_bbox": self.target_bbox,
+             "pick_confirmations": list(self.pick_confirmations),
              **details},
         )

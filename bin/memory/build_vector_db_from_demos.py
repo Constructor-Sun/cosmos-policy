@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import h5py, numpy as np, torch
 from PIL import Image
+from scipy.spatial.transform import Rotation
 
 ROOT = Path(__file__).resolve().parents[2]
 CKPT = Path(os.environ.get("CHECKPOINT_ROOT", ROOT.parent.parent / "checkpoints"))
@@ -107,6 +108,41 @@ def encode_vae(frame, ajpg, wjpg, rstate, cfg, stats, t5_emb, model, device):
         _, lat, _ = model.get_data_and_condition(batch)
     return lat[0, :, [2, 3], :, :].half().cpu()
 
+def compute_action_scale(acts, rstate, start, end):
+    """Reuse the action-to-displacement calibration from online correction."""
+    a = acts[start:end, :6].astype(np.float64)
+    p0 = rstate[start, 2:5].astype(np.float64)
+    p1 = rstate[end, 2:5].astype(np.float64)
+    r0 = Rotation.from_quat(rstate[start, 5:9])
+    r1 = Rotation.from_quat(rstate[end, 5:9])
+    dp = p1 - p0
+    dr = (r1 * r0.inv()).as_rotvec()
+    asp = a[:, :3].sum(axis=0)
+    rm = np.eye(3)
+    for ra in a[:, 3:6]:
+        rm = Rotation.from_rotvec(0.5 * ra).as_matrix() @ rm
+    asr = Rotation.from_matrix(rm).as_rotvec() / 0.5
+    scale = np.ones(6, dtype=np.float32)
+    for j in range(3):
+        if abs(asp[j]) > 1e-8:
+            scale[j] = float(dp[j] / asp[j])
+        if abs(asr[j]) > 1e-8:
+            scale[3 + j] = float(dr[j] / asr[j])
+    return scale
+
+
+def raw_action_chunk(acts, start, end, chunk_size=16):
+    """Extract a fixed-length 6D raw action chunk, padding the last row if needed."""
+    start = max(0, int(start))
+    end = min(int(end), acts.shape[0])
+    raw = acts[start:end, :7].astype(np.float32)
+    if len(raw) < chunk_size:
+        pad_row = raw[-1] if len(raw) else np.zeros(7, dtype=np.float32)
+        pad = np.tile(pad_row, (chunk_size - len(raw), 1))
+        raw = np.concatenate([raw, pad], axis=0)
+    return raw
+
+
 def make_chunk(t, segment_end, acts, rstate, vae_at, stats, demo_index):
     end = min(t + 16, segment_end)
     valid_length = end - t
@@ -138,6 +174,8 @@ def main():
     p.add_argument("--max-per-task", type=int, default=10)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--flip-images", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--feasible-recovery-output", type=Path,
+                   help="Optional separate output for ready-frame feasible recovery targets")
     args = p.parse_args()
     args.input_dir = args.input_dir.expanduser().resolve()
     if args.segments_manifest:
@@ -170,6 +208,8 @@ def main():
     print("Model ready.", flush=True)
 
     total, h5s = 0, sorted(args.input_dir.glob("*_demo.hdf5"))
+    recovery_targets = []
+    feasible_recovery_targets = []
     if not h5s: raise FileNotFoundError(f"No *_demo.hdf5 in {args.input_dir}")
     for h5_path in h5s:
         task_name = h5_path.stem.replace("_demo", "")
@@ -182,6 +222,7 @@ def main():
             with h5py.File(h5_path, "r") as f:
                 g = f["data"][dk]
                 acts, rstate = g["actions"][:], g["robot_states"][:]
+                ee_states = g["obs"]["ee_states"][:]
                 ajpg, wjpg = g["obs"]["agentview_rgb_jpeg"][:], g["obs"]["eye_in_hand_rgb_jpeg"][:]
             T, demo_index = acts.shape[0], int(dk.split("_")[1])
             cache = {}
@@ -223,6 +264,19 @@ def main():
                         make_chunk(t, end, acts, rstate, vae_at, stats, demo_index)
                         for t in range(start, end, 16)
                     ]
+                    recovery_frame = min(start + 16, max(start, end - 1))
+                    recovery_targets.append({
+                        "task_name": task_name,
+                        "demo_id": dk,
+                        "planner_step_id": int(segment["planner_step_id"]),
+                        "skill": segment["skill"],
+                        "arguments": dict(segment.get("arguments", {})),
+                        "recovery_frame": int(recovery_frame),
+                        "ee_states": np.asarray(ee_states[recovery_frame], dtype=np.float32),
+                        "action_scale": compute_action_scale(acts, rstate, start, recovery_frame),
+                        "action_chunk_raw": raw_action_chunk(acts, start, recovery_frame),
+                        "recovery_vae_main": vae_at(recovery_frame)[:, 1:2, :, :].half(),
+                    })
                     memory = {
                         **segment,
                         "success_state_source": (
@@ -241,6 +295,23 @@ def main():
                     if terminal_start is not None and ready_frame is not None:
                         terminal_start = min(max(int(terminal_start), start), end)
                         ready_frame = min(max(int(ready_frame), start), T - 1)
+                        feasible_recovery_targets.append({
+                            "task_name": task_name,
+                            "demo_id": dk,
+                            "planner_step_id": int(segment["planner_step_id"]),
+                            "skill": segment["skill"],
+                            "arguments": dict(segment.get("arguments", {})),
+                            "ready_frame": int(ready_frame),
+                            "ee_states": np.asarray(ee_states[ready_frame], dtype=np.float32),
+                            "action_scale": compute_action_scale(
+                                acts, rstate, max(start, ready_frame - 16), ready_frame
+                            ),
+                            "action_chunk_raw": raw_action_chunk(
+                                acts, ready_frame - 16, ready_frame
+                            ),
+                            "ready_vae_main": vae_at(ready_frame)[:, 1:2, :, :].half(),
+                            "ready_vae_wrist": vae_at(ready_frame)[:, 0:1, :, :].half(),
+                        })
                         completion_end = min(max(success_end, terminal_start), T)
                         completion_frames = list(range(terminal_start, completion_end))
                         completion_latents = [vae_at(frame) for frame in completion_frames]
@@ -308,6 +379,28 @@ def main():
                 torch.save(payload, out)
                 total += count
                 print(f"  {dk}: {count} chunks → {out.name}", flush=True)
+    if recovery_targets:
+        out = args.output_dir / "recovery_targets.pt"
+        torch.save({"format": "libero_recovery_targets_v1", "targets": recovery_targets}, out)
+        print(f"Wrote {len(recovery_targets)} recovery targets → {out.name}", flush=True)
+    if args.feasible_recovery_output is not None:
+        if feasible_recovery_targets:
+            args.feasible_recovery_output.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "format": "libero_feasible_recovery_targets_v1",
+                "targets": feasible_recovery_targets,
+            }, args.feasible_recovery_output)
+            print(
+                f"Wrote {len(feasible_recovery_targets)} feasible recovery targets "
+                f"→ {args.feasible_recovery_output}",
+                flush=True,
+            )
+        else:
+            print(
+                "No feasible recovery targets to write; "
+                "check segments_manifest ready_frame fields.",
+                flush=True,
+            )
     print(f"\nDone. {total} chunks in {args.output_dir}", flush=True)
 
 

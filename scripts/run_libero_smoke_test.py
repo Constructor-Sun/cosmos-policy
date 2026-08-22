@@ -90,8 +90,8 @@ if quiet_step_logs:
     except Exception:
         pass
 
-    def log_message_quiet(message, log_file=None):
-        if not is_step_log(message):
+    def log_message_quiet(message, log_file=None, console=True):
+        if console and not is_step_log(message):
             print(message)
         if log_file:
             log_file.write(message + "\n")
@@ -239,6 +239,8 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
     save_vector_db = os.environ.get("COSMOS_VECTOR_DB", "").lower() in {"1", "true", "yes"}
     vector_db_output_dir = os.environ.get("COSMOS_VECTOR_DB_DIR", "")
     enable_phase_verifier = os.environ.get("COSMOS_PHASE_VERIFIER", "").lower() in {"1", "true", "yes"}
+    enable_phase_recovery = os.environ.get("COSMOS_PHASE_RECOVERY", "").lower() in {"1", "true", "yes"}
+    enable_feasible_recovery = os.environ.get("COSMOS_FEASIBLE_RECOVERY", "").lower() in {"1", "true", "yes"}
     return PolicyEvalConfig(
         config="cosmos_predict2_2b_480p_libero__inference_only",
         ckpt_path=policy_ckpt_path,
@@ -259,6 +261,8 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
         save_vector_db=save_vector_db,
         vector_db_output_dir=vector_db_output_dir,
         enable_phase_verifier=enable_phase_verifier,
+        enable_phase_recovery=enable_phase_recovery,
+        enable_feasible_recovery=enable_feasible_recovery,
     )
 
 

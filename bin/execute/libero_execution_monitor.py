@@ -8,14 +8,14 @@ from typing import Any, Iterable
 import numpy as np
 
 try:
-    from .libero_feasible_region_verifier import FEASIBLE
+    from .libero_feasible_region_verifier import FEASIBLE, NOT_FEASIBLE
     from .libero_phase_monitor import PhaseSpec
-    from .libero_phase_verifier import PHASE_OK
+    from .libero_phase_verifier import PHASE_ERROR, PHASE_OK
     from .libero_skill_completion_verifier import SKILL_COMPLETE
 except ImportError:
-    from libero_feasible_region_verifier import FEASIBLE  # type: ignore[no-redef]
+    from libero_feasible_region_verifier import FEASIBLE, NOT_FEASIBLE  # type: ignore[no-redef]
     from libero_phase_monitor import PhaseSpec  # type: ignore[no-redef]
-    from libero_phase_verifier import PHASE_OK  # type: ignore[no-redef]
+    from libero_phase_verifier import PHASE_ERROR, PHASE_OK  # type: ignore[no-redef]
     from libero_skill_completion_verifier import SKILL_COMPLETE  # type: ignore[no-redef]
 
 
@@ -26,6 +26,7 @@ PLAN_COMPLETE = "PLAN_COMPLETE"
 
 FEASIBLE_TIMEOUT_CHUNKS = 2
 ACTION_CHUNK_STEPS = 16
+PLACE_SKILLS = {"PlaceIn", "PlaceOn"}
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,37 @@ class LiberoExecutionMonitor:
         self.feasible_enter_timestep = None
         self.intervention_reason = None
 
+    def retry_current_phase(self) -> None:
+        """Reset the current phase after a recovery movement."""
+        self._reset_phase()
+
+    def mark_feasible_after_recovery(self, timestep: int | None = None) -> None:
+        """Jump directly to completion after a feasible-region recovery."""
+        self.feasible_verifier.entered_feasible = True
+        self.feasible_verifier.stall_count = 0
+        self.feasible_verifier.wrong_way_count = 0
+        self.stage = COMPLETION_CHECK
+        self.feasible_enter_timestep = timestep
+        self.intervention_reason = None
+        self.completion_verifier.freeze_baseline()
+
+    def mark_wrong_grasp_recovery_finished(self, timestep: int | None = None) -> None:
+        """After a wrong-object grasp recovery: keep the phase anchor, return
+        to the feasible gate so the feasible verifier re-adjusts from scratch,
+        and clear only the grasp-completion state (do NOT retry the phase)."""
+        self.stage = PHASE_CHECK if self.target_xy is None else FEASIBLE_CHECK
+        self.feasible_enter_timestep = timestep
+        self.intervention_reason = None
+        if hasattr(self.feasible_verifier, "entered_feasible"):
+            self.feasible_verifier.entered_feasible = False
+        self.feasible_verifier.stall_count = 0
+        self.feasible_verifier.wrong_way_count = 0
+        cv = self.completion_verifier
+        cv.pick_close_xyz = None
+        cv.pick_moved = False
+        cv.pick_last_center = None
+        cv.pick_confirmations.clear()
+
     def start_episode(self, task_name: str, exclude_demo_ids: Iterable[str] = ()):
         if task_name not in self.plans or not self.plans[task_name]:
             raise KeyError(f"No phase plan for task {task_name!r}")
@@ -95,23 +127,50 @@ class LiberoExecutionMonitor:
 
     def observe_vae(self, current_vae: Any | None = None, *, gripper_closed: bool | None = None,
                     gripper_xy: Any = None, timestep: int | None = None,
-                    wrist_image: Any = None):
+                    wrist_image: Any = None, gripper_qpos: Any = None,
+                    eef_pos: Any = None):
         """Consume one low-level observation; only completion can advance."""
         if self.task_name is None:
             raise RuntimeError("start_episode() must be called before observe_vae()")
+        # Step-level wrong-object grasp guard (runs in every stage; the close
+        # edge must be seen even while the monitor is still in PHASE/FEASIBLE).
+        if hasattr(self.completion_verifier, "evaluate_close_edge"):
+            self.completion_verifier.evaluate_close_edge(
+                gripper_closed, gripper_xy, timestep
+            )
+            if self.completion_verifier.wrong_grasp_pending:
+                self.completion_verifier.wrong_grasp_pending = False
+                self.completion_verifier.wrong_grasp_count += 1
+                self.intervention_reason = "wrong_grasp_close"
+                return ExecutionMonitorResult(
+                    self.task_name, timestep,
+                    self.current_phase.planner_step_id,
+                    self.current_phase.planner_step_id,
+                    self.stage, self.stage, "wrong_grasp_close",
+                    should_intervene=True,
+                    intervention_reason="wrong_grasp_close",
+                )
         if self.stage in {PHASE_CHECK, FEASIBLE_CHECK}:
             self.completion_verifier.calibrate(current_vae)
             if hasattr(self.completion_verifier, "observe_wrist"):
                 self.completion_verifier.observe_wrist(wrist_image)
-            return None
-        if self.stage != COMPLETION_CHECK:
+
+            # For Place skills, release can complete the phase even before
+            # the feasible region has latched. Fall through to the shared
+            # completion handling below; unknown results are not logged.
+            if not (self.stage == FEASIBLE_CHECK and self.current_phase.skill in PLACE_SKILLS):
+                return None
+        elif self.stage != COMPLETION_CHECK:
             return None
         before, observed_step = self.stage, self.current_phase.planner_step_id
         result = self.completion_verifier.update(
             current_vae, gripper_closed=gripper_closed, gripper_xy=gripper_xy,
             target_bbox=self.target_bbox, timestep=timestep,
-            wrist_image=wrist_image,
+            wrist_image=wrist_image, gripper_qpos=gripper_qpos,
+            eef_pos=eef_pos,
         )
+        if result.status != SKILL_COMPLETE and before == FEASIBLE_CHECK:
+            return None
         if (
             result.status != SKILL_COMPLETE
             and self.feasible_enter_timestep is not None
@@ -143,7 +202,9 @@ class LiberoExecutionMonitor:
                 current_vae: Any | None = None, *,
                 gripper_closed: bool | None = None,
                 timestep: int | None = None,
-                wrist_image: Any = None) -> ExecutionMonitorResult:
+                wrist_image: Any = None,
+                gripper_qpos: Any = None,
+                eef_pos: Any = None) -> ExecutionMonitorResult:
         if self.task_name is None:
             raise RuntimeError("start_episode() must be called before observe()")
         before, observed_step = self.stage, self.current_phase.planner_step_id
@@ -154,6 +215,19 @@ class LiberoExecutionMonitor:
             self.completion_verifier, "observe_wrist"
         ):
             self.completion_verifier.observe_wrist(wrist_image)
+
+        # At chunk boundaries the release is often first observed. Route Place
+        # skills through observe_vae as well so release-based completion can
+        # fire before the feasible verifier turns leaving into a reversal.
+        if before == FEASIBLE_CHECK and self.current_phase.skill in PLACE_SKILLS:
+            step_result = self.observe_vae(
+                current_vae, gripper_closed=gripper_closed,
+                gripper_xy=gripper_xy, timestep=timestep,
+                wrist_image=wrist_image, gripper_qpos=gripper_qpos,
+                eef_pos=eef_pos,
+            )
+            if step_result is not None:
+                return step_result
 
         if before == PHASE_CHECK:
             phase_result = self.phase_verifier.update(third_view_rgb, gripper_xy)
@@ -174,17 +248,24 @@ class LiberoExecutionMonitor:
                 reason = "phase_confirmed" if enough_ready else "no_ready_memory_try_completion"
                 if self.stage == COMPLETION_CHECK:
                     self.completion_verifier.freeze_baseline()
+            elif phase_result.status == PHASE_ERROR:
+                self.intervention_reason = "phase_error"
+                reason = "phase_error"
             else:
                 reason = "waiting_for_phase_confirmation"
         elif before == FEASIBLE_CHECK:
             feasible_result = self.feasible_verifier.update(
                 self.target_xy, self.target_bbox, gripper_xy,
                 confidence=self.target_confidence, timestep=timestep,
+                wrist_image=wrist_image,
             )
             if feasible_result.status == FEASIBLE:
                 self.stage, reason = COMPLETION_CHECK, "entered_feasible_region"
                 self.feasible_enter_timestep = timestep
                 self.completion_verifier.freeze_baseline()
+            elif feasible_result.status == NOT_FEASIBLE:
+                self.intervention_reason = "feasible_error"
+                reason = "feasible_error"
             else:
                 reason = feasible_result.reason
         elif before == COMPLETION_CHECK:

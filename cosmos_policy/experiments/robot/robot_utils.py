@@ -121,16 +121,18 @@ def setup_logging(
     return log_file, local_log_filepath, run_id
 
 
-def log_message(message: str, log_file=None):
+def log_message(message: str, log_file=None, console: bool = True):
     """
     Log a message to console and optionally to a log file.
 
     Args:
         message: Message to log
         log_file: Optional file handle to write to
+        console: If False, skip printing to stdout/logger but still write to log_file.
     """
-    print(message)
-    logger.info(message)
+    if console:
+        print(message)
+        logger.info(message)
     if log_file:
         log_file.write(message + "\n")
         log_file.flush()
