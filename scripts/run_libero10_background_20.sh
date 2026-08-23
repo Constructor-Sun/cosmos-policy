@@ -44,16 +44,8 @@ SMOKE_GL_BACKEND=${SMOKE_GL_BACKEND:-egl}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/scripts/run_libero_smoke_test.py}
 
 # Keep this script focused on phase/feasible detection; disable unrelated
-# online/early-manifold/data-collection machinery unless explicitly needed.
-unset COSMOS_ONLINE_DETECTION \
-      COSMOS_EARLY_MANIFOLD_SCORE \
-      COSMOS_EARLY_MANIFOLD_INJECT \
-      COSMOS_EARLY_MANIFOLD_THRESHOLD \
-      COSMOS_EARLY_MANIFOLD_MAX_OFFSET \
-      COSMOS_EARLY_MANIFOLD_CORRECTION_CHUNKS \
-      COSMOS_TARGET_DEMOS \
-      COSMOS_TARGET_DEMOS_DIR \
-      COSMOS_DATA_COLLECTION \
+# data-collection machinery unless explicitly needed.
+unset COSMOS_DATA_COLLECTION \
       COSMOS_VECTOR_DB \
       COSMOS_VECTOR_DB_DIR
 

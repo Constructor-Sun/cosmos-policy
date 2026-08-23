@@ -10,6 +10,7 @@ counterfactual_experiments/
 experiments/
 outputs/
 skill_memory/
+skill_memory_test/
 
 *.pyc
 *.log

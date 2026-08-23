@@ -14,7 +14,6 @@ Verifier 分为三个职责独立的阶段：
 ### 1.1 文件
 
 - 默认实现：`bin/execute/libero_phase_verifier.py`
-- 精确匹配版本：`bin/execute/libero_phase_verifier_exact.py`
 - 离线目标构建：`bin/memory/build_libero_phase_targets.py`
 
 ### 1.2 离线目标

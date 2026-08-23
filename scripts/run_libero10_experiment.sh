@@ -32,8 +32,7 @@
 # Overridable environment variables (same semantics as run_libero10_robotinit_20.sh):
 #   NUM_CASES, SEED, GPU_ID, OUTPUT_ROOT, COSMOS_ROLLOUT_SUBDIR,
 #   COSMOS_INIT_STATE_OFFSET, COSMOS_DATA_COLLECTION, COSMOS_VECTOR_DB,
-#   COSMOS_VECTOR_DB_DIR, COSMOS_ONLINE_DETECTION, COSMOS_TARGET_DEMOS,
-#   SMOKE_PYTHON_SCRIPT
+#   COSMOS_VECTOR_DB_DIR, SMOKE_PYTHON_SCRIPT
 
 set -eu
 
@@ -187,11 +186,6 @@ eval "$RESOLVED"
 PERT_SHORT=$(echo "$PERTURBATION" | tr '_' '-')
 TASK_SHORT=$(echo "$SMOKE_PAIR_BASE_TASK" | sed 's/^\([A-Z_]*_[A-Z]*[0-9]*\)_.*/\1/')
 RUN_DIR="$OUTPUT_ROOT/${TASK_SHORT}_${PERT_SHORT}_${VARIANT}"
-RUN_MODE=normal
-if [ "${COSMOS_ONLINE_DETECTION:-}" = "1" ]; then
-    RUN_MODE=online-auto
-    RUN_DIR="${RUN_DIR}_online-auto"
-fi
 
 # Override COSMOS_ROLLOUT_SUBDIR default to include perturbation type
 COSMOS_ROLLOUT_SUBDIR=${COSMOS_ROLLOUT_SUBDIR:-$(date +%m-%d)}
@@ -215,11 +209,7 @@ if $DRY_RUN; then
     echo "INIT_STATE_OFFSET:          $COSMOS_INIT_STATE_OFFSET"
     echo "OUTPUT_ROOT:                $RUN_DIR"
     echo "ROLLOUT_SUBDIR:             ${COSMOS_ROLLOUT_SUBDIR:-(unset)}"
-    if [ "$RUN_MODE" = "online-auto" ]; then
-        echo "INJECTION_MODE:             automatic online detection + correction"
-    else
-        echo "INJECTION_MODE:             none (normal rollout)"
-    fi
+    echo "LEGACY_INJECTION:           disabled"
     echo ""
     echo "=== Shell command that would execute ==="
     echo "cd $REPO_ROOT && COSMOS_ROLLOUT_SUBDIR=... sh ./run_libero_smoke_test.sh"
@@ -255,11 +245,6 @@ maybe_export COSMOS_ROLLOUT_SUBDIR
 maybe_export COSMOS_DATA_COLLECTION
 maybe_export COSMOS_VECTOR_DB
 maybe_export COSMOS_VECTOR_DB_DIR
-maybe_export COSMOS_ONLINE_DETECTION
-maybe_export COSMOS_TARGET_DEMOS
-
-# Legacy manual/dry-run injection controls are deliberately unsupported.
-unset COSMOS_OFFSET_START_T COSMOS_OFFSET_AMOUNT COSMOS_OFFSET_DURATION COSMOS_ONLINE_INJECT
 
 COSMOS_SKIP_PLAIN_ROLLOUT=1 \
 COSMOS_INIT_STATE_OFFSET="$COSMOS_INIT_STATE_OFFSET" \
@@ -278,7 +263,7 @@ SMOKE_PAIR_PERT_TASK="$SMOKE_PAIR_PERT_TASK" \
 SMOKE_NUM_PAIRS="$NUM_CASES" \
 SMOKE_SEED="$SEED" \
 SMOKE_RESULTS_DIR="$RUN_DIR" \
-SMOKE_RUN_ID="${PERT_SHORT}_${VARIANT}_${RUN_MODE}_gpu${GPU_ID}" \
+SMOKE_RUN_ID="${PERT_SHORT}_${VARIANT}_normal_gpu${GPU_ID}" \
 sh ./run_libero_smoke_test.sh
 
 echo ""

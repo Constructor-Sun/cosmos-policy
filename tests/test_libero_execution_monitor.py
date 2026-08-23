@@ -21,7 +21,7 @@ from libero_execution_monitor import (  # noqa: E402
 from libero_feasible_region_verifier import FEASIBLE, FEASIBLE_UNKNOWN  # noqa: E402
 from libero_phase_monitor import PhaseSpec, load_phase_plans  # noqa: E402
 from libero_phase_verifier import PHASE_OK, PHASE_UNKNOWN  # noqa: E402
-from libero_skill_completion_verifier import (  # noqa: E402
+from libero_skill_completion_verifier_geo import (  # noqa: E402
     COMPLETION_UNKNOWN,
     SKILL_COMPLETE,
 )

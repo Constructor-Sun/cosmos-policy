@@ -11,12 +11,12 @@ try:
     from .libero_feasible_region_verifier import FEASIBLE, NOT_FEASIBLE
     from .libero_phase_monitor import PhaseSpec
     from .libero_phase_verifier import PHASE_ERROR, PHASE_OK
-    from .libero_skill_completion_verifier import SKILL_COMPLETE
+    from .libero_skill_completion_verifier_geo import SKILL_COMPLETE
 except ImportError:
     from libero_feasible_region_verifier import FEASIBLE, NOT_FEASIBLE  # type: ignore[no-redef]
     from libero_phase_monitor import PhaseSpec  # type: ignore[no-redef]
     from libero_phase_verifier import PHASE_ERROR, PHASE_OK  # type: ignore[no-redef]
-    from libero_skill_completion_verifier import SKILL_COMPLETE  # type: ignore[no-redef]
+    from libero_skill_completion_verifier_geo import SKILL_COMPLETE  # type: ignore[no-redef]
 
 
 PHASE_CHECK = "PHASE_CHECK"
