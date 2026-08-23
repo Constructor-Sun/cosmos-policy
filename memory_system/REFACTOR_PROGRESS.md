@@ -121,9 +121,7 @@ python -m pytest -q tests/test_memory_system_execute_consistency.py
 
 - 当前迁移（Step 0 ~ Step 5）已全部完成 ✅
 - 最终回归确认已通过：robotinit phase+feasible 10/10
+- 后续主要方向：
+  - 继续 3D / RGB-D 扩展
 - 后续待办：
   - 按功能重写旧的 offline / execute / recovery / completion 测试
-- 后续可选增强：
-  - 为 recovery 增加显式速度限制（如每步最大平移/旋转）
-  - 如需 phase recovery 也先抬升 2cm，将 `PhaseRecoverySelector` 的 `z_lift` 改为 `0.02`
-  - 继续 3D / RGB-D 扩展

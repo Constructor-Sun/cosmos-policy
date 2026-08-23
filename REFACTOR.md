@@ -682,3 +682,46 @@ geometry_mode = "2d" | "3d" | "hybrid"
 8. 第一版 3D 只在 Execute 使用 Main RGB-D，优先升级 Phase 和 Pick；
 9. 只有当 Feasible 需要 demo-derived 3D ready threshold 时，再考虑 Offline depth；
 10. 2D 和 3D 共享一套源码目录，过渡期通过 artifact version 和 geometry mode 对比。
+
+## 14. 当前迁移状态与剩余工作
+
+### 已完成
+
+- Step 0：2D baseline 特征测试 ✅
+- Step 1：创建 `memory_system` 共享包 ✅
+- Step 2：Offline 迁移完成 ✅
+- Step 3：Execute 迁移完成 ✅
+- Step 4：Eval 接线完成 ✅
+- Step 5：兼容入口与清理完成 ✅
+
+当前正式路径：
+
+- `run_libero_eval.py` 使用 `memory_system.execute`
+- `memory_system/offline` 负责离线 Memory 构建
+- `memory_system/execute` 负责在线 verifier / completion / recovery
+- 旧 `bin/memory` / `bin/execute` 已从工作区删除，Git 历史保留
+
+已通过验证：
+
+- `tests/test_memory_system_artifacts.py` + `tests/test_libero_eval_verifier_wiring.py`：12 passed
+- robotinit phase+feasible：10/10 成功
+- `FEASIBLE RECOVERY` 触发 12 次
+- `WRONG GRASP` 触发 2 次
+
+### 剩余工作
+
+1. **2D → 3D / RGB-D 扩展（下一主要阶段）**
+   - 第一阶段只在 Execute 引入 Main RGB-D：
+     - `memory_system/execute/rgbd.py`
+     - Main camera 提供 RGB-D
+     - Wrist camera 仍只提供 RGB
+   - 优先升级：
+     1. Phase 3D progress
+     2. Pick 3D object lift/follow
+   - 保持 `geometry_mode = "2d" | "3d" | "hybrid"` 过渡模式
+   - 只有 Feasible 需要 demo-derived 3D ready threshold 时，再考虑 Offline depth
+
+2. **按功能重写测试**
+   - 旧的 characterization / consistency 测试已移除；
+   - 后续需要针对 `offline`、`phase`、`feasible`、`completion`、`recovery`、`execution_monitor` 按功能重新编写测试。
+
