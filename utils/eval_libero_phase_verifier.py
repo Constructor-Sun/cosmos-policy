@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -14,17 +13,11 @@ import h5py
 import numpy as np
 import torch
 from PIL import Image
-ROOT = Path(__file__).resolve().parents[1]
-EXECUTE = ROOT / "bin/execute"
-if str(EXECUTE) not in sys.path:
-    sys.path.insert(0, str(EXECUTE))
 
-from libero_phase_verifier import (  # noqa: E402
-    PHASE_ERROR,
-    PHASE_UNKNOWN,
-    LiberoPhaseVerifier,
-    PhaseTargetMemory,
-)
+from memory_system.artifacts import PhaseTargetMemory
+from memory_system.execute.phase import PHASE_ERROR, PHASE_UNKNOWN, PhaseVerifier
+from memory_system.types import VerifierObservation
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -100,7 +93,9 @@ def run_group(verifier, key, samples, input_dir, args, rng):
         for sample in sorted(samples, key=lambda item: int(item["frame"])):
             image = perturb(decode_jpeg(images[int(sample["frame"])]), args, rng)
             gripper = shifted_xy(sample["gripper_xy"], args)
-            result = verifier.update(image, gripper)
+            result = verifier.update(
+                VerifierObservation(third_view_rgb=image, gripper_xy=gripper)
+            )
             results.append(result)
             frames.append({"image": image, "sample": sample, "gripper": gripper, "result": result})
             if result.target_xy is not None:
@@ -253,7 +248,9 @@ def synthetic_away_detected(verifier, key, samples, input_dir, args, rng) -> boo
                 if norm > 1e-6:
                     gripper = gripper - 8.0 * direction / norm
             image = perturb(decode_jpeg(images[int(sample["frame"])]), args, rng)
-            detected = detected or verifier.update(image, gripper).status == PHASE_ERROR
+            detected = detected or verifier.update(
+                VerifierObservation(third_view_rgb=image, gripper_xy=gripper)
+            ).status == PHASE_ERROR
     return detected
 
 
@@ -264,7 +261,7 @@ def main() -> int:
     if args.vis_max < 0 or (args.show_matches and args.vis_dir is None):
         raise ValueError("vis-max must be non-negative and show-matches requires vis-dir")
     memory = PhaseTargetMemory(args.phase_targets)
-    verifier = LiberoPhaseVerifier(memory)
+    verifier = PhaseVerifier(memory)
     groups = list(group_templates(memory.templates).items())
     if args.max_segments > 0:
         groups = groups[: args.max_segments]

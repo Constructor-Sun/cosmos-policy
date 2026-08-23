@@ -64,6 +64,7 @@ class VerifierObservation:
     wrist_image: np.ndarray | None = None
     eef_pos: np.ndarray | None = None
     eef_states: np.ndarray | None = None
+    gripper_qpos: Any = None
     main_vae: Any = None
     wrist_vae: Any = None
     target_bbox: tuple[float, float, float, float] | None = None
@@ -149,3 +150,23 @@ class RecoveryResult:
     correction_steps: int
     controller: Any = None
     correction_per_step: np.ndarray | None = None
+
+    @property
+    def demo_ids(self) -> tuple[str, ...]:
+        return self.target.demo_ids
+
+    @property
+    def target_ee_states(self) -> np.ndarray:
+        return self.target.target_ee_states
+
+    @property
+    def similarity(self) -> float:
+        return self.target.similarity
+
+    @property
+    def frame(self) -> int:
+        return self.target.frame
+
+    @property
+    def z_lift(self) -> float:
+        return self.target.z_lift

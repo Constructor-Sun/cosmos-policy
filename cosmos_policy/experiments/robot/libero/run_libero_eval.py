@@ -154,13 +154,10 @@ from cosmos_policy.experiments.robot.robot_utils import (
     setup_logging,
 )
 from cosmos_policy.utils.utils import jpeg_encode_image, set_seed_everywhere
+from memory_system.types import VerifierObservation
 from scipy.spatial.transform import Rotation
 
-# Make bin packages available for verifier and recovery imports.
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_BIN = str(_REPO_ROOT / "bin")
-if _BIN not in sys.path:
-    sys.path.insert(0, _BIN)
 
 # Cosmos Policy latent sequence indices
 # 0: blank, 1: curr proprio, 2: curr wrist img, 3: curr primary img, 4: action, 5: future proprio, 6: future wrist img, 7: future primary img, 8: value
@@ -317,10 +314,11 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
 
 def _create_execution_monitor(cfg: PolicyEvalConfig):
     """Build the sequential phase -> feasible -> completion monitor."""
-    phase_targets = _REPO_ROOT / "skill_memory/libero_10/phase_targets.pt"
-    segments_manifest = _REPO_ROOT / "skill_memory/libero_10/segments_ready_fixed16.json"
-    wrist_completion_targets = _REPO_ROOT / "skill_memory/libero_10/wrist_completion_targets.pt"
-    wrist_feasible_targets = _REPO_ROOT / "skill_memory/libero_10/feasible_wrist_targets.pt"
+    memory_dir = _REPO_ROOT / "skill_memory_test" / "libero_10"
+    phase_targets = memory_dir / "phase_targets.pt"
+    segments_manifest = memory_dir / "segments_ready_fixed16.json"
+    wrist_completion_targets = memory_dir / "wrist_completion_targets.pt"
+    wrist_feasible_targets = memory_dir / "feasible_wrist_targets.pt"
     missing = [path for path in (phase_targets, segments_manifest) if not path.exists()]
     if missing:
         raise FileNotFoundError(f"Missing sequential verifier inputs: {missing}")
@@ -329,24 +327,51 @@ def _create_execution_monitor(cfg: PolicyEvalConfig):
     if cfg.enable_feasible_recovery and not wrist_feasible_targets.exists():
         raise FileNotFoundError(f"Missing wrist feasible targets: {wrist_feasible_targets}")
 
-    from execute.libero_execution_monitor import LiberoExecutionMonitor
-    from execute.libero_feasible_region_verifier import LiberoFeasibleRegionVerifier
-    from execute.libero_phase_monitor import load_phase_plans
-    from execute.libero_phase_verifier import LiberoPhaseVerifier
-    from execute.libero_skill_completion_verifier_geo import LiberoSkillCompletionVerifierGeo
+    from memory_system.execute.execution_monitor import ExecutionMonitor
+    from memory_system.execute.feasible import FeasibleVerifier
+    from memory_system.execute.phase import PhaseVerifier
+    from memory_system.execute.plan import load_phase_plans
+    from memory_system.execute.skill_completion import SkillCompletionVerifier
 
-    return LiberoExecutionMonitor(
+    return ExecutionMonitor(
         load_phase_plans(segments_manifest),
-        LiberoPhaseVerifier(phase_targets),
-        LiberoFeasibleRegionVerifier(
+        PhaseVerifier(phase_targets),
+        FeasibleVerifier(
             phase_targets, segments_manifest,
             wrist_feasible_targets=(
                 wrist_feasible_targets if cfg.enable_feasible_recovery else None
             ),
         ),
-        LiberoSkillCompletionVerifierGeo(
+        SkillCompletionVerifier(
             phase_targets, wrist_completion_targets=wrist_completion_targets
         ),
+    )
+
+
+def _make_verifier_observation(
+    observation,
+    obs,
+    gripper_xy,
+    timestep,
+    gripper_closed,
+    main_vae=None,
+) -> VerifierObservation:
+    """Build the shared observation payload consumed by memory_system.execute."""
+    return VerifierObservation(
+        third_view_rgb=observation["primary_image"],
+        gripper_xy=gripper_xy,
+        gripper_closed=gripper_closed,
+        wrist_image=observation.get("wrist_image"),
+        eef_pos=obs["robot0_eef_pos"],
+        eef_states=np.concatenate(
+            [
+                obs["robot0_eef_pos"],
+                Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+            ]
+        ).astype(np.float32),
+        gripper_qpos=obs["robot0_gripper_qpos"],
+        main_vae=main_vae,
+        timestep=timestep,
     )
 
 
@@ -699,11 +724,9 @@ def run_episode(
                         obs, phase_camera_transform, cfg.flip_images
                     )
                     step_result = episode_execution_monitor.observe_vae(
-                        None, gripper_closed=last_gripper_closed,
-                        gripper_xy=gripper_xy, timestep=t,
-                        wrist_image=observation["wrist_image"],
-                        gripper_qpos=obs["robot0_gripper_qpos"],
-                        eef_pos=obs["robot0_eef_pos"],
+                        _make_verifier_observation(
+                            observation, obs, gripper_xy, t, last_gripper_closed
+                        )
                     )
                     if step_result is not None:
                         verifier_record = {
@@ -1057,22 +1080,15 @@ def run_episode(
                         gripper_xy = _project_gripper_xy(
                             obs, phase_camera_transform, cfg.flip_images
                         )
+                        verifier_obs = _make_verifier_observation(
+                            observation, obs, gripper_xy, t, last_gripper_closed
+                        )
                         execution_result = episode_execution_monitor.observe_vae(
-                            None, gripper_closed=last_gripper_closed,
-                            gripper_xy=gripper_xy, timestep=t,
-                            wrist_image=observation["wrist_image"],
-                            gripper_qpos=obs["robot0_gripper_qpos"],
-                            eef_pos=obs["robot0_eef_pos"],
+                            verifier_obs
                         )
                         if execution_result is None:
                             execution_result = episode_execution_monitor.observe(
-                                observation["primary_image"],
-                                gripper_xy,
-                                gripper_closed=last_gripper_closed,
-                                timestep=t,
-                                wrist_image=observation["wrist_image"],
-                                gripper_qpos=obs["robot0_gripper_qpos"],
-                                eef_pos=obs["robot0_eef_pos"],
+                                verifier_obs
                             )
                         if (
                             execution_result.should_intervene
@@ -1704,13 +1720,14 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
             "observation-only mode; policy actions remain unchanged",
             log_file,
         )
+    memory_dir = _REPO_ROOT / "skill_memory_test" / "libero_10"
     pose_recovery = None
     if cfg.enable_phase_recovery:
         if execution_monitor is None:
             raise ValueError("enable_phase_recovery requires enable_phase_verifier=True")
-        from execute.libero_pose_recovery import LiberoPoseRecovery
-        pose_recovery = LiberoPoseRecovery(
-            _REPO_ROOT / "skill_memory/libero_10/recovery_targets.pt"
+        from memory_system.execute.recovery import PhaseRecoverySelector
+        pose_recovery = PhaseRecoverySelector(
+            memory_dir / "recovery_targets.pt"
         )
         log_message(
             "Phase-error pose recovery enabled",
@@ -1720,9 +1737,9 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
     if cfg.enable_feasible_recovery:
         if execution_monitor is None:
             raise ValueError("enable_feasible_recovery requires enable_phase_verifier=True")
-        from execute.libero_feasible_recovery import LiberoFeasibleRecovery
-        feasible_recovery = LiberoFeasibleRecovery(
-            _REPO_ROOT / "skill_memory/libero_10/feasible_recovery_targets.pt"
+        from memory_system.execute.recovery import FeasibleRecoverySelector
+        feasible_recovery = FeasibleRecoverySelector(
+            memory_dir / "feasible_recovery_targets.pt"
         )
         log_message(
             "Feasible-error pose recovery enabled",

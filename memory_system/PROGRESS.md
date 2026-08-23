@@ -5,8 +5,24 @@
 - Step 0：特征测试完成 ✅
 - Step 1：创建 `memory_system` 共享包 ✅
 - Step 2：Offline 迁移完成 ✅
-- Step 3：Execute 迁移未开始 ⏳
-- Step 4：Eval 接线未开始 ⏳
+- Step 3：Execute 迁移完成 ✅
+  - 已迁移 plan / phase / feasible / completion / recovery / monitor 到 `memory_system/execute`
+  - 已添加新旧 execute 对照测试 `tests/test_memory_system_execute_consistency.py`
+  - 验收通过：`tests/test_memory_system_execute_consistency.py` 7 passed，相关原有测试 41 passed
+  - `memory_system/execute` 不依赖 `bin`，Step 3 阶段未修改 `bin/execute`
+- Step 4：Eval 接线完成 ✅
+  - `run_libero_eval.py` 已切换到 `memory_system.execute`
+  - 已删除 `bin` 的 `sys.path` 依赖
+  - 运行时 memory 默认使用 `skill_memory_test/libero_10`
+  - verifier/recovery 调用统一使用 `VerifierObservation`
+  - 更新 `tests/test_libero_eval_verifier_wiring.py` 锁定新接线
+  - 验收通过：相关测试 42 passed
+  - robotinit phase+feasible 实测：10/10 成功，FEASIBLE RECOVERY 触发 12 次，WRONG GRASP 触发 2 次
+- Step 5：兼容入口与清理完成 ✅
+  - 当前正式调用已全部走 `memory_system`
+  - `utils/eval_libero_phase_verifier.py` 和 `utils/eval_libero_feasible_region_verifier.py` 已切换到 `memory_system`
+  - 旧 `bin/memory` / `bin/execute` 保留为 frozen reference，新增 `bin/FROZEN.md` 标记
+  - 最终回归确认通过：robotinit phase+feasible 再次运行 10/10 成功
 
 ## 已迁移内容
 
@@ -22,6 +38,23 @@ memory_system/
 │   ├── label_boundaries.py
 │   ├── build_targets.py
 │   └── build_recovery.py
+├── execute/
+│   ├── __init__.py
+│   ├── plan.py
+│   ├── phase.py
+│   ├── feasible.py
+│   ├── execution_monitor.py
+│   ├── skill_completion/
+│   │   ├── __init__.py
+│   │   ├── _common.py
+│   │   ├── pick.py
+│   │   ├── place.py
+│   │   └── open_close.py
+│   └── recovery/
+│       ├── __init__.py
+│       ├── retrieval.py
+│       ├── selectors.py
+│       └── controller.py
 └── PROGRESS.md
 ```
 
@@ -30,6 +63,7 @@ memory_system/
 - 不修改 `bin/`。
 - `memory_system` 完全自包含，不 import `bin`。
 - Offline 与 test-time 类型保持独立。
+- Step 3 只迁移 Execute 到新 package，不切换 Eval 接线。
 
 ## 使用
 
@@ -49,6 +83,12 @@ python tests/compare_memory_system_offline.py
 
 ```bash
 python tests/visualize_offline_memory_diff.py
+```
+
+Execute 新旧对照测试：
+
+```bash
+python -m pytest -q tests/test_memory_system_execute_consistency.py
 ```
 
 ## Step 2 已知差异（暂时接受）
@@ -75,4 +115,9 @@ python tests/visualize_offline_memory_diff.py
 
 ## 下一步
 
-- Step 3：迁移 Execute（plan / phase / feasible / completion / recovery / monitor）。
+- 当前迁移（Step 0 ~ Step 5）已全部完成 ✅
+- 最终回归确认已通过：robotinit phase+feasible 10/10
+- 后续可选增强：
+  - 为 recovery 增加显式速度限制（如每步最大平移/旋转）
+  - 如需 phase recovery 也先抬升 2cm，将 `PhaseRecoverySelector` 的 `z_lift` 改为 `0.02`
+  - 继续 3D / RGB-D 扩展

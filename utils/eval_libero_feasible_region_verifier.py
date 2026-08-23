@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -12,18 +11,9 @@ from typing import Any
 import numpy as np
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-EXECUTE_BIN = ROOT / "bin" / "execute"
-if str(EXECUTE_BIN) not in sys.path:
-    sys.path.insert(0, str(EXECUTE_BIN))
-
-from libero_feasible_region_verifier import (  # noqa: E402
-    FEASIBLE,
-    NOT_FEASIBLE,
-    LiberoFeasibleRegionVerifier,
-    ReadyDistanceMemory,
-)
+from memory_system.artifacts import ReadyDistanceMemory
+from memory_system.execute.feasible import FEASIBLE, NOT_FEASIBLE, FeasibleVerifier
+from memory_system.types import VerifierObservation
 
 
 def arguments_key(arguments: dict[str, Any]) -> tuple[tuple[str, str], ...]:
@@ -52,7 +42,7 @@ def template_key(template: dict[str, Any]):
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     memory = ReadyDistanceMemory(args.phase_targets, args.segments_manifest)
-    verifier = LiberoFeasibleRegionVerifier(
+    verifier = FeasibleVerifier(
         memory,
         min_demo_votes=args.min_demo_votes,
         progress_tolerance_px=args.progress_tolerance_px,
@@ -97,9 +87,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             for sample in sorted((*prefix, *ready), key=lambda item: int(item["frame"])):
                 label = "ready" if int(sample["frame"]) == int(ready_frame) else "prefix"
                 result = verifier.update(
+                    VerifierObservation(gripper_xy=sample["gripper_xy"]),
                     sample["target_center_xy"],
                     sample["bbox_xyxy"],
-                    sample["gripper_xy"],
                 )
                 counts[f"{label}_samples"] += 1
                 counts[f"{label}_{result.status}"] += 1
