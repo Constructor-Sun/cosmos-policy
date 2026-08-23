@@ -21,10 +21,14 @@
 - Step 5：兼容入口与清理完成 ✅
   - 当前正式调用已全部走 `memory_system`
   - `utils/eval_libero_phase_verifier.py` 和 `utils/eval_libero_feasible_region_verifier.py` 已切换到 `memory_system`
-  - 旧 `bin/memory` / `bin/execute` 保留为 frozen reference，新增 `bin/FROZEN.md` 标记
+  - 旧 `bin/memory` / `bin/execute` 已从工作区删除（Git 历史仍保留）
+  - 依赖旧实现的旧测试已移除，后续按功能重写
+  - 当前保留测试：`test_memory_system_artifacts.py` + `test_libero_eval_verifier_wiring.py`，12 passed
   - 最终回归确认通过：robotinit phase+feasible 再次运行 10/10 成功
 
 ## 已迁移内容
+
+主迁移/重构文档：`REFACTOR.md`
 
 ```text
 memory_system/
@@ -55,7 +59,7 @@ memory_system/
 │       ├── retrieval.py
 │       ├── selectors.py
 │       └── controller.py
-└── PROGRESS.md
+└── REFACTOR_PROGRESS.md
 ```
 
 ## 关键约束
@@ -117,6 +121,8 @@ python -m pytest -q tests/test_memory_system_execute_consistency.py
 
 - 当前迁移（Step 0 ~ Step 5）已全部完成 ✅
 - 最终回归确认已通过：robotinit phase+feasible 10/10
+- 后续待办：
+  - 按功能重写旧的 offline / execute / recovery / completion 测试
 - 后续可选增强：
   - 为 recovery 增加显式速度限制（如每步最大平移/旋转）
   - 如需 phase recovery 也先抬升 2cm，将 `PhaseRecoverySelector` 的 `z_lift` 改为 `0.02`
