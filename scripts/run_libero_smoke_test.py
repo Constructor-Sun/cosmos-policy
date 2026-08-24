@@ -240,6 +240,7 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
     vector_db_output_dir = os.environ.get("COSMOS_VECTOR_DB_DIR", "")
     enable_phase_verifier = os.environ.get("COSMOS_PHASE_VERIFIER", "").lower() in {"1", "true", "yes"}
     enable_phase_3d = os.environ.get("COSMOS_PHASE_3D", "").lower() in {"1", "true", "yes"}
+    enable_feasible_3d = os.environ.get("COSMOS_FEASIBLE_3D", "").lower() in {"1", "true", "yes"}
     enable_phase_recovery = os.environ.get("COSMOS_PHASE_RECOVERY", "").lower() in {"1", "true", "yes"}
     enable_feasible_recovery = os.environ.get("COSMOS_FEASIBLE_RECOVERY", "").lower() in {"1", "true", "yes"}
     return PolicyEvalConfig(
@@ -263,6 +264,7 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
         vector_db_output_dir=vector_db_output_dir,
         enable_phase_verifier=enable_phase_verifier,
         enable_phase_3d=enable_phase_3d,
+        enable_feasible_3d=enable_feasible_3d,
         enable_phase_recovery=enable_phase_recovery,
         enable_feasible_recovery=enable_feasible_recovery,
     )

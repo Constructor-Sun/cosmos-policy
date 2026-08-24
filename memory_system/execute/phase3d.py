@@ -14,6 +14,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from memory_system.execute.feasible import FEASIBLE, FeasibleVerifier
+from memory_system.execute.feasible3d import Feasible3DVerifier
 from memory_system.execute.phase import (
     PHASE_ERROR,
     PHASE_OK,
@@ -41,6 +42,8 @@ class Phase3DVerifier:
         progress_tolerance_m: float = 0.001,
         evidence_updates: int = 2,
         disabled_skills: tuple[str, ...] = ("Close",),
+        enable_feasible_3d: bool = False,
+        ready3d_targets: str | Path | None = None,
     ):
         self.matcher = PhaseVerifier(
             phase_targets,
@@ -50,7 +53,14 @@ class Phase3DVerifier:
             cluster_radius_px=cluster_radius_px,
             ambiguity_ratio=ambiguity_ratio,
         )
-        self.feasible = FeasibleVerifier(phase_targets, segments_manifest)
+        if enable_feasible_3d:
+            if ready3d_targets is None:
+                raise ValueError("ready3d_targets is required when enable_feasible_3d=True")
+            self.feasible = Feasible3DVerifier(
+                ready3d_targets, phase_targets, segments_manifest
+            )
+        else:
+            self.feasible = FeasibleVerifier(phase_targets, segments_manifest)
         self.progress_tolerance_m = float(progress_tolerance_m)
         self.evidence_updates = int(evidence_updates)
         self.disabled_skills = set(disabled_skills)
@@ -208,12 +218,19 @@ class Phase3DVerifier:
                 },
             )
 
-        feasible_result = self.feasible.update(
-            observation,
-            target_xy,
-            bbox,
-            confidence=confidence,
-        )
+        if hasattr(self.feasible, "ready3d"):
+            feasible_result = self.feasible.update(
+                observation,
+                target_xyz_world=target_xyz,
+                confidence=confidence,
+            )
+        else:
+            feasible_result = self.feasible.update(
+                observation,
+                target_xy,
+                bbox,
+                confidence=confidence,
+            )
         if feasible_result.status == FEASIBLE:
             return PhaseResult(
                 PHASE_DONE,
@@ -226,6 +243,7 @@ class Phase3DVerifier:
                     "matched_bbox_xyxy": bbox,
                     "distance_m": current_distance,
                     "feasible_reason": feasible_result.reason,
+                    "target_xyz_world": target_xyz,
                 },
             )
 

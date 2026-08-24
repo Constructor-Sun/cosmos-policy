@@ -63,6 +63,7 @@ class ExecutionMonitor:
         self.exclude_demo_ids: tuple[str, ...] = ()
         self.target_xy: tuple[float, float] | None = None
         self.target_bbox: tuple[float, float, float, float] | None = None
+        self.target_xyz_world: np.ndarray | None = None
         self.target_confidence = 0.0
         self.feasible_enter_timestep: int | None = None
         self.intervention_reason: str | None = None
@@ -90,6 +91,7 @@ class ExecutionMonitor:
             )
         self.stage = PHASE_CHECK
         self.target_xy = self.target_bbox = None
+        self.target_xyz_world = None
         self.target_confidence = 0.0
         self.feasible_enter_timestep = None
         self.intervention_reason = None
@@ -247,6 +249,7 @@ class ExecutionMonitor:
             elif phase_result.status == PHASE_DONE:
                 self.target_xy = tuple(phase_result.target_xy)
                 self.target_bbox = tuple(bbox)
+                self.target_xyz_world = details.get("target_xyz_world")
                 self.target_confidence = float(getattr(phase_result, "confidence", 0.0))
                 self.stage = FEASIBLE_CHECK
                 reason = "phase_confirmed_3d"
@@ -274,12 +277,19 @@ class ExecutionMonitor:
             else:
                 reason = "waiting_for_phase_confirmation"
         elif before == FEASIBLE_CHECK:
-            feasible_result = self.feasible_verifier.update(
-                observation,
-                self.target_xy,
-                self.target_bbox,
-                confidence=self.target_confidence,
-            )
+            if hasattr(self.feasible_verifier, "ready3d"):
+                feasible_result = self.feasible_verifier.update(
+                    observation,
+                    target_xyz_world=self.target_xyz_world,
+                    confidence=self.target_confidence,
+                )
+            else:
+                feasible_result = self.feasible_verifier.update(
+                    observation,
+                    self.target_xy,
+                    self.target_bbox,
+                    confidence=self.target_confidence,
+                )
             if feasible_result.status == FEASIBLE:
                 self.stage, reason = COMPLETION_CHECK, "entered_feasible_region"
                 self.feasible_enter_timestep = observation.timestep

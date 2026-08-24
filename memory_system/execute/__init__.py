@@ -17,6 +17,7 @@ from memory_system.execute.feasible import (
     NOT_FEASIBLE,
     FeasibleVerifier,
 )
+from memory_system.execute.feasible3d import Feasible3DVerifier
 from memory_system.execute.phase import (
     PHASE_ERROR,
     PHASE_OK,
@@ -51,6 +52,7 @@ __all__ = [
     "FEASIBLE",
     "FEASIBLE_CHECK",
     "FEASIBLE_UNKNOWN",
+    "Feasible3DVerifier",
     "FeasibleRecoverySelector",
     "FeasibleVerifier",
     "ExecutionMonitor",

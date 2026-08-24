@@ -124,6 +124,11 @@ class FeasibleResult:
     wrong_way_count: int
     confidence: float
     details: dict[str, Any] = field(default_factory=dict)
+    # 3D Feasible optional fields (defaults keep 2D results unchanged).
+    current_distance_m: float | None = None
+    ready_distance_m: float | None = None
+    progress_m: float | None = None
+    target_xyz_world: np.ndarray | None = None
 
 
 @dataclass(frozen=True)

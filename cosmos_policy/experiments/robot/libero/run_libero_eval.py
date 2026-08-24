@@ -282,6 +282,7 @@ class PolicyEvalConfig:
     vector_db_output_dir: str = ""                                       # Output directory for vector DB .pt files
     enable_phase_verifier: bool = False                                  # Enable the sequential observation-only verifier; never modifies actions
     enable_phase_3d: bool = False                                        # Use RGB-D Phase 3D verifier when phase verifier is enabled
+    enable_feasible_3d: bool = False                                     # Use 3D Feasible verifier when phase verifier is enabled
     enable_phase_recovery: bool = False                                 # Enable retrieval-based PHASE_ERROR pose recovery
     enable_feasible_recovery: bool = False                              # Enable retrieval-based FEASIBLE_ERROR pose recovery
 
@@ -316,6 +317,8 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
             raise ValueError("Visual verifier memory was built at env_img_res=256")
         if not cfg.flip_images:
             raise ValueError("Visual verifier memory requires flip_images=True")
+    if cfg.enable_feasible_3d and not cfg.enable_phase_3d:
+        raise ValueError("enable_feasible_3d requires enable_phase_3d=True")
 
 
 def _create_execution_monitor(cfg: PolicyEvalConfig):
@@ -325,6 +328,7 @@ def _create_execution_monitor(cfg: PolicyEvalConfig):
     segments_manifest = memory_dir / "segments_ready_fixed16.json"
     wrist_completion_targets = memory_dir / "wrist_completion_targets.pt"
     wrist_feasible_targets = memory_dir / "feasible_wrist_targets.pt"
+    ready3d_targets = memory_dir / "ready3d_targets.pt"
     missing = [path for path in (phase_targets, segments_manifest) if not path.exists()]
     if missing:
         raise FileNotFoundError(f"Missing sequential verifier inputs: {missing}")
@@ -332,29 +336,49 @@ def _create_execution_monitor(cfg: PolicyEvalConfig):
         raise FileNotFoundError(f"Missing wrist completion targets: {wrist_completion_targets}")
     if cfg.enable_feasible_recovery and not wrist_feasible_targets.exists():
         raise FileNotFoundError(f"Missing wrist feasible targets: {wrist_feasible_targets}")
+    if cfg.enable_feasible_3d and not ready3d_targets.exists():
+        raise FileNotFoundError(f"Missing ready3d targets: {ready3d_targets}")
 
     from memory_system.execute.execution_monitor import ExecutionMonitor
     from memory_system.execute.feasible import FeasibleVerifier
+    from memory_system.execute.feasible3d import Feasible3DVerifier
     from memory_system.execute.phase import PhaseVerifier
     from memory_system.execute.phase3d import Phase3DVerifier
     from memory_system.execute.plan import load_phase_plans
     from memory_system.execute.skill_completion import SkillCompletionVerifier
 
     phase_verifier = (
-        Phase3DVerifier(phase_targets, segments_manifest)
+        Phase3DVerifier(
+            phase_targets,
+            segments_manifest,
+            enable_feasible_3d=cfg.enable_feasible_3d,
+            ready3d_targets=ready3d_targets if cfg.enable_feasible_3d else None,
+        )
         if cfg.enable_phase_3d
         else PhaseVerifier(phase_targets)
+    )
+    feasible_verifier = (
+        Feasible3DVerifier(
+            ready3d_targets,
+            phase_targets,
+            segments_manifest,
+            wrist_feasible_targets=(
+                wrist_feasible_targets if cfg.enable_feasible_recovery else None
+            ),
+        )
+        if cfg.enable_feasible_3d
+        else FeasibleVerifier(
+            phase_targets, segments_manifest,
+            wrist_feasible_targets=(
+                wrist_feasible_targets if cfg.enable_feasible_recovery else None
+            ),
+        )
     )
 
     return ExecutionMonitor(
         load_phase_plans(segments_manifest),
         phase_verifier,
-        FeasibleVerifier(
-            phase_targets, segments_manifest,
-            wrist_feasible_targets=(
-                wrist_feasible_targets if cfg.enable_feasible_recovery else None
-            ),
-        ),
+        feasible_verifier,
         SkillCompletionVerifier(
             phase_targets, wrist_completion_targets=wrist_completion_targets
         ),
@@ -457,6 +481,10 @@ def _feasible_result_payload(result):
         "stall_count": result.stall_count,
         "wrong_way_count": result.wrong_way_count,
         "confidence": result.confidence,
+        "current_distance_m": getattr(result, "current_distance_m", None),
+        "ready_distance_m": getattr(result, "ready_distance_m", None),
+        "progress_m": getattr(result, "progress_m", None),
+        "target_xyz_world": getattr(result, "target_xyz_world", None),
         "details": result.details,
     }
 
