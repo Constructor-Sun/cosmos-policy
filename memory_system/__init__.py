@@ -11,8 +11,16 @@ from memory_system.artifacts import (
     WristCompletionMemory,
     WristFeasibleMemory,
 )
+from memory_system.geometry import (
+    camera_params,
+    depth_to_metric,
+    flip_depth,
+    pixel_to_world,
+    world_to_pixel,
+)
 from memory_system.skills import SKILLS
 from memory_system.types import (
+    CameraParams,
     CompletionResult,
     FeasibleResult,
     MemoryKey,
@@ -27,6 +35,7 @@ from memory_system.types import (
 )
 
 __all__ = [
+    "CameraParams",
     "CompletionResult",
     "FeasibleRecoveryMemory",
     "FeasibleResult",
@@ -45,4 +54,9 @@ __all__ = [
     "VerifierObservation",
     "WristCompletionMemory",
     "WristFeasibleMemory",
+    "camera_params",
+    "depth_to_metric",
+    "flip_depth",
+    "pixel_to_world",
+    "world_to_pixel",
 ]

@@ -8,6 +8,7 @@ import numpy as np
 
 from memory_system.execute.feasible import FEASIBLE, NOT_FEASIBLE
 from memory_system.execute.phase import PHASE_ERROR, PHASE_OK
+from memory_system.execute.phase3d import PHASE_DONE
 from memory_system.execute.plan import PhaseSpec
 from memory_system.execute.skill_completion import SKILL_COMPLETE
 from memory_system.skills import is_place
@@ -243,6 +244,12 @@ class ExecutionMonitor:
             if details.get("reason") == "no_templates":
                 self.stage, reason = COMPLETION_CHECK, "no_phase_memory_try_completion"
                 self.completion_verifier.freeze_baseline()
+            elif phase_result.status == PHASE_DONE:
+                self.target_xy = tuple(phase_result.target_xy)
+                self.target_bbox = tuple(bbox)
+                self.target_confidence = float(getattr(phase_result, "confidence", 0.0))
+                self.stage = FEASIBLE_CHECK
+                reason = "phase_confirmed_3d"
             elif (
                 phase_result.status == PHASE_OK
                 and phase_result.progress_px is not None

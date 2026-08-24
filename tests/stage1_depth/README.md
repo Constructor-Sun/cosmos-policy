@@ -12,13 +12,36 @@
 - 模拟器内容（`sim.render`、`sim.model` 的 znear/zfar/extent、`robot0_eef_pos`）
   在本阶段只作为测试参考，不进入被测试的转换路径。
 
+## 正式几何实现位置
+
+米制 depth 转换、相机参数和反投影逻辑已经放入正式模块：
+
+```text
+memory_system/geometry.py
+```
+
+包含：
+
+- `depth_to_metric()`
+- `camera_params()`
+- `flip_depth()`
+- `pixel_to_world()`
+- `world_to_pixel()`
+
+Stage 1 测试直接测试该正式实现，不再从 `tests/stage1_depth/harness.py` 导入重复的几何函数。
+
+`VerifierObservation` 也已扩展：
+
+- `main_depth`
+- `camera_params`
+
 ## 三个检查
 
 | 文件 | 检查 | 做法 | 参照 |
 |---|---|---|---|
 | `test_depth_plumbing.py` | obs 键/形状/数值 | `obs["agentview_depth"]` == `sim.render(depth=True)`（同渲染器，只查接线） | sim.render |
 | `test_depth_conversion.py` | 米制转换正确性 | implied-near 一致性：从每个像素反解 near，必须恒等于模型 `znear×extent` | sim.model near/far |
-| `test_depth_flip.py` | flip 对齐 | A) flip_depth == np.flipud（精确）；B) flip 感知反投影 == 未 flip 反投影（精确）；C) EEF 世界点投影→flip→反投影→再投影，落在同一 flip 像素（±2px） | 自洽 + EEF |
+| `test_depth_flip.py` | flip 对齐 | A) `flip_depth == np.flipud`（精确）；B) flip 感知反投影 == 未 flip 反投影（精确）；C) EEF 世界点投影→flip→反投影→再投影，落在同一 flip 像素（±2px） | 自洽 + EEF |
 
 ## 运行
 
@@ -61,7 +84,7 @@ row_render    = H - 1 - row_canonical     # backward：canonical 像素 -> 相�
 | 离线 `gripper_xy` | **flip**：`world→pixel` 投影（raw）后镜像 row（`row = H-1-row`） | 实测：模板 gripper_xy == EEF 的 flipped 投影 |
 | 在线 `third_view_rgb`（`prepare_observation`） | **flip**：`np.flipud(raw obs)` | 与模板同空间，phase 匹配一致 |
 | 在线 `_project_gripper_xy` | **当前不 flip**（`run_libero_eval.py` NOTE 明确不要） | ← 现状：raw，与 canonical 不一致（见下） |
-| 反投影 pixel→world（RGB-D 未来 / 本测试） | **先 unflip row 再进相机几何** | `harness.back_project_flipped` 即此约定 |
+| 反投影 pixel→world（RGB-D） | **先 unflip row 再进相机几何** | `memory_system.geometry.pixel_to_world()` 即此约定 |
 
 **forward / backward 两条规则（唯一约定）**：
 
@@ -87,9 +110,9 @@ backward (canonical pixel -> world):  depth 在 canonical 像素 (r, c) 采样�
 1. **depth obs 与米制转换**
    - `obs["agentview_depth"]`：`(256, 256, 1)` float32，归一化 `[0.984, 0.995]`，
      等于 `sim.render("agentview", depth=True)` 的原始渲染（IMAGE_CONVENTION=opengl，无翻转）。
-   - 米制转换 `get_real_depth_map`（near = znear×extent = 0.011831,
-     far = zfar×extent = 591.55）在 1.0~2.3 m 深度范围内反解出的 near **恒等于** 模型值
-     （相对误差 ~1e-6），即米制转换在数学上精确正确。
+   - 米制转换（near = znear×extent = 0.011831, far = zfar×extent = 591.55）
+     在 1.0~2.3 m 深度范围内反解出的 near **恒等于** 模型值（相对误差 ~1e-6），
+     即米制转换在数学上精确正确。
    - agentview fovy = 45°；`camera_depths=[True, False]`（main depth，wrist 保持 RGB）。
 
 2. **环境限制：同一进程内不得同时存活两个 LIBERO env（EGL 上下文串扰）**

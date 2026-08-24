@@ -96,9 +96,9 @@ class PhaseVerifier:
 
     def _match_template(
         self, image: np.ndarray, prepared: list[tuple[np.ndarray, np.ndarray]]
-    ) -> tuple[np.ndarray, float, tuple[int, int, int, int]] | None:
+    ) -> tuple[np.ndarray, float, tuple[int, int, int, int], int] | None:
         best = None
-        for resized, mask_rgb in prepared:
+        for scale_idx, (resized, mask_rgb) in enumerate(prepared):
             height, width = resized.shape[:2]
             if width > image.shape[1] or height > image.shape[0]:
                 continue
@@ -111,6 +111,7 @@ class PhaseVerifier:
             candidate = (
                 np.asarray([x0 + width / 2, y0 + height / 2], dtype=np.float32),
                 float(score), (x0, y0, x0 + width, y0 + height),
+                int(scale_idx),
             )
             if best is None or candidate[1] > best[1]:
                 best = candidate
@@ -136,6 +137,62 @@ class PhaseVerifier:
             support, mean_score = len(cluster), float(weights.mean())
             ranked.append((center, support * mean_score, support, mean_score, best))
         return sorted(ranked, key=lambda item: (item[2], item[1]), reverse=True)
+
+    def _mask_for_match(self, template: dict[str, Any], scale_idx: int,
+                        bbox: tuple[int, int, int, int]) -> np.ndarray:
+        """Build a full-image binary mask for a matched template result."""
+        crop = _as_numpy(template["crop_mask"], np.uint8)
+        scale = self.scales[int(scale_idx)]
+        width = max(6, int(round(crop.shape[1] * scale)))
+        height = max(6, int(round(crop.shape[0] * scale)))
+        resized = cv2.resize(crop, (width, height), interpolation=cv2.INTER_NEAREST)
+        x0, y0, x1, y1 = [int(v) for v in bbox]
+        mask = np.zeros((self.image_height, self.image_width), dtype=np.uint8)
+        mask[y0:y1, x0:x1] = resized
+        return mask
+
+    def match_current(self, image: np.ndarray) -> dict[str, Any] | None:
+        """Run the same template-match/vote path as update() and return mask.
+
+        This is the reusable matching entry point for RGB-D Phase work.  It
+        does not change any 2D Phase state/progress behavior.
+        """
+        if not self.templates:
+            return None
+        image = _as_numpy(image, np.uint8)
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(f"Expected HxWx3 RGB image, got {image.shape}")
+        self.image_height, self.image_width = image.shape[:2]
+        image = cv2.GaussianBlur(image, (3, 3), 0)
+        by_demo = {}
+        for template, prepared in self.prepared_templates:
+            match = self._match_template(image, prepared)
+            demo_id = template["demo_id"]
+            if match is not None and (demo_id not in by_demo or match[1] > by_demo[demo_id][1]):
+                by_demo[demo_id] = (*match, template)
+        ranked = self._cluster_votes(list(by_demo.values()))
+        if not ranked or ranked[0][2] < self.min_demo_votes:
+            return None
+        target, strength, support, similarity, best = ranked[0]
+        runner_strength = ranked[1][1] if len(ranked) > 1 else 0.0
+        confidence = strength / max(strength + runner_strength, 1e-8)
+        if runner_strength > 0 and runner_strength / strength >= self.ambiguity_ratio:
+            return None
+        template = best[4]
+        scale_idx = int(best[3])
+        bbox = tuple(int(v) for v in best[2])
+        mask = self._mask_for_match(template, scale_idx, bbox)
+        return {
+            "target_xy": tuple(float(x) for x in target),
+            "bbox_xyxy": bbox,
+            "scale_idx": scale_idx,
+            "mask": mask,
+            "template": template,
+            "support": support,
+            "similarity": similarity,
+            "strength": strength,
+            "confidence": confidence,
+        }
 
     def update(self, observation: VerifierObservation) -> PhaseResult:
         third_view_rgb = observation.third_view_rgb
@@ -164,7 +221,7 @@ class PhaseVerifier:
         if runner_strength > 0 and runner_strength / strength >= self.ambiguity_ratio:
             return PhaseResult(
                 PHASE_UNKNOWN, confidence, tuple(float(x) for x in target), None,
-                support, best[3]["demo_id"], {"reason": "ambiguous_visual_region"},
+                support, best[4]["demo_id"], {"reason": "ambiguous_visual_region"},
             )
         progress, status = None, PHASE_OK
         if gripper_xy is not None:
@@ -180,7 +237,7 @@ class PhaseVerifier:
                 if self.wrong_way_count >= self.wrong_way_updates:
                     status = PHASE_ERROR
             self.previous_gripper = gripper.copy()
-        template = best[3]
+        template = best[4]
         return PhaseResult(
             status, confidence, tuple(float(x) for x in target), progress, support,
             template["demo_id"], {
@@ -188,6 +245,7 @@ class PhaseVerifier:
                 "demo_votes": support,
                 "cluster_strength": strength,
                 "matched_bbox_xyxy": best[2],
+                "matched_scale_idx": best[3],
                 "template_frame": int(template["frame"]),
                 "wrong_way_count": self.wrong_way_count,
             },

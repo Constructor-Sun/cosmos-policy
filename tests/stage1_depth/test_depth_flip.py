@@ -26,8 +26,34 @@ wrist EEF frame along the ray by a few cm, so we assert pixel consistency
 import numpy as np
 import pytest
 
-from harness import RESOLUTION, back_project, back_project_flipped, camera_params, flip_depth, metric_depth
+from harness import RESOLUTION
+from memory_system.geometry import (
+    camera_params as build_camera_params,
+    depth_to_metric,
+    flip_depth,
+    pixel_to_world,
+)
 from robosuite.utils.camera_utils import project_points_from_world_to_camera
+
+def _metric(env, obs):
+    cam = build_camera_params(env.env.sim, "agentview", RESOLUTION, RESOLUTION)
+    raw = np.asarray(obs["agentview_depth"], dtype=np.float64)
+    return depth_to_metric(raw, cam.near, cam.far)
+
+
+def _back_project_unflipped(pixels, depth, cam):
+    """Test-only reference: back-project in raw render pixel space."""
+    d = depth[..., 0] if depth.ndim == 3 else depth
+    px = np.atleast_2d(np.asarray(pixels, dtype=np.int64))
+    rows, cols = px[:, 0], px[:, 1]
+    z = d[rows, cols].astype(np.float64)
+    fx, fy = float(cam.K[0, 0]), float(cam.K[1, 1])
+    cx, cy = float(cam.K[0, 2]), float(cam.K[1, 2])
+    x_cam = (cols - cx) / fx * z
+    y_cam = (rows - cy) / fy * z
+    cam_pts = np.stack([x_cam, y_cam, z, np.ones_like(z)], axis=-1)
+    return (cam.T_c2w @ cam_pts.T).T[:, :3]
+
 
 PX_TOL = 2  # pixels (rounding + K principal-point half-pixel)
 
@@ -38,7 +64,7 @@ PX_TOL = 2  # pixels (rounding + K principal-point half-pixel)
 ])
 def test_flip_array_identity(env_ctx, task):
     _env, obs = env_ctx(task)
-    d = metric_depth(_env, obs)
+    d = _metric(_env, obs)
     d_f = flip_depth(d)
     assert d_f.shape == d.shape
     assert np.array_equal(d_f, np.flipud(d))
@@ -54,8 +80,8 @@ def test_flip_array_identity(env_ctx, task):
 ])
 def test_flip_backproject_consistency(env_ctx, task):
     env, obs = env_ctx(task)
-    K, _T_w2c, T_c2w = camera_params(env)
-    d = metric_depth(env, obs)
+    cam = build_camera_params(env.env.sim, "agentview", RESOLUTION, RESOLUTION)
+    d = _metric(env, obs)
     d_f = flip_depth(d)
 
     rng = np.random.default_rng(1)
@@ -64,8 +90,8 @@ def test_flip_backproject_consistency(env_ctx, task):
     pix = np.stack([rows, cols], axis=-1)
     pix_f = np.stack([RESOLUTION - 1 - rows, cols], axis=-1)
 
-    P = back_project(pix, d, K, T_c2w)
-    P_f = back_project_flipped(pix_f, d_f, K, T_c2w)
+    P = _back_project_unflipped(pix, d, cam)
+    P_f = pixel_to_world(pix_f, d_f, cam)
     assert np.allclose(P, P_f, atol=1e-9), (
         "flip-aware back-projection at flipped coords != unflipped back-projection"
     )
@@ -77,17 +103,17 @@ def test_flip_backproject_consistency(env_ctx, task):
 ])
 def test_eef_roundtrip_flipped_pixel(env_ctx, task):
     env, obs = env_ctx(task)
-    K, T_w2c, T_c2w = camera_params(env)
-    d_f = flip_depth(metric_depth(env, obs))
+    cam = build_camera_params(env.env.sim, "agentview", RESOLUTION, RESOLUTION)
+    d_f = flip_depth(_metric(env, obs))
 
     eef = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
-    row_col = project_points_from_world_to_camera(eef, T_w2c, RESOLUTION, RESOLUTION)
+    row_col = project_points_from_world_to_camera(eef, cam.T_w2c, RESOLUTION, RESOLUTION)
     row_f = int(RESOLUTION - 1 - row_col[0])
     col = int(row_col[1])
 
-    P = back_project_flipped(np.array([[row_f, col]]), d_f, K, T_c2w)[0]
+    P = pixel_to_world(np.array([[row_f, col]]), d_f, cam)[0]
     # forward-project the recovered point; it must land on the same flipped pixel
-    r1 = project_points_from_world_to_camera(P, T_w2c, RESOLUTION, RESOLUTION)
+    r1 = project_points_from_world_to_camera(P, cam.T_w2c, RESOLUTION, RESOLUTION)
     row_f1 = int(RESOLUTION - 1 - r1[0])
     col1 = int(r1[1])
     assert abs(row_f1 - row_f) <= PX_TOL and abs(col1 - col) <= PX_TOL, (

@@ -17,7 +17,8 @@ import argparse
 
 import numpy as np
 
-from harness import RESOLUTION, create_env, flip_depth, load_task_names, metric_depth
+from harness import RESOLUTION, create_env, load_task_names
+from memory_system.geometry import camera_params as build_camera_params, depth_to_metric, flip_depth
 
 
 def main() -> None:
@@ -34,8 +35,10 @@ def main() -> None:
     env = create_env(task)
     obs = env.reset()
 
+    cam = build_camera_params(env.env.sim, "agentview", RESOLUTION, RESOLUTION)
+    metric = depth_to_metric(obs["agentview_depth"], cam.near, cam.far)
     rgb = np.asarray(obs["agentview_image"])
-    d = metric_depth(env, obs)[..., 0]
+    d = metric[..., 0]
     rgb_f = np.flipud(rgb)
     d_f = flip_depth(d)
 

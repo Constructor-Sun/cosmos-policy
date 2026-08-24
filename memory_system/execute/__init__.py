@@ -23,6 +23,7 @@ from memory_system.execute.phase import (
     PHASE_UNKNOWN,
     PhaseVerifier,
 )
+from memory_system.execute.phase3d import PHASE_DONE, Phase3DVerifier
 from memory_system.execute.plan import (
     PhaseMonitor,
     PhaseMonitorResult,
@@ -57,10 +58,12 @@ __all__ = [
     "NOT_FEASIBLE",
     "OpenCloseCompletionVerifier",
     "PHASE_CHECK",
+    "PHASE_DONE",
     "PHASE_ERROR",
     "PHASE_OK",
     "PHASE_UNKNOWN",
     "PLAN_COMPLETE",
+    "Phase3DVerifier",
     "PhaseMonitor",
     "PhaseMonitorResult",
     "PhaseRecoverySelector",

@@ -154,6 +154,11 @@ from cosmos_policy.experiments.robot.robot_utils import (
     setup_logging,
 )
 from cosmos_policy.utils.utils import jpeg_encode_image, set_seed_everywhere
+from memory_system.geometry import (
+    camera_params as build_camera_params,
+    depth_to_metric,
+    flip_depth,
+)
 from memory_system.types import VerifierObservation
 from scipy.spatial.transform import Rotation
 
@@ -276,6 +281,7 @@ class PolicyEvalConfig:
     save_vector_db: bool = False                                         # If True, save VAE latents + proprio at action chunk boundaries
     vector_db_output_dir: str = ""                                       # Output directory for vector DB .pt files
     enable_phase_verifier: bool = False                                  # Enable the sequential observation-only verifier; never modifies actions
+    enable_phase_3d: bool = False                                        # Use RGB-D Phase 3D verifier when phase verifier is enabled
     enable_phase_recovery: bool = False                                 # Enable retrieval-based PHASE_ERROR pose recovery
     enable_feasible_recovery: bool = False                              # Enable retrieval-based FEASIBLE_ERROR pose recovery
 
@@ -330,12 +336,19 @@ def _create_execution_monitor(cfg: PolicyEvalConfig):
     from memory_system.execute.execution_monitor import ExecutionMonitor
     from memory_system.execute.feasible import FeasibleVerifier
     from memory_system.execute.phase import PhaseVerifier
+    from memory_system.execute.phase3d import Phase3DVerifier
     from memory_system.execute.plan import load_phase_plans
     from memory_system.execute.skill_completion import SkillCompletionVerifier
 
+    phase_verifier = (
+        Phase3DVerifier(phase_targets, segments_manifest)
+        if cfg.enable_phase_3d
+        else PhaseVerifier(phase_targets)
+    )
+
     return ExecutionMonitor(
         load_phase_plans(segments_manifest),
-        PhaseVerifier(phase_targets),
+        phase_verifier,
         FeasibleVerifier(
             phase_targets, segments_manifest,
             wrist_feasible_targets=(
@@ -355,6 +368,8 @@ def _make_verifier_observation(
     timestep,
     gripper_closed,
     main_vae=None,
+    main_depth=None,
+    camera_params=None,
 ) -> VerifierObservation:
     """Build the shared observation payload consumed by memory_system.execute."""
     return VerifierObservation(
@@ -372,7 +387,17 @@ def _make_verifier_observation(
         gripper_qpos=obs["robot0_gripper_qpos"],
         main_vae=main_vae,
         timestep=timestep,
+        main_depth=main_depth,
+        camera_params=camera_params,
     )
+
+
+def _make_main_depth(obs, camera_params, flip_images: bool):
+    """Return metric depth aligned with the canonical third-view RGB."""
+    metric = depth_to_metric(
+        obs["agentview_depth"], camera_params.near, camera_params.far
+    )
+    return flip_depth(metric) if flip_images else metric
 
 
 def _resolve_phase_task_name(task_name: str, execution_monitor) -> str:
@@ -577,6 +602,7 @@ def run_episode(
     execution_monitor_error = None
     verifier_records = []
     phase_camera_transform = None
+    phase_camera_params = None
     phase_overlay = None
     phase_overlay_renderer = None
     if episode_execution_monitor is not None:
@@ -589,6 +615,9 @@ def run_episode(
 
         height, width = obs["agentview_image"].shape[:2]
         phase_camera_transform = get_camera_transform_matrix(
+            env.sim, "agentview", height, width
+        )
+        phase_camera_params = build_camera_params(
             env.sim, "agentview", height, width
         )
         phase_overlay_renderer = render_phase_verifier_overlay
@@ -609,6 +638,7 @@ def run_episode(
     last_gripper_closed = None
 
     _max_phase_corrections = int(os.environ.get("COSMOS_MAX_CORRECTIONS_PER_PHASE", "2"))
+    _phase_check_interval = int(os.environ.get("COSMOS_PHASE_CHECK_INTERVAL", "8"))
     _correction_kind = None
     _correction_per_step = None
     _correction_controller = None
@@ -648,6 +678,240 @@ def run_episode(
             f"then moving to nearest ready pose",
             log_fh,
         )
+
+    def _phase_check_and_recover(t, observation, obs, log_file):
+        nonlocal _phase_correction_count
+        nonlocal _correction_kind, _correction_steps_remaining, _correction_per_step
+        nonlocal _correction_controller, _correction_step_index, offset_gripper_action
+        nonlocal episode_execution_monitor, phase_overlay, execution_monitor_error
+        if episode_execution_monitor is not None:
+            try:
+                active_spec = episode_execution_monitor.current_phase
+                gripper_xy = _project_gripper_xy(
+                    obs, phase_camera_transform, cfg.flip_images
+                )
+                verifier_obs = _make_verifier_observation(
+                    observation, obs, gripper_xy, t, last_gripper_closed,
+                    main_depth=_make_main_depth(
+                        obs, phase_camera_params, cfg.flip_images
+                    ),
+                    camera_params=phase_camera_params,
+                )
+                execution_result = episode_execution_monitor.observe_vae(
+                    verifier_obs
+                )
+                if execution_result is None:
+                    execution_result = episode_execution_monitor.observe(
+                        verifier_obs
+                    )
+                if (
+                    execution_result.should_intervene
+                    and execution_result.intervention_reason == "wrong_grasp_close"
+                    and feasible_recovery is not None
+                ):
+                    _start_wrong_grasp_correction(t, obs, log_file)
+                if (
+                    execution_result.should_intervene
+                    and execution_result.intervention_reason == "phase_error"
+                    and pose_recovery is not None
+                    and _captured_latent
+                    and _phase_correction_count < _max_phase_corrections
+                ):
+                    _phase_correction_count += 1
+                    current_vae_main = _captured_latent[0][0, :, 3:4, :, :]
+                    current_ee_states = np.concatenate([
+                        obs["robot0_eef_pos"],
+                        Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+                    ]).astype(np.float32)
+                    recovery = pose_recovery.compute(
+                        phase_task_name,
+                        active_spec.planner_step_id,
+                        active_spec.skill,
+                        active_spec.arguments,
+                        current_vae_main,
+                        current_ee_states,
+                    )
+                    if recovery is not None:
+                        _correction_kind = "phase_pose_recovery"
+                        _correction_steps_remaining = recovery.correction_steps
+                        _correction_per_step = recovery.correction_per_step
+                        _correction_controller = recovery.controller
+                        _correction_step_index = 0
+                        offset_gripper_action = float(bool(last_gripper_closed))
+                        action_queue.clear()
+                        episode_execution_monitor.retry_current_phase()
+                        phase_overlay = None
+                        log_message(
+                            f"[PHASE RECOVERY] t={t}: current={current_ee_states.tolist()} "
+                            f"target={recovery.target_ee_states.tolist()} "
+                            f"per_step={recovery.correction_per_step[0].tolist() if recovery.correction_per_step.ndim == 2 else recovery.correction_per_step.tolist()} "
+                            f"per_step_last={recovery.correction_per_step[-1].tolist() if recovery.correction_per_step.ndim == 2 else ''} "
+                            f"sim={recovery.similarity:.3f} demos={recovery.demo_ids}",
+                            log_file,
+                        )
+                    else:
+                        _correction_kind = "phase_retry"
+                        _correction_steps_remaining = 1
+                        _correction_per_step = np.zeros(6, dtype=np.float32)
+                        _correction_step_index = 0
+                        offset_gripper_action = float(bool(last_gripper_closed))
+                        action_queue.clear()
+                        episode_execution_monitor.retry_current_phase()
+                        phase_overlay = None
+                        log_message(
+                            f"[PHASE RECOVERY] t={t}: no confident target; retry phase",
+                            log_file,
+                        )
+                if (
+                    execution_result.should_intervene
+                    and execution_result.intervention_reason == "feasible_error"
+                    and feasible_recovery is not None
+                    and _captured_latent
+                ):
+                    if _phase_correction_count < _max_phase_corrections:
+                        _phase_correction_count += 1
+                        current_vae_main = _captured_latent[0][0, :, 3:4, :, :]
+                        current_vae_wrist = _captured_latent[0][0, :, 2:3, :, :]
+                        current_ee_states = np.concatenate([
+                            obs["robot0_eef_pos"],
+                            Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+                        ]).astype(np.float32)
+                        recovery = feasible_recovery.compute(
+                            phase_task_name,
+                            active_spec.planner_step_id,
+                            active_spec.skill,
+                            active_spec.arguments,
+                            current_vae_main,
+                            current_vae_wrist,
+                            current_ee_states,
+                        )
+                        if recovery is not None:
+                            _correction_kind = "feasible_pose_recovery"
+                            _correction_steps_remaining = recovery.correction_steps
+                            _correction_per_step = recovery.correction_per_step
+                            _correction_controller = recovery.controller
+                            _correction_step_index = 0
+                            offset_gripper_action = float(bool(last_gripper_closed))
+                            action_queue.clear()
+                            episode_execution_monitor.mark_feasible_after_recovery()
+                            phase_overlay = None
+                            log_message(
+                                f"[FEASIBLE RECOVERY] t={t}: current={current_ee_states.tolist()} "
+                                f"target={recovery.target_ee_states.tolist()} "
+                                f"per_step={recovery.correction_per_step[0].tolist() if recovery.correction_per_step.ndim == 2 else recovery.correction_per_step.tolist()} "
+                                f"per_step_last={recovery.correction_per_step[-1].tolist() if recovery.correction_per_step.ndim == 2 else ''} "
+                                f"sim={recovery.similarity:.3f} demos={recovery.demo_ids}",
+                                log_file,
+                            )
+                        else:
+                            feasible_result = execution_result.feasible_result
+                            far = (
+                                feasible_result is not None
+                                and feasible_result.current_distance is not None
+                                and feasible_result.ready_distance is not None
+                                and feasible_result.current_distance > feasible_result.ready_distance * 2.5
+                            )
+                            recovery = (
+                                feasible_recovery.compute_nearest_ready(
+                                    phase_task_name,
+                                    active_spec.planner_step_id,
+                                    active_spec.skill,
+                                    active_spec.arguments,
+                                    current_ee_states,
+                                )
+                                if far else None
+                            )
+                            if recovery is not None:
+                                _correction_kind = "feasible_nearest_ready"
+                                _correction_steps_remaining = recovery.correction_steps
+                                _correction_per_step = recovery.correction_per_step
+                                _correction_controller = recovery.controller
+                                _correction_step_index = 0
+                                offset_gripper_action = float(bool(last_gripper_closed))
+                                action_queue.clear()
+                                episode_execution_monitor.retry_current_phase()
+                                phase_overlay = None
+                                log_message(
+                                    f"[FEASIBLE NEAREST READY] t={t}: far={far} "
+                                    f"target={recovery.target_ee_states.tolist()} "
+                                    f"demos={recovery.demo_ids}",
+                                    log_file,
+                                )
+                            else:
+                                _correction_kind = "feasible_retry"
+                                _correction_steps_remaining = 1
+                                _correction_per_step = np.zeros(6, dtype=np.float32)
+                                _correction_step_index = 0
+                                offset_gripper_action = float(bool(last_gripper_closed))
+                                action_queue.clear()
+                                episode_execution_monitor.retry_current_phase()
+                                phase_overlay = None
+                                log_message(
+                                    f"[FEASIBLE RECOVERY] t={t}: no confident target; retry phase",
+                                    log_file,
+                                )
+                    else:
+                        log_message(
+                            f"[FEASIBLE RECOVERY] t={t}: skip feasible correction; "
+                            "limit reached for this phase",
+                            log_file,
+                        )
+                if execution_result.phase_result is not None:
+                    phase_overlay = _phase_overlay_payload(
+                        active_spec, execution_result.phase_result
+                    )
+                    replay_images[-1] = phase_overlay_renderer(
+                        observation["primary_image"], phase_overlay
+                    )
+                elif execution_result.phase_advanced:
+                    _phase_correction_count = 0
+                    phase_overlay = None
+                verifier_record = {
+                    "task_name": phase_task_name,
+                    "episode": episode_index + 1,
+                    "timestep": t,
+                    "rollout_frame_index": len(replay_images) - 1,
+                    "active_phase": _phase_spec_payload(active_spec),
+                    "observed_step_id": execution_result.observed_step_id,
+                    "active_step_id": execution_result.active_step_id,
+                    "stage_before": execution_result.stage_before,
+                    "stage_after": execution_result.stage_after,
+                    "reason": execution_result.reason,
+                    "phase_advanced": execution_result.phase_advanced,
+                    "plan_complete": execution_result.plan_complete,
+                    "gripper_xy": gripper_xy,
+                    "gripper_closed": last_gripper_closed,
+                    "phase": _phase_result_payload(execution_result.phase_result),
+                    "feasible": _feasible_result_payload(execution_result.feasible_result),
+                    "completion": _completion_result_payload(execution_result.completion_result),
+                }
+                verifier_records.append(verifier_record)
+                tag = (
+                    "PHASE" if execution_result.phase_result is not None
+                    else "FEASIBLE" if execution_result.feasible_result is not None
+                    else "COMPLETION" if execution_result.completion_result is not None
+                    else "VERIFIER"
+                )
+                log_message(
+                    f"[{tag}] "
+                    + json.dumps(
+                        verifier_record,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=_phase_json_default,
+                    ),
+                    log_file,
+                    console=(tag != "PHASE"),
+                )
+            except Exception as verifier_error:
+                execution_monitor_error = str(verifier_error)
+                episode_execution_monitor = None
+                phase_overlay = None
+                log_message(
+                    f"[VERIFIER ERROR] t={t}: {verifier_error}; "
+                    "disabling sequential verifier for this episode",
+                    log_file,
+                )
 
     # Setup
     t = 0
@@ -725,7 +989,11 @@ def run_episode(
                     )
                     step_result = episode_execution_monitor.observe_vae(
                         _make_verifier_observation(
-                            observation, obs, gripper_xy, t, last_gripper_closed
+                            observation, obs, gripper_xy, t, last_gripper_closed,
+                            main_depth=_make_main_depth(
+                                obs, phase_camera_params, cfg.flip_images
+                            ),
+                            camera_params=phase_camera_params,
                         )
                     )
                     if step_result is not None:
@@ -1074,233 +1342,21 @@ def run_episode(
                             "step_index": t,
                         })
 
-                if episode_execution_monitor is not None:
-                    try:
-                        active_spec = episode_execution_monitor.current_phase
-                        gripper_xy = _project_gripper_xy(
-                            obs, phase_camera_transform, cfg.flip_images
-                        )
-                        verifier_obs = _make_verifier_observation(
-                            observation, obs, gripper_xy, t, last_gripper_closed
-                        )
-                        execution_result = episode_execution_monitor.observe_vae(
-                            verifier_obs
-                        )
-                        if execution_result is None:
-                            execution_result = episode_execution_monitor.observe(
-                                verifier_obs
-                            )
-                        if (
-                            execution_result.should_intervene
-                            and execution_result.intervention_reason == "wrong_grasp_close"
-                            and feasible_recovery is not None
-                        ):
-                            _start_wrong_grasp_correction(t, obs, log_file)
-                        if (
-                            execution_result.should_intervene
-                            and execution_result.intervention_reason == "phase_error"
-                            and pose_recovery is not None
-                            and _captured_latent
-                            and _phase_correction_count < _max_phase_corrections
-                        ):
-                            _phase_correction_count += 1
-                            current_vae_main = _captured_latent[0][0, :, 3:4, :, :]
-                            current_ee_states = np.concatenate([
-                                obs["robot0_eef_pos"],
-                                Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
-                            ]).astype(np.float32)
-                            recovery = pose_recovery.compute(
-                                phase_task_name,
-                                active_spec.planner_step_id,
-                                active_spec.skill,
-                                active_spec.arguments,
-                                current_vae_main,
-                                current_ee_states,
-                            )
-                            if recovery is not None:
-                                _correction_kind = "phase_pose_recovery"
-                                _correction_steps_remaining = recovery.correction_steps
-                                _correction_per_step = recovery.correction_per_step
-                                _correction_controller = recovery.controller
-                                _correction_step_index = 0
-                                offset_gripper_action = float(bool(last_gripper_closed))
-                                action_queue.clear()
-                                episode_execution_monitor.retry_current_phase()
-                                phase_overlay = None
-                                log_message(
-                                    f"[PHASE RECOVERY] t={t}: current={current_ee_states.tolist()} "
-                                    f"target={recovery.target_ee_states.tolist()} "
-                                    f"per_step={recovery.correction_per_step[0].tolist() if recovery.correction_per_step.ndim == 2 else recovery.correction_per_step.tolist()} "
-                                    f"per_step_last={recovery.correction_per_step[-1].tolist() if recovery.correction_per_step.ndim == 2 else ''} "
-                                    f"sim={recovery.similarity:.3f} demos={recovery.demo_ids}",
-                                    log_file,
-                                )
-                            else:
-                                _correction_kind = "phase_retry"
-                                _correction_steps_remaining = 1
-                                _correction_per_step = np.zeros(6, dtype=np.float32)
-                                _correction_step_index = 0
-                                offset_gripper_action = float(bool(last_gripper_closed))
-                                action_queue.clear()
-                                episode_execution_monitor.retry_current_phase()
-                                phase_overlay = None
-                                log_message(
-                                    f"[PHASE RECOVERY] t={t}: no confident target; retry phase",
-                                    log_file,
-                                )
-                        if (
-                            execution_result.should_intervene
-                            and execution_result.intervention_reason == "feasible_error"
-                            and feasible_recovery is not None
-                            and _captured_latent
-                        ):
-                            if _phase_correction_count < _max_phase_corrections:
-                                _phase_correction_count += 1
-                                current_vae_main = _captured_latent[0][0, :, 3:4, :, :]
-                                current_vae_wrist = _captured_latent[0][0, :, 2:3, :, :]
-                                current_ee_states = np.concatenate([
-                                    obs["robot0_eef_pos"],
-                                    Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
-                                ]).astype(np.float32)
-                                recovery = feasible_recovery.compute(
-                                    phase_task_name,
-                                    active_spec.planner_step_id,
-                                    active_spec.skill,
-                                    active_spec.arguments,
-                                    current_vae_main,
-                                    current_vae_wrist,
-                                    current_ee_states,
-                                )
-                                if recovery is not None:
-                                    _correction_kind = "feasible_pose_recovery"
-                                    _correction_steps_remaining = recovery.correction_steps
-                                    _correction_per_step = recovery.correction_per_step
-                                    _correction_controller = recovery.controller
-                                    _correction_step_index = 0
-                                    offset_gripper_action = float(bool(last_gripper_closed))
-                                    action_queue.clear()
-                                    episode_execution_monitor.mark_feasible_after_recovery()
-                                    phase_overlay = None
-                                    log_message(
-                                        f"[FEASIBLE RECOVERY] t={t}: current={current_ee_states.tolist()} "
-                                        f"target={recovery.target_ee_states.tolist()} "
-                                        f"per_step={recovery.correction_per_step[0].tolist() if recovery.correction_per_step.ndim == 2 else recovery.correction_per_step.tolist()} "
-                                        f"per_step_last={recovery.correction_per_step[-1].tolist() if recovery.correction_per_step.ndim == 2 else ''} "
-                                        f"sim={recovery.similarity:.3f} demos={recovery.demo_ids}",
-                                        log_file,
-                                    )
-                                else:
-                                    feasible_result = execution_result.feasible_result
-                                    far = (
-                                        feasible_result is not None
-                                        and feasible_result.current_distance is not None
-                                        and feasible_result.ready_distance is not None
-                                        and feasible_result.current_distance > feasible_result.ready_distance * 2.5
-                                    )
-                                    recovery = (
-                                        feasible_recovery.compute_nearest_ready(
-                                            phase_task_name,
-                                            active_spec.planner_step_id,
-                                            active_spec.skill,
-                                            active_spec.arguments,
-                                            current_ee_states,
-                                        )
-                                        if far else None
-                                    )
-                                    if recovery is not None:
-                                        _correction_kind = "feasible_nearest_ready"
-                                        _correction_steps_remaining = recovery.correction_steps
-                                        _correction_per_step = recovery.correction_per_step
-                                        _correction_controller = recovery.controller
-                                        _correction_step_index = 0
-                                        offset_gripper_action = float(bool(last_gripper_closed))
-                                        action_queue.clear()
-                                        episode_execution_monitor.retry_current_phase()
-                                        phase_overlay = None
-                                        log_message(
-                                            f"[FEASIBLE NEAREST READY] t={t}: far={far} "
-                                            f"target={recovery.target_ee_states.tolist()} "
-                                            f"demos={recovery.demo_ids}",
-                                            log_file,
-                                        )
-                                    else:
-                                        _correction_kind = "feasible_retry"
-                                        _correction_steps_remaining = 1
-                                        _correction_per_step = np.zeros(6, dtype=np.float32)
-                                        _correction_step_index = 0
-                                        offset_gripper_action = float(bool(last_gripper_closed))
-                                        action_queue.clear()
-                                        episode_execution_monitor.retry_current_phase()
-                                        phase_overlay = None
-                                        log_message(
-                                            f"[FEASIBLE RECOVERY] t={t}: no confident target; retry phase",
-                                            log_file,
-                                        )
-                            else:
-                                log_message(
-                                    f"[FEASIBLE RECOVERY] t={t}: skip feasible correction; "
-                                    "limit reached for this phase",
-                                    log_file,
-                                )
-                        if execution_result.phase_result is not None:
-                            phase_overlay = _phase_overlay_payload(
-                                active_spec, execution_result.phase_result
-                            )
-                            replay_images[-1] = phase_overlay_renderer(
-                                observation["primary_image"], phase_overlay
-                            )
-                        elif execution_result.phase_advanced:
-                            _phase_correction_count = 0
-                            phase_overlay = None
-                        verifier_record = {
-                            "task_name": phase_task_name,
-                            "episode": episode_index + 1,
-                            "timestep": t,
-                            "rollout_frame_index": len(replay_images) - 1,
-                            "active_phase": _phase_spec_payload(active_spec),
-                            "observed_step_id": execution_result.observed_step_id,
-                            "active_step_id": execution_result.active_step_id,
-                            "stage_before": execution_result.stage_before,
-                            "stage_after": execution_result.stage_after,
-                            "reason": execution_result.reason,
-                            "phase_advanced": execution_result.phase_advanced,
-                            "plan_complete": execution_result.plan_complete,
-                            "gripper_xy": gripper_xy,
-                            "gripper_closed": last_gripper_closed,
-                            "phase": _phase_result_payload(execution_result.phase_result),
-                            "feasible": _feasible_result_payload(execution_result.feasible_result),
-                            "completion": _completion_result_payload(execution_result.completion_result),
-                        }
-                        verifier_records.append(verifier_record)
-                        tag = (
-                            "PHASE" if execution_result.phase_result is not None
-                            else "FEASIBLE" if execution_result.feasible_result is not None
-                            else "COMPLETION" if execution_result.completion_result is not None
-                            else "VERIFIER"
-                        )
-                        log_message(
-                            f"[{tag}] "
-                            + json.dumps(
-                                verifier_record,
-                                ensure_ascii=False,
-                                sort_keys=True,
-                                default=_phase_json_default,
-                            ),
-                            log_file,
-                            console=(tag != "PHASE"),
-                        )
-                    except Exception as verifier_error:
-                        execution_monitor_error = str(verifier_error)
-                        episode_execution_monitor = None
-                        phase_overlay = None
-                        log_message(
-                            f"[VERIFIER ERROR] t={t}: {verifier_error}; "
-                            "disabling sequential verifier for this episode",
-                            log_file,
-                        )
+                _phase_check_and_recover(t, observation, obs, log_file)
 
                 if _capture_vae:
                     model.get_data_and_condition = _orig_gdac
+
+            # Additional phase checks at half-chunk cadence.  With the default
+            # 16-step open-loop chunk and 8-step phase-check interval, this adds
+            # checks at t=18, 34, 50, ... while chunk-boundary checks remain at
+            # t=10, 26, 42, ... giving an effective 8-step cadence.
+            if (
+                episode_execution_monitor is not None
+                and len(action_queue) != 0
+                and (t - (NUM_STEPS_WAIT + _phase_check_interval)) % cfg.num_open_loop_steps == 0
+            ):
+                _phase_check_and_recover(t, observation, obs, log_file)
 
             # A newly detected correction begins immediately on this timestep.
             _is_correction_action = (
@@ -1480,7 +1536,12 @@ def run_task(
     initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
 
     # Initialize environment and get task description
-    env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+    env, task_description = get_libero_env(
+        task,
+        cfg.model_family,
+        resolution=cfg.env_img_res,
+        camera_depths=[True, False] if execution_monitor is not None else None,
+    )
 
     # Start episodes
     task_episodes, task_successes = 0, 0

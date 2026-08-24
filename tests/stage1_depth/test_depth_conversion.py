@@ -24,17 +24,24 @@ is ~1 um of depth error).
 import numpy as np
 import pytest
 
-from harness import metric_depth
+from harness import RESOLUTION
+from memory_system.geometry import camera_params as build_camera_params, depth_to_metric
 
 # relative tolerance on the implied-near identity. float32 depth buffer noise
 # makes (1-d) the dominant error term: rel error ~ eps32/(1-d) ~ 1e-4 at worst.
 REL_TOL = 5e-4
 
 
+def _metric(env, obs):
+    cam = build_camera_params(env.env.sim, "agentview", RESOLUTION, RESOLUTION)
+    raw = np.asarray(obs["agentview_depth"], dtype=np.float64)
+    return depth_to_metric(raw, cam.near, cam.far)
+
+
 def _implied_near_errors(env, obs):
     sim = env.env.sim
     raw = np.asarray(obs["agentview_depth"], dtype=np.float64)[..., 0]
-    metric = metric_depth(env, obs)[..., 0]
+    metric = _metric(env, obs)[..., 0]
 
     extent = float(sim.model.stat.extent)
     near_m = float(sim.model.vis.map.znear) * extent

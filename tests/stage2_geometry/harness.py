@@ -19,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
+from memory_system.geometry import camera_params as build_camera_params, depth_to_metric
+
 REPO_ROOT = Path(__file__).resolve().parents[2]  # <repo>/tests/stage2_geometry -> <repo>
 LIBERO_PLUS = REPO_ROOT.parent / "LIBERO-plus"
 
@@ -119,37 +121,15 @@ def phase_frames(segment: dict, length: int) -> list[int]:
 
 def metric_depth(env, obs) -> np.ndarray:
     """Metric (view-space z) depth aligned with the raw agentview image, (H, W, 1)."""
-    from robosuite.utils.camera_utils import get_real_depth_map
-
+    cam = build_camera_params(env.env.sim, "agentview", RESOLUTION, RESOLUTION)
     raw = np.asarray(obs["agentview_depth"], dtype=np.float64)
-    return get_real_depth_map(env.env.sim, raw)
+    return depth_to_metric(raw, cam.near, cam.far)
 
 
 def camera_params(env):
-    """K, T_w2c, T_c2w built from the ACTUAL render camera.
-
-    IMPORTANT (empirically verified): robosuite's get_camera_extrinsic_matrix
-    applies an axis correction diag(1,-1,-1) that does NOT match this
-    environment's renderer (mujoco 2.3.7 + robosuite 1.4.0).  The render is
-    reproduced by R = cam_xmat @ diag(1,1,-1): with it, back-projecting the
-    rendered instance pixels lands on the true simulator positions, while
-    robosuite's convention is off by ~13 cm in world z.  Stage 2 (world
-    geometry) requires the corrected convention.
-    """
-    sim = env.env.sim
-    cam_id = sim.model.camera_name2id("agentview")
-    cam_pos = np.asarray(sim.data.cam_xpos[cam_id], dtype=np.float64).copy()
-    cam_rot = np.asarray(sim.data.cam_xmat[cam_id], dtype=np.float64).reshape(3, 3).copy()
-    R = cam_rot @ np.diag([1.0, 1.0, -1.0])  # corrected: matches the actual render
-    f = 0.5 * RESOLUTION / np.tan(np.radians(float(sim.model.cam_fovy[cam_id])) / 2)
-    K = np.array([[f, 0.0, RESOLUTION / 2], [0.0, f, RESOLUTION / 2], [0.0, 0.0, 1.0]])
-    T_c2w = np.eye(4)
-    T_c2w[:3, :3] = R
-    T_c2w[:3, 3] = cam_pos
-    T_w2c = np.eye(4)
-    T_w2c[:3, :3] = R.T
-    T_w2c[:3, 3] = -R.T @ cam_pos
-    return K, T_w2c, T_c2w
+    """Return (K, T_w2c, T_c2w) using the formal memory_system geometry."""
+    cam = build_camera_params(env.env.sim, "agentview", RESOLUTION, RESOLUTION)
+    return cam.K, cam.T_w2c, cam.T_c2w
 
 
 def instance_mask(env, obs, instance_name: str) -> np.ndarray:

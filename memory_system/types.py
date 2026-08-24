@@ -55,6 +55,19 @@ class SkillPlan:
 
 
 @dataclass(frozen=True)
+class CameraParams:
+    """Camera intrinsics/extrinsics and depth range for RGB-D geometry."""
+
+    K: np.ndarray
+    T_w2c: np.ndarray
+    T_c2w: np.ndarray
+    height: int
+    width: int
+    near: float = 0.0
+    far: float = 0.0
+
+
+@dataclass(frozen=True)
 class VerifierObservation:
     """Observation payload consumed by phase/feasible/completion verifiers."""
 
@@ -69,6 +82,8 @@ class VerifierObservation:
     wrist_vae: Any = None
     target_bbox: tuple[float, float, float, float] | None = None
     timestep: int | None = None
+    main_depth: np.ndarray | None = None
+    camera_params: CameraParams | None = None
 
 
 @dataclass(frozen=True)

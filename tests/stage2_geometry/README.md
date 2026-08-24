@@ -2,6 +2,24 @@
 
 本目录是 **test-only** 的 Stage 2 深度校验实现与结果记录，不参与生产逻辑。
 
+## 正式几何实现位置
+
+本阶段使用的米制 depth 转换和相机参数来自正式模块：
+
+```text
+memory_system/geometry.py
+```
+
+包括：
+
+- `depth_to_metric()`
+- `camera_params()`
+- `flip_depth()`
+- `pixel_to_world()`
+
+`tests/stage2_geometry/harness.py` 不再维护重复的几何实现，只保留环境、mask、
+`mj_ray()` oracle 等 test-only 逻辑。
+
 ## 定义
 
 对于像素 \((u,v)\)，深度定义为该像素第一处可见表面在相机坐标系中的 \(Z\)：
@@ -25,7 +43,7 @@ D(u,v)=Z_{\text{camera}}
 - Test Oracle 使用 MuJoCo `mj_ray()` 从 simulator geometry 获取该 pixel 第一处表面交点。
 - 将交点转换到相机坐标后取 \(Z\) 作为 \(D_{\text{oracle}}(u,v)\)。
 - 在 eroded object mask 上比较逐像素误差。
-- 不使用 `get_real_depth_map()` 的输出同时作为被测结果和 Oracle。
+- 不使用 `depth_to_metric()` 的输出同时作为被测结果和 Oracle。
 - 比较前保证 RGB、Depth、mask 使用相同分辨率、pixel convention 和 flip 方式。
 
 ## 支持的 skill
