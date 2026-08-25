@@ -5,12 +5,12 @@ set -eu
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TASK=${LIBERO10_TASK:-KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it}
 LANGUAGE=${LIBERO10_LANGUAGE:-put the black bowl in the bottom drawer of the cabinet and close it}
-NUM_CASES=${NUM_CASES:-1}
+NUM_CASES=${NUM_CASES:-20}
 SEED=${SEED:-0}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/run_libero_smoke_test.py}
 ROBOTINIT_GPU=${ROBOTINIT_GPU:-2}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_robotinit_single}
-COSMOS_ROLLOUT_SUBDIR=${COSMOS_ROLLOUT_SUBDIR:-08-24}
+COSMOS_ROLLOUT_SUBDIR=${COSMOS_ROLLOUT_SUBDIR:-08-24-2}
 
 # --- Data collection (save trajectory HDF5 for offline analysis) ---
 COSMOS_DATA_COLLECTION=${COSMOS_DATA_COLLECTION:-}
@@ -23,6 +23,8 @@ COSMOS_PHASE_3D=${COSMOS_PHASE_3D:-1}
 COSMOS_FEASIBLE_3D=${COSMOS_FEASIBLE_3D:-0}
 COSMOS_PHASE_RECOVERY=${COSMOS_PHASE_RECOVERY:-1}
 COSMOS_FEASIBLE_RECOVERY=${COSMOS_FEASIBLE_RECOVERY:-0}
+# --- One-shot initial alignment (disables all verifier/recovery when enabled) ---
+COSMOS_INITIAL_ALIGNMENT=${COSMOS_INITIAL_ALIGNMENT:-0}
 # --- Init state offset (default 0 = first init state) ---
 # Episode N = init_state_index N-1. Set OFFSET=2 for episode 3.
 COSMOS_INIT_STATE_OFFSET=${COSMOS_INIT_STATE_OFFSET:-4}
@@ -40,6 +42,16 @@ cd "$REPO_ROOT"
 # Legacy manual-injection controls are deliberately unsupported.
 unset COSMOS_OFFSET_START_T COSMOS_OFFSET_AMOUNT COSMOS_OFFSET_DURATION COSMOS_ONLINE_INJECT
 
+# Strict separation: when initial alignment is on, disable all other
+# verifier/recovery paths in the launcher as well (Python also enforces this).
+if [ "$COSMOS_INITIAL_ALIGNMENT" = "1" ]; then
+    COSMOS_PHASE_VERIFIER=0
+    COSMOS_PHASE_3D=0
+    COSMOS_FEASIBLE_3D=0
+    COSMOS_PHASE_RECOVERY=0
+    COSMOS_FEASIBLE_RECOVERY=0
+fi
+
 COSMOS_ROLLOUT_SUBDIR="$COSMOS_ROLLOUT_SUBDIR" \
 COSMOS_SKIP_PLAIN_ROLLOUT=1 \
 COSMOS_INIT_STATE_OFFSET="$COSMOS_INIT_STATE_OFFSET" \
@@ -51,6 +63,7 @@ COSMOS_PHASE_3D="$COSMOS_PHASE_3D" \
 COSMOS_FEASIBLE_3D="$COSMOS_FEASIBLE_3D" \
 COSMOS_PHASE_RECOVERY="$COSMOS_PHASE_RECOVERY" \
 COSMOS_FEASIBLE_RECOVERY="$COSMOS_FEASIBLE_RECOVERY" \
+COSMOS_INITIAL_ALIGNMENT="$COSMOS_INITIAL_ALIGNMENT" \
 TMPDIR="$OUTPUT_ROOT/tmp-robotinit" \
 SMOKE_PYTHON_SCRIPT="$SMOKE_PYTHON_SCRIPT" \
 GPU_ID="$ROBOTINIT_GPU" \

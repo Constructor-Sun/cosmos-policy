@@ -6,12 +6,13 @@ REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 NUM_CASES=${NUM_CASES:-20}
 SEED=${SEED:-7}
 ROBOTINIT_GPU=${ROBOTINIT_GPU:-6}
-OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_other9_robotinit_20}
-ROLLOUT_SUBDIR=${ROLLOUT_SUBDIR:-libero_10_robotinit_other9}
+OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_robotinit_low_success_20}
+ROLLOUT_SUBDIR=${ROLLOUT_SUBDIR:-libero_10_robotinit_low_success}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/run_libero_smoke_test.py}
 COSMOS_INIT_STATE_OFFSET=${COSMOS_INIT_STATE_OFFSET:-0}
-# --- One-shot initial alignment (disables all verifier/recovery when enabled) ---
-COSMOS_INITIAL_ALIGNMENT=${COSMOS_INITIAL_ALIGNMENT:-0}
+# --- One-shot initial alignment (default on for this low-success rerun set) ---
+COSMOS_INITIAL_ALIGNMENT=${COSMOS_INITIAL_ALIGNMENT:-1}
+COSMOS_CUROBO_JOINT_EXECUTION=${COSMOS_CUROBO_JOINT_EXECUTION:-1}
 
 mkdir -p "$OUTPUT_ROOT" "$OUTPUT_ROOT/tmp" "$REPO_ROOT/rollouts/$ROLLOUT_SUBDIR"
 cd "$REPO_ROOT"
@@ -39,6 +40,7 @@ run_task() {
     COSMOS_SKIP_PLAIN_ROLLOUT=1 \
     COSMOS_INIT_STATE_OFFSET="$COSMOS_INIT_STATE_OFFSET" \
     COSMOS_INITIAL_ALIGNMENT="$COSMOS_INITIAL_ALIGNMENT" \
+    COSMOS_CUROBO_JOINT_EXECUTION="$COSMOS_CUROBO_JOINT_EXECUTION" \
     TMPDIR="$OUTPUT_ROOT/tmp" \
     SMOKE_PYTHON_SCRIPT="$SMOKE_PYTHON_SCRIPT" \
     GPU_ID="$ROBOTINIT_GPU" \
@@ -53,14 +55,9 @@ run_task() {
     SMOKE_NUM_PAIRS="$NUM_CASES" \
     SMOKE_SEED="$SEED" \
     SMOKE_RESULTS_DIR="$task_output" \
-    SMOKE_RUN_ID="other9_robotinit_gpu${ROBOTINIT_GPU}" \
+    SMOKE_RUN_ID="low_success_robotinit_gpu${ROBOTINIT_GPU}" \
     sh ./run_libero_smoke_test.sh >"$task_output/run.log" 2>&1
 }
-
-run_task \
-    KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it \
-    "turn on the stove and put the moka pot on it" \
-    KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it_view_0_0_100_0_0_initstate_273
 
 run_task \
     KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it \
@@ -73,19 +70,9 @@ run_task \
     KITCHEN_SCENE8_put_both_moka_pots_on_the_stove_view_0_0_100_0_0_initstate_269
 
 run_task \
-    LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket \
-    "put both the alphabet soup and the cream cheese box in the basket" \
-    LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket_view_0_0_100_0_0_initstate_268
-
-run_task \
     LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket \
     "put both the alphabet soup and the tomato sauce in the basket" \
     LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket_view_0_0_100_0_0_initstate_271
-
-run_task \
-    LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket \
-    "put both the cream cheese box and the butter in the basket" \
-    LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket_view_0_0_100_0_0_initstate_282
 
 run_task \
     LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate \
@@ -93,15 +80,10 @@ run_task \
     LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate_view_0_0_100_0_0_initstate_265
 
 run_task \
-    LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate \
-    "put the white mug on the plate and put the chocolate pudding to the right of the plate" \
-    LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate_view_0_0_100_0_0_initstate_267
-
-run_task \
     STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy \
     "pick up the book and place it in the back compartment of the caddy" \
     STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy_view_0_0_100_0_0_initstate_276
 
 
-printf 'All robot-init evaluations completed.\nResults: %s\nVideos: %s\n' \
+printf 'All low-success robot-init evaluations completed.\nResults: %s\nVideos: %s\n' \
     "$OUTPUT_ROOT" "$REPO_ROOT/rollouts/$ROLLOUT_SUBDIR"

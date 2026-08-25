@@ -11,6 +11,12 @@ from memory_system.execute.execution_monitor import (
     ExecutionMonitor,
     ExecutionMonitorResult,
 )
+from memory_system.execute.curobo_planner import CuroboPlanner, PlanResult
+from memory_system.execute.curobo_trajectory import JointTrajectoryPlan
+from memory_system.execute.initial_alignment import (
+    InitialAlignmentResult,
+    InitialAlignmentSelector,
+)
 from memory_system.execute.feasible import (
     FEASIBLE,
     FEASIBLE_UNKNOWN,
@@ -55,6 +61,11 @@ __all__ = [
     "Feasible3DVerifier",
     "FeasibleRecoverySelector",
     "FeasibleVerifier",
+    "CuroboPlanner",
+    "InitialAlignmentResult",
+    "InitialAlignmentSelector",
+    "JointTrajectoryPlan",
+    "PlanResult",
     "ExecutionMonitor",
     "ExecutionMonitorResult",
     "NOT_FEASIBLE",

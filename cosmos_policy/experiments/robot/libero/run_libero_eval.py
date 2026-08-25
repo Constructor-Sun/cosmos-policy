@@ -285,6 +285,9 @@ class PolicyEvalConfig:
     enable_feasible_3d: bool = False                                     # Use 3D Feasible verifier when phase verifier is enabled
     enable_phase_recovery: bool = False                                 # Enable retrieval-based PHASE_ERROR pose recovery
     enable_feasible_recovery: bool = False                              # Enable retrieval-based FEASIBLE_ERROR pose recovery
+    enable_initial_alignment: bool = False                              # Enable one-shot initial ready-pose alignment before the first policy action
+    enable_collision_aware_initial_alignment: bool = True              # Use cuRobo RGB-D collision-free planning for initial alignment
+    enable_curobo_joint_execution: bool = False                         # Execute the timed cuRobo joint trajectory during initial alignment
 
     # fmt: on
 
@@ -309,6 +312,21 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+
+    if cfg.enable_initial_alignment:
+        # Strict separation: initial alignment is a standalone one-shot path.
+        # It must not accidentally enable any verifier or online recovery.
+        cfg.enable_phase_verifier = False
+        cfg.enable_phase_3d = False
+        cfg.enable_feasible_3d = False
+        cfg.enable_phase_recovery = False
+        cfg.enable_feasible_recovery = False
+        if cfg.task_suite_name != TaskSuite.LIBERO_10:
+            raise ValueError("Initial alignment memory currently supports only the libero_10 task suite")
+        if cfg.env_img_res != 256:
+            raise ValueError("Initial alignment memory was built at env_img_res=256")
+        if not cfg.flip_images:
+            raise ValueError("Initial alignment memory requires flip_images=True")
 
     if cfg.enable_phase_verifier:
         if cfg.task_suite_name != TaskSuite.LIBERO_10:
@@ -382,6 +400,37 @@ def _create_execution_monitor(cfg: PolicyEvalConfig):
         SkillCompletionVerifier(
             phase_targets, wrist_completion_targets=wrist_completion_targets
         ),
+    )
+
+
+def _create_initial_alignment_selector(cfg: PolicyEvalConfig):
+    """Build the standalone one-shot initial alignment selector.
+
+    This intentionally does not require ``enable_phase_verifier`` or any
+    ExecutionMonitor.  It loads only what is needed to choose a first-phase
+    ready pose from the main-camera VAE.
+    """
+    memory_dir = _REPO_ROOT / "skill_memory_test" / "libero_10"
+    segments_manifest = memory_dir / "segments_ready_fixed16.json"
+    feasible_recovery_targets = memory_dir / "feasible_recovery_targets.pt"
+    missing = [
+        path for path in (segments_manifest, feasible_recovery_targets)
+        if not path.exists()
+    ]
+    if missing:
+        raise FileNotFoundError(f"Missing initial alignment inputs: {missing}")
+
+    from memory_system.execute.curobo_planner import CuroboPlanner
+    from memory_system.execute.initial_alignment import InitialAlignmentSelector
+    planner = (
+        CuroboPlanner(joint_execution=cfg.enable_curobo_joint_execution)
+        if cfg.enable_collision_aware_initial_alignment
+        else None
+    )
+    return InitialAlignmentSelector(
+        segments_manifest,
+        feasible_recovery_targets,
+        planner=planner,
     )
 
 
@@ -609,6 +658,7 @@ def run_episode(
     phase_task_name=None,
     pose_recovery=None,
     feasible_recovery=None,
+    initial_alignment_selector=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -654,6 +704,17 @@ def run_episode(
             log_file,
         )
 
+    # Initial alignment also needs camera geometry for RGB-D collision planning.
+    if (
+        episode_execution_monitor is None
+        and cfg.enable_collision_aware_initial_alignment
+        and initial_alignment_selector is not None
+    ):
+        height, width = obs["agentview_image"].shape[:2]
+        phase_camera_params = build_camera_params(
+            env.sim, "agentview", height, width
+        )
+
     # Initialize action queue
     if cfg.num_open_loop_steps != cfg.chunk_size:
         print(
@@ -674,6 +735,13 @@ def run_episode(
     _correction_step_index = 0
     _phase_correction_count = 0
     _captured_latent = None
+    _policy_step_count = 0
+    _initial_align_attempted = False
+    from cosmos_policy.experiments.robot.libero.libero_joint_control import step_correction_controller
+
+    def _close_correction_controller(controller) -> None:
+        if controller is not None and hasattr(controller, "close"):
+            controller.close()
 
     _wrong_grasp_open_steps = int(os.environ.get("COSMOS_WRONG_GRASP_OPEN_STEPS", "8"))
 
@@ -941,6 +1009,83 @@ def run_episode(
                     log_file,
                 )
 
+    def _maybe_start_initial_alignment(t_now, observation, obs, log_fh) -> None:
+        nonlocal _initial_align_attempted, _policy_step_count
+        nonlocal _correction_kind, _correction_steps_remaining, _correction_per_step
+        nonlocal _correction_controller, _correction_step_index, offset_gripper_action, action_queue
+        if initial_alignment_selector is None or _initial_align_attempted:
+            return
+        # Trigger before the first policy action is executed.
+        if _policy_step_count != 0:
+            return
+        _initial_align_attempted = True
+        if not _captured_latent:
+            log_message(
+                f"[INIT ALIGN] t={t_now}: skip, no captured VAE latent",
+                log_fh,
+            )
+            return
+        current_vae_main = _captured_latent[0][0, :, 3:4, :, :]
+        current_ee_states = np.concatenate([
+            obs["robot0_eef_pos"],
+            Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+        ]).astype(np.float32)
+        main_depth = None
+        joint_positions = None
+        if phase_camera_params is not None and "agentview_depth" in obs:
+            main_depth = _make_main_depth(obs, phase_camera_params, cfg.flip_images)
+        if "robot0_joint_pos" in obs:
+            joint_positions = np.asarray(obs["robot0_joint_pos"], dtype=np.float32)
+        robot_base_pose = np.concatenate([env.robots[0].base_pos, env.robots[0].base_ori])
+        try:
+            alignment = initial_alignment_selector.select(
+                phase_task_name,
+                current_vae_main,
+                current_ee_states,
+                main_depth=main_depth,
+                camera_params=phase_camera_params,
+                joint_positions=joint_positions,
+                robot_base_pose=robot_base_pose,
+            )
+        except Exception as exc:
+            log_message(
+                f"[INIT ALIGN] t={t_now}: error selecting target: {exc}",
+                log_fh,
+            )
+            return
+        if alignment is None:
+            log_message(
+                f"[INIT ALIGN] t={t_now}: no matching ready pose; skip",
+                log_fh,
+            )
+            return
+        _correction_kind = "initial_align"
+        offset_gripper_action = float(bool(last_gripper_closed))
+        if alignment.joint_trajectory is not None:
+            from cosmos_policy.experiments.robot.libero.libero_joint_control import (
+                LiberoJointTrajectoryController,
+            )
+            _correction_controller = LiberoJointTrajectoryController(
+                env,
+                alignment.joint_trajectory,
+                alignment.target_ee_states,
+                offset_gripper_action,
+            )
+            _correction_steps_remaining = _correction_controller.max_steps
+            _correction_per_step = None
+        else:
+            _correction_steps_remaining = alignment.correction_steps
+            _correction_per_step = alignment.correction_per_step
+            _correction_controller = alignment.controller
+        _correction_step_index = 0
+        action_queue.clear()
+        log_message(
+            f"[INIT ALIGN] t={t_now}: target={alignment.target_ee_states.tolist()} "
+            f"sim={alignment.similarity:.3f} demos={alignment.demo_ids} "
+            f"steps={_correction_steps_remaining}",
+            log_fh,
+        )
+
     # Setup
     t = 0
     replay_images = []
@@ -1083,18 +1228,14 @@ def run_episode(
                 if _correction_controller is not None:
                     # Step-level closed loop: regenerate the action from the
                     # current measured EE pose every step.
-                    _current_ee_states = np.concatenate([
-                        obs["robot0_eef_pos"],
-                        Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
-                    ]).astype(np.float32)
-                    _step_action = _correction_controller.step(_current_ee_states)
+                    _step_action = step_correction_controller(_correction_controller, obs)
                 elif np.ndim(_correction_per_step) == 2:
                     _step_action = _correction_per_step[
                         min(_correction_step_index, _correction_per_step.shape[0] - 1)
                     ]
                 else:
                     _step_action = _correction_per_step
-                if np.ndim(_step_action) == 1 and _step_action.shape[0] == 7:
+                if np.ndim(_step_action) == 1 and _step_action.shape[0] in (7, 8):
                     action = _step_action.astype(np.float32).copy()
                     # Recovery trajectories must not change the gripper state.
                     # Always preserve the gripper command captured before correction.
@@ -1109,12 +1250,18 @@ def run_episode(
                 if cfg.data_collection:
                     actions_list.append(action.copy())
 
-                last_gripper_closed = bool(float(action[6]) > 0.0)
+                last_gripper_closed = bool(float(action[-1]) > 0.0)
                 obs, reward, done, info = env.step(action.tolist())
                 _correction_steps_remaining -= 1
                 _correction_step_index += 1
+                if hasattr(_correction_controller, "observe"):
+                    _correction_controller.observe(obs)
+                if getattr(_correction_controller, "finished", False):
+                    _correction_steps_remaining = 0
                 if _correction_steps_remaining == 0:
                     _finished_kind = _correction_kind
+                    _finished_controller = _correction_controller
+                    _close_correction_controller(_finished_controller)
                     offset_gripper_action = None
                     _correction_per_step = None
                     _correction_controller = None
@@ -1155,7 +1302,7 @@ def run_episode(
                             episode_execution_monitor.mark_wrong_grasp_recovery_finished(timestep=t)
                     log_message(
                         f"[CORRECTION] t={t}: {_finished_kind} correction finished; "
-                        "resuming policy",
+                        f"status={getattr(_finished_controller, 'status', 'completed')}; resuming policy",
                         log_file,
                     )
                 if done:
@@ -1174,6 +1321,7 @@ def run_episode(
                     cfg.save_vector_db
                     or (cfg.enable_phase_recovery and episode_execution_monitor is not None)
                     or (cfg.enable_feasible_recovery and episode_execution_monitor is not None)
+                    or (cfg.enable_initial_alignment and initial_alignment_selector is not None)
                 )
                 if _capture_vae:
                     _captured_latent = []
@@ -1370,7 +1518,9 @@ def run_episode(
                             "step_index": t,
                         })
 
-                _phase_check_and_recover(t, observation, obs, log_file)
+                if episode_execution_monitor is not None:
+                    _phase_check_and_recover(t, observation, obs, log_file)
+                _maybe_start_initial_alignment(t, observation, obs, log_file)
 
                 if _capture_vae:
                     model.get_data_and_condition = _orig_gdac
@@ -1395,18 +1545,14 @@ def run_episode(
                 if _correction_controller is not None:
                     # Step-level closed loop: regenerate the action from the
                     # current measured EE pose every step.
-                    _current_ee_states = np.concatenate([
-                        obs["robot0_eef_pos"],
-                        Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
-                    ]).astype(np.float32)
-                    _step_action = _correction_controller.step(_current_ee_states)
+                    _step_action = step_correction_controller(_correction_controller, obs)
                 elif np.ndim(_correction_per_step) == 2:
                     _step_action = _correction_per_step[
                         min(_correction_step_index, _correction_per_step.shape[0] - 1)
                     ]
                 else:
                     _step_action = _correction_per_step
-                if np.ndim(_step_action) == 1 and _step_action.shape[0] == 7:
+                if np.ndim(_step_action) == 1 and _step_action.shape[0] in (7, 8):
                     action = _step_action.astype(np.float32).copy()
                 else:
                     action = np.zeros(7, dtype=np.float32)
@@ -1416,6 +1562,7 @@ def run_episode(
                 _correction_step_index += 1
             else:
                 action = action_queue.popleft()
+                _policy_step_count += 1
 
             # Process action
             print(f"t: {t}\t action: {action}")
@@ -1423,10 +1570,16 @@ def run_episode(
             if cfg.data_collection:
                 actions_list.append(action.copy())
             # Execute action in environment
-            last_gripper_closed = bool(float(action[6]) > 0.0)
+            last_gripper_closed = bool(float(action[-1]) > 0.0)
             obs, reward, done, info = env.step(action.tolist())
+            if hasattr(_correction_controller, "observe"):
+                _correction_controller.observe(obs)
+            if getattr(_correction_controller, "finished", False):
+                _correction_steps_remaining = 0
             if (_correction_per_step is not None or _correction_controller is not None) and _correction_steps_remaining == 0:
                 _finished_kind = _correction_kind
+                _finished_controller = _correction_controller
+                _close_correction_controller(_finished_controller)
                 offset_gripper_action = None
                 _correction_per_step = None
                 _correction_controller = None
@@ -1435,7 +1588,8 @@ def run_episode(
                 if _finished_kind == "feasible_pose_recovery" and episode_execution_monitor is not None:
                     episode_execution_monitor.mark_feasible_after_recovery(timestep=t)
                 log_message(
-                    f"[CORRECTION] t={t}: {_finished_kind} correction finished; resuming policy",
+                    f"[CORRECTION] t={t}: {_finished_kind} correction finished; "
+                    f"status={getattr(_finished_controller, 'status', 'completed')}; resuming policy",
                     log_file,
                 )
             if done:
@@ -1447,6 +1601,8 @@ def run_episode(
         error_msg = f"Episode error: {e}"
         traceback_str = traceback.format_exc()
         log_message(f"{error_msg}\nFull traceback:\n{traceback_str}", log_file)
+
+    _close_correction_controller(_correction_controller)
 
     if execution_monitor_started:
         verifier_summary = {
@@ -1547,6 +1703,7 @@ def run_task(
     execution_monitor=None,
     pose_recovery=None,
     feasible_recovery=None,
+    initial_alignment_selector=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -1559,6 +1716,13 @@ def run_task(
                 f"[PHASE] mapped perturbation task {task.name!r} to {phase_task_name!r}",
                 log_file,
             )
+    elif initial_alignment_selector is not None:
+        phase_task_name = initial_alignment_selector.resolve_task_name(task.name)
+        if phase_task_name is not None and phase_task_name != task.name:
+            log_message(
+                f"[INIT ALIGN] mapped perturbation task {task.name!r} to {phase_task_name!r}",
+                log_file,
+            )
 
     # Get initial states
     initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
@@ -1568,7 +1732,10 @@ def run_task(
         task,
         cfg.model_family,
         resolution=cfg.env_img_res,
-        camera_depths=[True, False] if execution_monitor is not None else None,
+        camera_depths=[True, False] if (
+            execution_monitor is not None
+            or (cfg.enable_initial_alignment and cfg.enable_collision_aware_initial_alignment)
+        ) else None,
     )
 
     # Start episodes
@@ -1612,6 +1779,7 @@ def run_task(
             phase_task_name=phase_task_name,
             pose_recovery=pose_recovery,
             feasible_recovery=feasible_recovery,
+            initial_alignment_selector=initial_alignment_selector,
         )
 
         # Update counters
@@ -1835,6 +2003,14 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
             log_file,
         )
 
+    initial_alignment_selector = None
+    if cfg.enable_initial_alignment:
+        initial_alignment_selector = _create_initial_alignment_selector(cfg)
+        log_message(
+            "Initial alignment enabled (standalone one-shot; verifier/recovery disabled)",
+            log_file,
+        )
+
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
     log_message(f"Number of tasks: {num_tasks}", log_file)
 
@@ -1862,6 +2038,7 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
             execution_monitor=execution_monitor,
             pose_recovery=pose_recovery,
             feasible_recovery=feasible_recovery,
+            initial_alignment_selector=initial_alignment_selector,
         )
 
     # Calculate final success rate

@@ -243,6 +243,10 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
     enable_feasible_3d = os.environ.get("COSMOS_FEASIBLE_3D", "").lower() in {"1", "true", "yes"}
     enable_phase_recovery = os.environ.get("COSMOS_PHASE_RECOVERY", "").lower() in {"1", "true", "yes"}
     enable_feasible_recovery = os.environ.get("COSMOS_FEASIBLE_RECOVERY", "").lower() in {"1", "true", "yes"}
+    enable_initial_alignment = os.environ.get("COSMOS_INITIAL_ALIGNMENT", "").lower() in {"1", "true", "yes"}
+    enable_curobo_joint_execution = os.environ.get(
+        "COSMOS_CUROBO_JOINT_EXECUTION", ""
+    ).lower() in {"1", "true", "yes"}
     return PolicyEvalConfig(
         config="cosmos_predict2_2b_480p_libero__inference_only",
         ckpt_path=policy_ckpt_path,
@@ -267,6 +271,8 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
         enable_feasible_3d=enable_feasible_3d,
         enable_phase_recovery=enable_phase_recovery,
         enable_feasible_recovery=enable_feasible_recovery,
+        enable_initial_alignment=enable_initial_alignment,
+        enable_curobo_joint_execution=enable_curobo_joint_execution,
     )
 
 
