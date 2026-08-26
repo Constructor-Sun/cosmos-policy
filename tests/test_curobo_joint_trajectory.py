@@ -171,3 +171,32 @@ def test_libero_adapter_switches_action_dimension_and_restores(monkeypatch):
     controller.close()
     assert robot.controller.name == "OSC_POSE"
     assert base_env._action_dim == 7
+
+
+def test_deadline_accepts_final_reference_inside_goal_tolerance():
+    from cosmos_policy.experiments.robot.libero.libero_joint_control import (
+        LiberoJointTrajectoryController,
+    )
+
+    controller = LiberoJointTrajectoryController.__new__(
+        LiberoJointTrajectoryController
+    )
+    controller._status = "ACTIVE"
+    controller.last_reference = np.zeros(7)
+    controller.tracking_tolerance = 0.08
+    controller.target = np.zeros(6)
+    controller.references = np.zeros((2, 7))
+    controller.reference_index = 1
+    controller.position_tolerance = 0.005
+    controller.rotation_tolerance = 0.02
+    controller.stable_steps = 2
+    controller._stable_count = 0
+    controller.step_count = 64
+    controller.max_steps = 64
+    observation = {
+        "robot0_joint_pos": np.zeros(7),
+        "robot0_eef_pos": np.array([0.001, 0.0, 0.0]),
+        "robot0_eef_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+    }
+    controller.observe(observation)
+    assert controller.status == "CONVERGED"

@@ -177,9 +177,6 @@ class CuroboPlanner:
                     surface_points, sample_target, self.max_spheres,
                     self.voxel_size, mandatory_points=mandatory,
                 )
-                start_clearance = np.min(np.linalg.norm(
-                    selection.points[:, None, :] - robot_spheres.reshape(-1, 4)[None, :, :3], axis=2
-                ) - robot_spheres.reshape(-1, 4)[None, :, 3], axis=1)
                 obstacles = [Cuboid(
                     name=f"obs_{i}",
                     pose=[*map(float, point), 1.0, 0.0, 0.0, 0.0],
@@ -187,10 +184,9 @@ class CuroboPlanner:
                 ) for i, point in enumerate(selection.points)]
                 planner.update_world(SceneCfg(cuboid=obstacles))
                 logger.info(
-                    "CuroboPlanner: surfaces=%d global=%d target=%d mandatory=%d start_min=%.4fm near=%d",
+                    "CuroboPlanner: surfaces=%d global=%d target=%d mandatory=%d",
                     len(surface_points), selection.global_count,
                     selection.target_count, selection.mandatory_count,
-                    start_clearance.min(), np.count_nonzero(start_clearance < 0.025),
                 )
 
             update_surface_world()

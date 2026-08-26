@@ -42,7 +42,7 @@ matches = [
 if len(matches) != 1:
     raise RuntimeError(f"expected one task, found {len(matches)}")
 task_index, task = matches[0]
-initial_state = suite.get_task_init_states(task_index)[0]
+initial_state = suite.get_task_init_states(task_index)[11]
 env, _ = get_libero_env(
     task,
     "cosmos",

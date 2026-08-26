@@ -3,7 +3,7 @@
 set -eu
 
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-NUM_CASES=${NUM_CASES:-20}
+NUM_CASES=${NUM_CASES:-5}
 SEED=${SEED:-7}
 ROBOTINIT_GPU=${ROBOTINIT_GPU:-6}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_robotinit_low_success_20}
