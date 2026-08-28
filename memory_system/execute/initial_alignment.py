@@ -33,7 +33,6 @@ class InitialAlignmentResult:
     target: RecoveryTarget
     correction_steps: int
     controller: Any = None
-    correction_per_step: np.ndarray | None = None
     joint_trajectory: Any = None
 
     @property
@@ -235,7 +234,6 @@ class InitialAlignmentSelector:
                         ),
                         correction_steps=plan.correction_steps,
                         controller=plan.controller,
-                        correction_per_step=plan.correction_per_step,
                         joint_trajectory=plan.joint_trajectory,
                     )
             except Exception:
@@ -254,5 +252,4 @@ class InitialAlignmentSelector:
             ),
             correction_steps=self.correction_steps,
             controller=controller,
-            correction_per_step=controller.preview_action(current_ee_states).reshape(1, 6),
         )

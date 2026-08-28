@@ -94,6 +94,10 @@ COSMOS_URDF_ROBOT_FILTER=0
 
 ## 6. 当前代码边界
 
+### waypoint 执行预算与收敛
+
+waypoint 数量表示规划路径的离散分辨率，不表示环境需要执行的步数。Initial Alignment 的 waypoint controller 使用独立的 `max_steps` 预算（默认 96），并通过 `ACTIVE`、`CONVERGED` 和 `GOAL_NOT_CONVERGED` 状态向 Eval 反馈结果。这样一个 waypoint 可以跨越多个环境步，避免路径点数量与执行预算耦合；后续 skill completion 判定可以在此接口之外独立实现。
+
 - `memory_system/execute/initial_alignment.py`：memory 加载、首段统计、VAE 检索和目标生成；
 - `memory_system/execute/curobo_planner.py`：点云障碍、cuRobo 求解、轨迹复核和最小回退；
 - `memory_system/execute/surface_obstacles.py`：表面采样与完整点云碰撞检查；

@@ -5,7 +5,7 @@ set -eu
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TASK=${LIBERO10_TASK:-KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it}
 LANGUAGE=${LIBERO10_LANGUAGE:-put the black bowl in the bottom drawer of the cabinet and close it}
-NUM_CASES=${NUM_CASES:-10}
+NUM_CASES=${NUM_CASES:-20}
 SEED=${SEED:-0}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/run_libero_smoke_test.py}
 ROBOTINIT_GPU=${ROBOTINIT_GPU:-2}
@@ -20,7 +20,7 @@ COSMOS_VECTOR_DB_DIR=${COSMOS_VECTOR_DB_DIR:-}
 # --- One-shot initial alignment ---
 COSMOS_INITIAL_ALIGNMENT=${COSMOS_INITIAL_ALIGNMENT:-1}
 COSMOS_CUROBO_JOINT_EXECUTION=${COSMOS_CUROBO_JOINT_EXECUTION:-0}
-COSMOS_URDF_ROBOT_FILTER=${COSMOS_URDF_ROBOT_FILTER:-0}
+COSMOS_URDF_ROBOT_FILTER=${COSMOS_URDF_ROBOT_FILTER:-1}
 # --- Per-step initial-alignment debug logging ---
 COSMOS_DEBUG_INIT_ALIGN=${COSMOS_DEBUG_INIT_ALIGN:-1}
 # --- Init state offset (default 0 = first init state) ---

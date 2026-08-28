@@ -116,6 +116,7 @@ class WaypointPoseController:
         action_clip: float = 0.5,
         eps_pos: float = 0.005,
         eps_rot: float = 0.02,
+        max_steps: int = 96,
     ) -> None:
         self.waypoints = np.asarray(waypoints, dtype=np.float64).reshape(-1, 6)
         self.k = float(k)
@@ -123,9 +124,13 @@ class WaypointPoseController:
         self.action_clip = float(action_clip)
         self.eps_pos = float(eps_pos)
         self.eps_rot = float(eps_rot)
+        self.max_steps = int(max_steps)
+        if self.max_steps <= 0:
+            raise ValueError("max_steps must be positive")
         self.index = 0
         self.step_count = 0
         self._converged = len(self.waypoints) == 0
+        self._status = "CONVERGED" if self._converged else "ACTIVE"
 
     def _target(self) -> np.ndarray | None:
         return None if self.index >= len(self.waypoints) else self.waypoints[self.index]
@@ -157,25 +162,30 @@ class WaypointPoseController:
         )
         return action.astype(np.float32)
 
-    def preview_action(self, current_ee_states: np.ndarray) -> np.ndarray:
-        current = np.asarray(current_ee_states, dtype=np.float64).reshape(6)
-        target = self._target()
-        if target is None:
-            return np.zeros(6, dtype=np.float32)
-        error = self._error(current, target)
-        return np.clip(
-            (self.k / self.scale) * error, -self.action_clip, self.action_clip
-        ).astype(np.float32)
-
     def step(self, current_ee_states: np.ndarray) -> np.ndarray:
+        if self.finished:
+            return np.zeros(6, dtype=np.float32)
         self.step_count += 1
-        return self._action(
+        action = self._action(
             np.asarray(current_ee_states, dtype=np.float64).reshape(6)
         )
+        if self._converged:
+            self._status = "CONVERGED"
+        elif self.step_count >= self.max_steps:
+            self._status = "GOAL_NOT_CONVERGED"
+        return action
 
     @property
     def converged(self) -> bool:
         return self._converged
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @property
+    def finished(self) -> bool:
+        return self._status != "ACTIVE"
 
 
 @dataclass(frozen=True)

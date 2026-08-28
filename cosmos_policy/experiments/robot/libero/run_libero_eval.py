@@ -452,7 +452,6 @@ def run_episode(
     alignment_gripper_action = None
     last_gripper_closed = None
 
-    _alignment_per_step = None
     _alignment_controller = None
     _alignment_steps_remaining = 0
     _alignment_step_index = 0
@@ -467,7 +466,7 @@ def run_episode(
 
     def _maybe_start_initial_alignment(t_now, observation, obs, log_fh) -> None:
         nonlocal _initial_align_attempted, _policy_step_count
-        nonlocal _alignment_steps_remaining, _alignment_per_step
+        nonlocal _alignment_steps_remaining
         nonlocal _alignment_controller, _alignment_step_index
         nonlocal alignment_gripper_action, action_queue
         if initial_alignment_selector is None or _initial_align_attempted:
@@ -531,10 +530,8 @@ def run_episode(
                 alignment_gripper_action,
             )
             _alignment_steps_remaining = _alignment_controller.max_steps
-            _alignment_per_step = None
         else:
             _alignment_steps_remaining = alignment.correction_steps
-            _alignment_per_step = alignment.correction_per_step
             _alignment_controller = alignment.controller
         _alignment_step_index = 0
         action_queue.clear()
@@ -625,7 +622,7 @@ def run_episode(
 
             _alignment_active = (
                 _alignment_steps_remaining > 0
-                and (_alignment_per_step is not None or _alignment_controller is not None)
+                and _alignment_controller is not None
             )
             # Initial Alignment owns the action stream until it finishes, then
             # the policy is queried again because its queued chunk was cleared.
@@ -634,12 +631,6 @@ def run_episode(
                     # Step-level closed loop: regenerate the action from the
                     # current measured EE pose every step.
                     _step_action = step_correction_controller(_alignment_controller, obs)
-                elif np.ndim(_alignment_per_step) == 2:
-                    _step_action = _alignment_per_step[
-                        min(_alignment_step_index, _alignment_per_step.shape[0] - 1)
-                    ]
-                else:
-                    _step_action = _alignment_per_step
                 if np.ndim(_step_action) == 1 and _step_action.shape[0] in (7, 8):
                     action = _step_action.astype(np.float32).copy()
                     # Preserve the gripper command captured before alignment.
@@ -709,7 +700,6 @@ def run_episode(
                     _finished_controller = _alignment_controller
                     _close_alignment_controller(_finished_controller)
                     alignment_gripper_action = None
-                    _alignment_per_step = None
                     _alignment_controller = None
                     _alignment_step_index = 0
                     log_message(
@@ -936,19 +926,13 @@ def run_episode(
             # A newly selected Initial Alignment begins immediately on this timestep.
             _is_alignment_action = (
                 _alignment_steps_remaining > 0
-                and (_alignment_per_step is not None or _alignment_controller is not None)
+                and _alignment_controller is not None
             )
             if _is_alignment_action:
                 if _alignment_controller is not None:
                     # Step-level closed loop: regenerate the action from the
                     # current measured EE pose every step.
                     _step_action = step_correction_controller(_alignment_controller, obs)
-                elif np.ndim(_alignment_per_step) == 2:
-                    _step_action = _alignment_per_step[
-                        min(_alignment_step_index, _alignment_per_step.shape[0] - 1)
-                    ]
-                else:
-                    _step_action = _alignment_per_step
                 if np.ndim(_step_action) == 1 and _step_action.shape[0] in (7, 8):
                     action = _step_action.astype(np.float32).copy()
                 else:
@@ -974,13 +958,12 @@ def run_episode(
             if getattr(_alignment_controller, "finished", False):
                 _alignment_steps_remaining = 0
             if (
-                (_alignment_per_step is not None or _alignment_controller is not None)
+                _alignment_controller is not None
                 and _alignment_steps_remaining == 0
             ):
                 _finished_controller = _alignment_controller
                 _close_alignment_controller(_finished_controller)
                 alignment_gripper_action = None
-                _alignment_per_step = None
                 _alignment_controller = None
                 _alignment_step_index = 0
                 log_message(

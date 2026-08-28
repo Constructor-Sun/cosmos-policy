@@ -38,7 +38,6 @@ class PlanResult:
 
     controller: Any
     correction_steps: int
-    correction_per_step: np.ndarray | None = None
     joint_trajectory: JointTrajectoryPlan | None = None
     target_ee_states: np.ndarray | None = None
 
@@ -58,6 +57,7 @@ class CuroboPlanner:
         device: str = "cuda:0",
         joint_execution: bool = False,
         enable_urdf_robot_filter: bool = False,
+        waypoint_step_budget: int = 96,
     ):
         self.robot = robot
         self.voxel_size = float(voxel_size)
@@ -70,6 +70,9 @@ class CuroboPlanner:
         self.device = device
         self.joint_execution = bool(joint_execution)
         self.enable_urdf_robot_filter = bool(enable_urdf_robot_filter)
+        self.waypoint_step_budget = int(waypoint_step_budget)
+        if self.waypoint_step_budget <= 0:
+            raise ValueError("waypoint_step_budget must be positive")
         self._planner = None
         self._urdf_filter = None
         self._urdf_filter_failed = False
@@ -335,11 +338,13 @@ class CuroboPlanner:
             rotvec_libero = Rotation.from_matrix(rotmat_libero).as_rotvec()
             waypoints = np.concatenate([pos_libero, rotvec_libero], axis=-1).astype(np.float32)
 
-            controller = WaypointPoseController(waypoints)
+            # Waypoint count is path resolution, not the number of env steps.
+            controller = WaypointPoseController(
+                waypoints, max_steps=self.waypoint_step_budget
+            )
             return PlanResult(
                 controller=controller,
-                correction_steps=len(waypoints),
-                correction_per_step=controller.preview_action(current_ee_states).reshape(1, 6),
+                correction_steps=self.waypoint_step_budget,
             )
         except Exception as exc:
             logger.warning("CuroboPlanner: planning failed: %s", exc)
