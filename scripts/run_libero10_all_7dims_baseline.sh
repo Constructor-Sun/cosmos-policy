@@ -49,8 +49,6 @@ SMOKE_T5_ALLOW_STRICT_COMPUTE=${SMOKE_T5_ALLOW_STRICT_COMPUTE:-false}
 unset COSMOS_DATA_COLLECTION \
       COSMOS_VECTOR_DB \
       COSMOS_VECTOR_DB_DIR
-export COSMOS_PHASE_VERIFIER=0
-export COSMOS_PHASE_RECOVERY=0
 export COSMOS_INIT_STATE_OFFSET=0
 
 # ---------------------------------------------------------------------------
@@ -160,8 +158,6 @@ printf '%s\n' "$RUN_PLAN" | while IFS='|' read -r task language pert_name pert_c
 
     (
         cd "$REPO_ROOT"
-        COSMOS_PHASE_VERIFIER=0 \
-        COSMOS_PHASE_RECOVERY=0 \
         COSMOS_INIT_STATE_OFFSET=0 \
         SMOKE_PYTHON_SCRIPT="$SMOKE_PYTHON_SCRIPT" \
         GPU_ID="$GPU_ID" \

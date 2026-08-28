@@ -1,4 +1,4 @@
-"""Recovery subpackage for memory_system.execute."""
+"""Generic pose-control and retrieval helpers used by Initial Alignment."""
 from memory_system.execute.recovery.controller import PoseController
 from memory_system.execute.recovery.retrieval import (
     arguments_key,
@@ -10,14 +10,7 @@ from memory_system.execute.recovery.retrieval import (
     similarity,
     token,
 )
-from memory_system.execute.recovery.selectors import (
-    FeasibleRecoverySelector,
-    PhaseRecoverySelector,
-)
-
 __all__ = [
-    "FeasibleRecoverySelector",
-    "PhaseRecoverySelector",
     "PoseController",
     "arguments_key",
     "close",

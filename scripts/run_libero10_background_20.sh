@@ -37,15 +37,11 @@ TASK_SCOPE=${TASK_SCOPE:-all}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_background_20}
 ROLLOUT_SUBDIR=${ROLLOUT_SUBDIR:-background_initial}
 COSMOS_INIT_STATE_OFFSET=${COSMOS_INIT_STATE_OFFSET:-0}
-COSMOS_PHASE_VERIFIER=${COSMOS_PHASE_VERIFIER:-0}
-COSMOS_PHASE_RECOVERY=${COSMOS_PHASE_RECOVERY:-0}
-COSMOS_FEASIBLE_RECOVERY=${COSMOS_FEASIBLE_RECOVERY:-0}
 COSMOS_INITIAL_ALIGNMENT=${COSMOS_INITIAL_ALIGNMENT:-1}
 SMOKE_GL_BACKEND=${SMOKE_GL_BACKEND:-egl}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/scripts/run_libero_smoke_test.py}
 
-# Keep this script focused on phase/feasible detection; disable unrelated
-# data-collection machinery unless explicitly needed.
+# Keep this background-perturbation evaluation free of data-collection machinery.
 unset COSMOS_DATA_COLLECTION \
       COSMOS_VECTOR_DB \
       COSMOS_VECTOR_DB_DIR
@@ -108,7 +104,6 @@ echo "GPU_ID      : $GPU_ID"
 echo "NUM_CASES   : $NUM_CASES"
 echo "SEED        : $SEED"
 echo "TASK_SCOPE  : $TASK_SCOPE"
-echo "Phase       : verifier=$COSMOS_PHASE_VERIFIER recovery=$COSMOS_PHASE_RECOVERY feasible=$COSMOS_FEASIBLE_RECOVERY"
 echo "InitAlign   : $COSMOS_INITIAL_ALIGNMENT"
 echo "======================================================"
 
@@ -128,9 +123,6 @@ printf '%s\n' "$RUN_PLAN" | while IFS='|' read -r task language pert_name pert_c
 
     (
         cd "$REPO_ROOT"
-        COSMOS_PHASE_VERIFIER="$COSMOS_PHASE_VERIFIER" \
-        COSMOS_PHASE_RECOVERY="$COSMOS_PHASE_RECOVERY" \
-        COSMOS_FEASIBLE_RECOVERY="$COSMOS_FEASIBLE_RECOVERY" \
         COSMOS_INITIAL_ALIGNMENT="$COSMOS_INITIAL_ALIGNMENT" \
         COSMOS_ROLLOUT_SUBDIR="$ROLLOUT_SUBDIR" \
         COSMOS_SKIP_PLAIN_ROLLOUT=1 \

@@ -1,8 +1,4 @@
-"""Memory system package for offline construction and online execution.
-
-Step 1 provides shared types, skill declarations, and artifact loaders.  The
-package is self-contained and does not import from ``bin``.
-"""
+"""Shared artifacts, geometry, skill declarations, and data types."""
 from memory_system.artifacts import (
     FeasibleRecoveryMemory,
     PhaseTargetMemory,
@@ -21,12 +17,7 @@ from memory_system.geometry import (
 from memory_system.skills import SKILLS
 from memory_system.types import (
     CameraParams,
-    CompletionResult,
-    FeasibleResult,
     MemoryKey,
-    PhaseResult,
-    RecoveryRequest,
-    RecoveryResult,
     RecoveryTarget,
     SkillPlan,
     SkillStep,
@@ -36,16 +27,11 @@ from memory_system.types import (
 
 __all__ = [
     "CameraParams",
-    "CompletionResult",
     "FeasibleRecoveryMemory",
-    "FeasibleResult",
     "MemoryKey",
-    "PhaseResult",
     "PhaseTargetMemory",
     "PoseRecoveryMemory",
     "ReadyDistanceMemory",
-    "RecoveryRequest",
-    "RecoveryResult",
     "RecoveryTarget",
     "SKILLS",
     "SkillPlan",

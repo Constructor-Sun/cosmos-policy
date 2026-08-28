@@ -1,16 +1,14 @@
 """One-shot initial alignment selector for LIBERO episodes.
 
-This module is intentionally independent from ``ExecutionMonitor`` and the
-online phase/feasible recovery machinery.  It only:
+This module implements the standalone online intervention path.  It only:
 
 * loads phase plans and feasible/ready-pose memory,
 * maps a LIBERO-plus perturbed task back to its base task,
 * selects the most visually similar first-phase ready pose using the main
   camera VAE only,
-* returns a single correction that ``run_episode`` can execute through the
-  existing correction channel.
+* returns one alignment trajectory/controller for ``run_episode`` to execute.
 
-No verifier state is kept and no online recovery is triggered.
+No skill verifier state is kept and no online recovery is triggered.
 """
 from __future__ import annotations
 
@@ -30,12 +28,7 @@ from memory_system.types import RecoveryTarget
 
 @dataclass(frozen=True)
 class InitialAlignmentResult:
-    """Result of a one-shot initial alignment selection.
-
-    It mirrors the small part of ``RecoveryResult`` needed by the shared
-    correction executor, but keeps the initial-alignment path semantically
-    separate from online recovery.
-    """
+    """Result of a one-shot Initial Alignment target selection."""
 
     target: RecoveryTarget
     correction_steps: int
@@ -67,10 +60,9 @@ class InitialAlignmentResult:
 class InitialAlignmentSelector:
     """Select a single first-phase ready pose using main-camera VAE similarity.
 
-    The selector does not depend on ``enable_phase_verifier``.  It loads the
-    phase plan and feasible/ready memory itself so the initial-alignment path
-    can be enabled alone.  By default the selected target is raised 2 cm in z
-    so the robot moves to the ready x/y pose slightly above the final height.
+    The selector loads the skill plan and ready-pose memory itself.  By default
+    the selected target is raised 2 cm in z so the robot moves to the ready
+    x/y pose slightly above the final height.
     """
 
     def __init__(

@@ -17,16 +17,6 @@ COSMOS_CUROBO_JOINT_EXECUTION=${COSMOS_CUROBO_JOINT_EXECUTION:-1}
 mkdir -p "$OUTPUT_ROOT" "$OUTPUT_ROOT/tmp" "$REPO_ROOT/rollouts/$ROLLOUT_SUBDIR"
 cd "$REPO_ROOT"
 
-# Strict separation: when initial alignment is on, disable all other
-# verifier/recovery paths in the launcher as well (Python also enforces this).
-if [ "$COSMOS_INITIAL_ALIGNMENT" = "1" ]; then
-    COSMOS_PHASE_VERIFIER=0
-    COSMOS_PHASE_3D=0
-    COSMOS_FEASIBLE_3D=0
-    COSMOS_PHASE_RECOVERY=0
-    COSMOS_FEASIBLE_RECOVERY=0
-fi
-
 run_task() {
     task=$1
     language=$2
