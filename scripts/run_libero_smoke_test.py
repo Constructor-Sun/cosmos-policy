@@ -247,6 +247,9 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
     enable_curobo_joint_execution = os.environ.get(
         "COSMOS_CUROBO_JOINT_EXECUTION", ""
     ).lower() in {"1", "true", "yes"}
+    enable_urdf_robot_filter = os.environ.get(
+        "COSMOS_URDF_ROBOT_FILTER", ""
+    ).lower() in {"1", "true", "yes"}
     return PolicyEvalConfig(
         config="cosmos_predict2_2b_480p_libero__inference_only",
         ckpt_path=policy_ckpt_path,
@@ -273,6 +276,7 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
         enable_feasible_recovery=enable_feasible_recovery,
         enable_initial_alignment=enable_initial_alignment,
         enable_curobo_joint_execution=enable_curobo_joint_execution,
+        enable_urdf_robot_filter=enable_urdf_robot_filter,
     )
 
 

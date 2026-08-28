@@ -57,6 +57,7 @@ class CuroboPlanner:
         max_surface_replans: int = 2,
         device: str = "cuda:0",
         joint_execution: bool = False,
+        enable_urdf_robot_filter: bool = False,
     ):
         self.robot = robot
         self.voxel_size = float(voxel_size)
@@ -68,7 +69,31 @@ class CuroboPlanner:
         self.max_surface_replans = int(max_surface_replans)
         self.device = device
         self.joint_execution = bool(joint_execution)
+        self.enable_urdf_robot_filter = bool(enable_urdf_robot_filter)
         self._planner = None
+        self._urdf_filter = None
+        self._urdf_filter_failed = False
+
+    def _ensure_urdf_filter(self):
+        if not self.enable_urdf_robot_filter or self._urdf_filter_failed:
+            return None
+        if self._urdf_filter is None:
+            try:
+                import curobo
+                from pathlib import Path
+                from memory_system.execute.urdf_depth_filter import (
+                    UrdfDepthFilter, UrdfDepthFilterConfig,
+                )
+                urdf = (Path(curobo.__file__).resolve().parent /
+                        "content/assets/robot/franka_description/franka_panda.urdf")
+                self._urdf_filter = UrdfDepthFilter(
+                    UrdfDepthFilterConfig(urdf_path=str(urdf))
+                )
+                logger.info("CuroboPlanner: enabled URDF robot filter: %s", urdf)
+            except Exception as exc:
+                self._urdf_filter_failed = True
+                logger.warning("CuroboPlanner: URDF filter unavailable; using spheres: %s", exc)
+        return self._urdf_filter
 
     def _ensure_planner(self, scene_cfg):
         import torch
@@ -113,6 +138,7 @@ class CuroboPlanner:
         depth: np.ndarray | None = None,
         camera_params: CameraParams | None = None,
         joint_positions: np.ndarray | None = None,
+        gripper_joint_positions: np.ndarray | None = None,
         robot_base_pose: np.ndarray | None = None,
     ) -> PlanResult | None:
         if depth is None or camera_params is None or joint_positions is None:
@@ -128,7 +154,32 @@ class CuroboPlanner:
         except Exception as exc:
             logger.warning("CuroboPlanner: cuRobo import failed: %s", exc)
             return None
-        points = self._points_from_depth(depth, camera_params)
+        depth_for_points = depth
+        urdf_filter = self._ensure_urdf_filter()
+        if urdf_filter is not None:
+            try:
+                arm = np.asarray(joint_positions, dtype=np.float64).reshape(-1)
+                fingers = np.asarray(
+                    [0.04, 0.04] if gripper_joint_positions is None
+                    else gripper_joint_positions,
+                    dtype=np.float64,
+                ).reshape(-1)
+                urdf_joints = np.concatenate([arm, np.clip(np.abs(fingers[:2]), 0.0, 0.04)])
+                if len(urdf_joints) != len(urdf_filter.joint_names):
+                    raise ValueError(
+                        f"URDF expects {len(urdf_filter.joint_names)} joints, got {len(urdf_joints)}"
+                    )
+                filtered = urdf_filter.filter(
+                    depth,
+                    camera_params=camera_params,
+                    joint_positions=urdf_joints,
+                    robot_base_pose=robot_base_pose,
+                )
+                depth_for_points = filtered.filtered_depth
+                logger.info("CuroboPlanner: URDF removed %d depth pixels", filtered.removed_pixel_count)
+            except Exception as exc:
+                logger.warning("CuroboPlanner: URDF filtering failed; using spheres: %s", exc)
+        points = self._points_from_depth(depth_for_points, camera_params)
         if len(points) == 0:
             logger.warning("CuroboPlanner: no valid depth points; using direct PoseController")
             return None

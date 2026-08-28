@@ -161,6 +161,7 @@ class InitialAlignmentSelector:
         main_depth: Any = None,
         camera_params: Any = None,
         joint_positions: Any = None,
+        gripper_joint_positions: Any = None,
         robot_base_pose: Any = None,
     ) -> InitialAlignmentResult | None:
         """Return the best-matching first-phase ready pose, or ``None``.
@@ -223,6 +224,7 @@ class InitialAlignmentSelector:
                     depth=main_depth,
                     camera_params=camera_params,
                     joint_positions=joint_positions,
+                    gripper_joint_positions=gripper_joint_positions,
                     robot_base_pose=robot_base_pose,
                 )
                 if plan is not None:

@@ -288,6 +288,7 @@ class PolicyEvalConfig:
     enable_initial_alignment: bool = False                              # Enable one-shot initial ready-pose alignment before the first policy action
     enable_collision_aware_initial_alignment: bool = True              # Use cuRobo RGB-D collision-free planning for initial alignment
     enable_curobo_joint_execution: bool = False                         # Execute the timed cuRobo joint trajectory during initial alignment
+    enable_urdf_robot_filter: bool = False                              # Remove robot depth with URDF before sphere filtering
 
     # fmt: on
 
@@ -423,7 +424,10 @@ def _create_initial_alignment_selector(cfg: PolicyEvalConfig):
     from memory_system.execute.curobo_planner import CuroboPlanner
     from memory_system.execute.initial_alignment import InitialAlignmentSelector
     planner = (
-        CuroboPlanner(joint_execution=cfg.enable_curobo_joint_execution)
+        CuroboPlanner(
+            joint_execution=cfg.enable_curobo_joint_execution,
+            enable_urdf_robot_filter=cfg.enable_urdf_robot_filter,
+        )
         if cfg.enable_collision_aware_initial_alignment
         else None
     )
@@ -1045,6 +1049,7 @@ def run_episode(
                 main_depth=main_depth,
                 camera_params=phase_camera_params,
                 joint_positions=joint_positions,
+                gripper_joint_positions=obs.get("robot0_gripper_qpos"),
                 robot_base_pose=robot_base_pose,
             )
         except Exception as exc:
@@ -1079,6 +1084,26 @@ def run_episode(
             _correction_controller = alignment.controller
         _correction_step_index = 0
         action_queue.clear()
+        if (
+            os.environ.get("COSMOS_DEBUG_INIT_ALIGN", "").lower()
+            in {"1", "true", "yes"}
+        ):
+            _full_plan_waypoints = getattr(_correction_controller, "waypoints", None)
+            if _full_plan_waypoints is not None:
+                log_message(
+                    "[INIT_ALIGN_FULL_PLAN] "
+                    + json.dumps(
+                        {
+                            "episode": episode_index,
+                            "waypoints": np.asarray(
+                                _full_plan_waypoints, dtype=np.float32
+                            ).tolist(),
+                            "target": alignment.target_ee_states.tolist(),
+                        }
+                    ),
+                    log_fh,
+                    console=False,
+                )
         log_message(
             f"[INIT ALIGN] t={t_now}: target={alignment.target_ee_states.tolist()} "
             f"sim={alignment.similarity:.3f} demos={alignment.demo_ids} "
@@ -1247,6 +1272,27 @@ def run_episode(
                     action[6] = offset_gripper_action
                 print(f"t: {t}\t automatic correction action: {action}")
 
+                _debug_init_align = (
+                    os.environ.get("COSMOS_DEBUG_INIT_ALIGN", "").lower()
+                    in {"1", "true", "yes"}
+                    and _correction_kind == "initial_align"
+                )
+                _debug_before_ee = None
+                _debug_wp_index = None
+                _debug_wp = None
+                if _debug_init_align:
+                    _debug_before_ee = np.concatenate([
+                        obs["robot0_eef_pos"],
+                        Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+                    ]).astype(np.float32)
+                    _debug_wp_index = getattr(_correction_controller, "index", None)
+                    _debug_wps = getattr(_correction_controller, "waypoints", None)
+                    if _debug_wps is not None and _debug_wp_index is not None:
+                        _debug_wp = np.asarray(
+                            _debug_wps[min(_debug_wp_index, len(_debug_wps) - 1)],
+                            dtype=np.float32,
+                        )
+
                 if cfg.data_collection:
                     actions_list.append(action.copy())
 
@@ -1254,6 +1300,29 @@ def run_episode(
                 obs, reward, done, info = env.step(action.tolist())
                 _correction_steps_remaining -= 1
                 _correction_step_index += 1
+                if _debug_init_align:
+                    _debug_after_ee = np.concatenate([
+                        obs["robot0_eef_pos"],
+                        Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec(),
+                    ]).astype(np.float32)
+                    log_message(
+                        "[INIT_ALIGN_DEBUG] "
+                        + json.dumps(
+                            {
+                                "episode": episode_index,
+                                "t": t,
+                                "correction_step_index": _correction_step_index,
+                                "waypoint_index": _debug_wp_index,
+                                "waypoint": None if _debug_wp is None else _debug_wp.tolist(),
+                                "eef_before": None if _debug_before_ee is None else _debug_before_ee.tolist(),
+                                "action": np.asarray(action, dtype=np.float32).tolist(),
+                                "eef_after": _debug_after_ee.tolist(),
+                                "steps_remaining": _correction_steps_remaining,
+                            }
+                        ),
+                        log_file,
+                        console=False,
+                    )
                 if hasattr(_correction_controller, "observe"):
                     _correction_controller.observe(obs)
                 if getattr(_correction_controller, "finished", False):
