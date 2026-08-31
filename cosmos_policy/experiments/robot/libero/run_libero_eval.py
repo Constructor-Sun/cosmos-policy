@@ -163,6 +163,12 @@ from scipy.spatial.transform import Rotation
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
+# Optional global phase-transition hook used by smoke-test held-object pipeline.
+_PHASE_TRANSITION_HOOK = None
+
+# Optional simple Place fine-aligner set by the smoke-test pipeline.
+_PLACE_ALIGNER = None
+
 # Cosmos Policy latent sequence indices
 # 0: blank, 1: curr proprio, 2: curr wrist img, 3: curr primary img, 4: action, 5: future proprio, 6: future wrist img, 7: future primary img, 8: value
 CURR_STATE_START_LATENT_IDX, CURR_STATE_END_LATENT_IDX = 1, 3
@@ -417,6 +423,7 @@ def run_episode(
     episode_index=0,
     alignment_task_name=None,
     initial_alignment_selector=None,
+    phase_transition_hook=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -430,6 +437,122 @@ def run_episode(
         obs = env.set_init_state(initial_state)
     else:
         obs = env.get_observation()
+
+    # Optional read-only skill-completion telemetry.  Its return value is
+    # deliberately ignored: it never changes the action stream or episode end.
+    skill_shadow = None
+    if os.environ.get("COSMOS_SKILL_COMPLETION_SHADOW", "").lower() in {
+        "1", "true", "yes"
+    }:
+        item = os.environ.get("COSMOS_SKILL_COMPLETION_ITEM", "").strip()
+        if item:
+            try:
+                from memory_system.execute.skill_completion.shadow import (
+                    PickCompletionShadow,
+                )
+
+                resolution = int(obs["agentview_image"].shape[0])
+                skill_shadow = PickCompletionShadow(env, item, log_file, resolution)
+                log_message(
+                    f"[SKILL_COMPLETION] shadow enabled: item={item!r} "
+                    f"instance_id={skill_shadow.target_instance_id}",
+                    log_file,
+                )
+            except Exception as exc:
+                log_message(f"[SKILL_COMPLETION] shadow init failed: {exc}", log_file)
+        else:
+            log_message(
+                "[SKILL_COMPLETION] shadow requested but "
+                "COSMOS_SKILL_COMPLETION_ITEM is empty",
+                log_file,
+            )
+
+    def observe_skill_shadow(observation, action, frame):
+        if skill_shadow is None:
+            return
+        try:
+            # This is telemetry only; the boolean result is intentionally unused.
+            skill_shadow.observe(observation, action, frame)
+        except Exception as exc:
+            log_message(f"[SKILL_COMPLETION] shadow frame failed: {exc}", log_file)
+
+    # Active completion is deliberately kept separate from the read-only
+    # shadow.  It is created only after Initial Alignment selects a concrete
+    # memory demo, and it observes VLA actions only (never planner actions).
+    skill_runtime = None
+    pick_point_cloud = None
+
+    def _begin_vla_window(frame: int) -> None:
+        if skill_runtime is None or skill_runtime.active or skill_runtime.exhausted:
+            return
+        try:
+            phase = skill_runtime.begin_vla(frame=frame)
+            log_message(
+                f"[SKILL_COMPLETION] VLA start phase={skill_runtime.phase_index} "
+                f"skill={phase.skill} args={phase.arguments} demo={skill_runtime.demo_id}",
+                log_file,
+            )
+        except Exception as exc:
+            log_message(f"[SKILL_COMPLETION] VLA start failed: {exc}", log_file)
+
+    def _active_vla_points(observation, phase):
+        nonlocal pick_point_cloud
+        if phase is None or phase.skill != "Pick":
+            return None
+        item = phase.arguments.get("item")
+        if not item:
+            return None
+        try:
+            if pick_point_cloud is None:
+                from memory_system.execute.skill_completion.shadow import (
+                    PickTargetPointCloud,
+                )
+
+                resolution = int(observation["agentview_image"].shape[0])
+                pick_point_cloud = PickTargetPointCloud(env, resolution)
+            return pick_point_cloud.points(observation, item)
+        except Exception as exc:
+            log_message(f"[SKILL_COMPLETION] Pick point extraction failed: {exc}", log_file)
+            return None
+
+    def observe_active_vla(observation, action, frame: int):
+        """Consume one VLA frame and clear the queue on phase advance."""
+        if skill_runtime is None or not skill_runtime.active:
+            return None
+        phase = skill_runtime.active_phase
+        action_array = np.asarray(action, dtype=np.float64).reshape(-1)
+        decision = skill_runtime.observe_vla_frame(
+            target_points=_active_vla_points(observation, phase),
+            eef_pos=observation.get("robot0_eef_pos"),
+            eef_quat=observation.get("robot0_eef_quat"),
+            gripper_closed=bool(action_array[-1] > 0.0) if len(action_array) else False,
+            gripper_qpos=observation.get("robot0_gripper_qpos"),
+            frame=frame,
+        )
+        if decision.advance:
+            action_queue.clear()
+            log_message(
+                f"[SKILL_COMPLETION] advance phase={skill_runtime.phase_index - 1} "
+                f"reason={decision.reason} semantic={decision.semantic_completed} "
+                f"chunks={decision.action_chunks}; queue cleared",
+                log_file,
+            )
+        return decision
+
+    def finish_active_vla_chunk(frame: int):
+        """Apply the timeout only when a VLA queue naturally exhausts."""
+        if skill_runtime is None or not skill_runtime.active:
+            return None
+        decision = skill_runtime.finish_action_chunk(frame=frame)
+        if decision.advance:
+            action_queue.clear()
+            log_message(
+                f"[SKILL_COMPLETION] advance phase={skill_runtime.phase_index - 1} "
+                f"reason={decision.reason} semantic={decision.semantic_completed} "
+                f"chunks={decision.action_chunks}; queue cleared",
+                log_file,
+            )
+        return decision
 
     alignment_camera_params = None
     if (
@@ -465,7 +588,7 @@ def run_episode(
             controller.close()
 
     def _maybe_start_initial_alignment(t_now, observation, obs, log_fh) -> None:
-        nonlocal _initial_align_attempted, _policy_step_count
+        nonlocal _initial_align_attempted, _policy_step_count, skill_runtime
         nonlocal _alignment_steps_remaining
         nonlocal _alignment_controller, _alignment_step_index
         nonlocal alignment_gripper_action, action_queue
@@ -518,6 +641,46 @@ def run_episode(
                 log_fh,
             )
             return
+        # Bind active completion to the exact demo selected by memory retrieval.
+        # If that demo has no valid ordered sequence, retain the baseline path.
+        if (
+            skill_runtime is None
+            and os.environ.get("COSMOS_SKILL_COMPLETION_ACTIVE", "0").lower()
+            not in {"0", "false", "no"}
+        ):
+            demo_id = alignment.demo_ids[0] if alignment.demo_ids else None
+            sequence = None
+            sequence_loader = getattr(
+                initial_alignment_selector, "sequence_for_demo", None
+            )
+            if demo_id is not None and callable(sequence_loader):
+                try:
+                    sequence = sequence_loader(alignment_task_name, demo_id)
+                except Exception as exc:
+                    log_message(
+                        f"[SKILL_COMPLETION] sequence load failed for demo={demo_id}: {exc}",
+                        log_fh,
+                    )
+            if sequence:
+                from memory_system.execute.vla_skill_runtime import VLASkillRuntime
+
+                skill_runtime = VLASkillRuntime(
+                    sequence,
+                    task_name=alignment_task_name,
+                    demo_id=demo_id,
+                    episode_id=episode_index,
+                )
+                log_message(
+                    f"[SKILL_COMPLETION] active sequence loaded: demo={demo_id} "
+                    f"phases={len(sequence)}",
+                    log_fh,
+                )
+            else:
+                log_message(
+                    f"[SKILL_COMPLETION] no valid sequence for demo={demo_id}; "
+                    "active continuation disabled",
+                    log_fh,
+                )
         alignment_gripper_action = float(bool(last_gripper_closed))
         if alignment.joint_trajectory is not None:
             from cosmos_policy.experiments.robot.libero.libero_joint_control import (
@@ -562,6 +725,81 @@ def run_episode(
             log_fh,
         )
 
+    def _maybe_run_phase_transition_hook(decision, observation, frame):
+        nonlocal _alignment_controller, _alignment_steps_remaining
+        nonlocal _alignment_step_index, alignment_gripper_action
+        hook = phase_transition_hook or _PHASE_TRANSITION_HOOK
+        if hook is None or decision is None or not decision.advance:
+            return
+        if skill_runtime is None or skill_runtime.phase_index < 1:
+            return
+        completed_phase = skill_runtime.phases[skill_runtime.phase_index - 1]
+        next_phase = skill_runtime.active_phase
+        if completed_phase is None or next_phase is None:
+            return
+        if completed_phase.skill != "Pick" or next_phase.skill not in {"PlaceIn", "PlaceOn"}:
+            return
+        try:
+            result = hook(
+                observation=observation,
+                completed_phase=completed_phase,
+                next_phase=next_phase,
+                task_name=skill_runtime.task_name,
+                demo_id=skill_runtime.demo_id,
+                episode_id=episode_index,
+                env=env,
+                cfg=cfg,
+                log_file=log_file,
+            )
+        except Exception as exc:
+            log_message(f"[HELD_OBJECT] phase transition hook failed: {exc}", log_file)
+            return
+        if result is None:
+            return
+        controller = getattr(result, "controller", None)
+        if controller is None:
+            return
+        _alignment_controller = controller
+        _alignment_steps_remaining = int(getattr(result, "correction_steps", 1))
+        _alignment_step_index = 0
+        alignment_gripper_action = 1.0
+        action_queue.clear()
+        log_message(
+            f"[HELD_OBJECT] t={frame}: held-object controller armed steps={_alignment_steps_remaining}",
+            log_file,
+        )
+
+    def _maybe_start_place_fine_alignment(obs, frame):
+        nonlocal _alignment_controller, _alignment_steps_remaining
+        nonlocal _alignment_step_index, alignment_gripper_action
+        aligner = _PLACE_ALIGNER
+        if aligner is None or _alignment_controller is not None:
+            return
+        if skill_runtime is None or not skill_runtime.active:
+            return
+        phase = skill_runtime.active_phase
+        if phase is None or phase.skill not in {"PlaceIn", "PlaceOn"}:
+            return
+        try:
+            controller = aligner.maybe_controller(obs, frame, phase)
+        except Exception as exc:
+            log_message(f"[PLACE_ALIGN] simple check failed: {exc}", log_file)
+            return
+        if controller is None:
+            return
+        _alignment_controller = controller
+        _alignment_steps_remaining = int(getattr(controller, "max_steps", 48))
+        _alignment_step_index = 0
+        alignment_gripper_action = 1.0
+        action_queue.clear()
+        log_message(
+            f"[PLACE_ALIGN] t={frame}: simple controller armed "
+            f"pos_err={getattr(aligner, 'last_pos_error', float('nan')):.4f} "
+            f"rot_err={getattr(aligner, 'last_rot_error', float('nan')):.4f} "
+            f"steps={_alignment_steps_remaining}",
+            log_file,
+        )
+
     # Setup
     t = 0
     replay_images = []
@@ -596,7 +834,9 @@ def run_episode(
 
             # Do nothing for the first few timesteps to let objects stabilize
             if t < NUM_STEPS_WAIT:
-                obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
+                dummy_action = get_libero_dummy_action(cfg.model_family)
+                obs, reward, done, info = env.step(dummy_action)
+                observe_skill_shadow(obs, dummy_action, t)
                 t += 1
                 continue
 
@@ -667,6 +907,7 @@ def run_episode(
 
                 last_gripper_closed = bool(float(action[-1]) > 0.0)
                 obs, reward, done, info = env.step(action.tolist())
+                observe_skill_shadow(obs, action, t)
                 _alignment_steps_remaining -= 1
                 _alignment_step_index += 1
                 if _debug_init_align:
@@ -707,6 +948,7 @@ def run_episode(
                         f"status={getattr(_finished_controller, 'status', 'completed')}; resuming policy",
                         log_file,
                     )
+                    _begin_vla_window(t + 1)
                 if done:
                     success = True
                     break
@@ -715,6 +957,7 @@ def run_episode(
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
+                _begin_vla_window(t)
                 best_actions = None
                 best_future_predictions = None
 
@@ -923,6 +1166,8 @@ def run_episode(
                 if _capture_vae:
                     model.get_data_and_condition = _orig_gdac
 
+            _maybe_start_place_fine_alignment(obs, t)
+
             # A newly selected Initial Alignment begins immediately on this timestep.
             _is_alignment_action = (
                 _alignment_steps_remaining > 0
@@ -953,6 +1198,7 @@ def run_episode(
             # Execute action in environment
             last_gripper_closed = bool(float(action[-1]) > 0.0)
             obs, reward, done, info = env.step(action.tolist())
+            observe_skill_shadow(obs, action, t)
             if hasattr(_alignment_controller, "observe"):
                 _alignment_controller.observe(obs)
             if getattr(_alignment_controller, "finished", False):
@@ -971,6 +1217,18 @@ def run_episode(
                     f"status={getattr(_finished_controller, 'status', 'completed')}; resuming policy",
                     log_file,
                 )
+                _begin_vla_window(t + 1)
+            if not _is_alignment_action:
+                decision = observe_active_vla(obs, action, t)
+                if decision is not None and decision.advance:
+                    _maybe_run_phase_transition_hook(decision, obs, t)
+                else:
+                    # A chunk boundary is the only place where timeout may be
+                    # applied; planner actions never reach this hook.
+                    if len(action_queue) == 0:
+                        decision = finish_active_vla_chunk(t)
+                        if decision is not None and decision.advance:
+                            _maybe_run_phase_transition_hook(decision, obs, t)
             if done:
                 success = True
                 break
@@ -982,6 +1240,14 @@ def run_episode(
         log_message(f"{error_msg}\nFull traceback:\n{traceback_str}", log_file)
 
     _close_alignment_controller(_alignment_controller)
+    if skill_runtime is not None:
+        for summary in skill_runtime.finalize(success):
+            log_message(
+                "[SKILL_COMPLETION] summary " + json.dumps(summary),
+                log_file,
+            )
+    if skill_shadow is not None:
+        skill_shadow.close()
 
     # Fill data collection buffers
     if cfg.data_collection:
@@ -1050,6 +1316,7 @@ def run_task(
     total_successes=0,
     log_file=None,
     initial_alignment_selector=None,
+    phase_transition_hook=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -1115,6 +1382,7 @@ def run_task(
             episode_index=episode_idx,
             alignment_task_name=alignment_task_name,
             initial_alignment_selector=initial_alignment_selector,
+            phase_transition_hook=phase_transition_hook,
         )
 
         # Update counters

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import ClassVar, List, Optional, Tuple, Union
 
 import attrs
@@ -22,7 +23,7 @@ from transformers import T5EncoderModel, T5TokenizerFast
 
 transformers.logging.set_verbosity_error()
 
-T5_MODEL_DIR = "checkpoints/google-t5/t5-11b"
+T5_MODEL_DIR = os.environ.get("COSMOS_T5_PATH", "/data1/liu/exp/counterfactual/checkpoints/t5-11b")
 
 
 class CosmosT5TextEncoder(torch.nn.Module):
@@ -30,7 +31,7 @@ class CosmosT5TextEncoder(torch.nn.Module):
 
     def __init__(
         self,
-        model_name: str = "google-t5/t5-11b",
+        model_name: str = T5_MODEL_DIR,
         device: str = "cuda",
         cache_dir=None,
         local_files_only=False,

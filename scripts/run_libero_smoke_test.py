@@ -232,6 +232,364 @@ def get_t5_embedding_for_libero_plus(task_label):
 cosmos_utils.get_t5_embedding_from_cache = get_t5_embedding_for_libero_plus
 
 
+# --- Held-object Pick->Place pipeline ---
+if os.environ.get("COSMOS_HELD_OBJECT", "").lower() in {"1", "true", "yes"}:
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    from memory_system.artifacts import FeasibleRecoveryMemory
+    from memory_system.geometry import camera_params as build_camera_params
+
+    _repo_root = pathlib.Path(__file__).resolve().parents[1]
+    _feasible_path = _repo_root / "skill_memory_test" / "libero_10" / "feasible_recovery_targets.pt"
+    _held_memory = FeasibleRecoveryMemory(str(_feasible_path))
+    _place_mode = os.environ.get("COSMOS_PLACE_MODE", "curobo").lower()
+
+    if _place_mode == "simple":
+        from memory_system.execute.planner.place_fine_aligner import PlaceFineAligner
+
+        def _held_object_hook(
+            *,
+            observation,
+            completed_phase,
+            next_phase,
+            task_name,
+            demo_id,
+            episode_id,
+            env,
+            cfg,
+            log_file,
+        ):
+            del observation, completed_phase, env, cfg
+            run_libero_eval_mod._PLACE_ALIGNER = None
+            candidates = _held_memory.select(
+                task_name,
+                next_phase.planner_step_id,
+                next_phase.skill,
+                next_phase.arguments,
+            )
+            exact = [c for c in candidates if str(c.get("demo_id")) == str(demo_id)]
+            if not exact:
+                msg = f"[PLACE_ALIGN] no exact ready pose for demo={demo_id}"
+                print(msg)
+                run_libero_eval_mod.log_message(msg, log_file)
+                return None
+            ready_pose = np.asarray(exact[0]["ee_states"], dtype=np.float64).reshape(6)
+            aligner = PlaceFineAligner(ready_pose)
+            run_libero_eval_mod._PLACE_ALIGNER = aligner
+            msg = (
+                f"[PLACE_ALIGN] simple mode armed for demo={demo_id} "
+                f"ready_pose={ready_pose.tolist()}"
+            )
+            print(msg)
+            run_libero_eval_mod.log_message(msg, log_file)
+            return None
+
+        run_libero_eval_mod._PHASE_TRANSITION_HOOK = _held_object_hook
+        print("[PLACE_ALIGN] simple Place fine-align mode enabled")
+    else:
+        from memory_system.execute.planner.held_object.connected_component import (
+            HeldObjectConnectedComponentExtractor,
+        )
+        from memory_system.execute.planner.held_object.planner import HeldObjectPlanner
+        from memory_system.execute.planner.held_object.types import HeldObjectPlannerInput
+
+        _held_extractor = HeldObjectConnectedComponentExtractor()
+        # Test-only: use GPU Warp URDF filter from the diagnostic script so the
+        # held-object hook does not stall on CPU ray casting.
+        import importlib.util
+        import sys
+
+        import curobo
+        from memory_system.execute.urdf_depth_filter import UrdfDepthFilterConfig
+
+        _base_path = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "tests" / "held_object" / "visualize_held_object_after_robot_removal.py"
+        )
+        _spec = importlib.util.spec_from_file_location("held_object_gpu_urdf_base", _base_path)
+        _base = importlib.util.module_from_spec(_spec)
+        sys.modules[_spec.name] = _base
+        _spec.loader.exec_module(_base)
+        _urdf_path = str(
+            pathlib.Path(curobo.__file__).resolve().parent
+            / "content" / "assets" / "robot" / "franka_description" / "franka_panda.urdf"
+        )
+        _held_extractor.planner._urdf_filter = _base.WarpUrdfDepthFilter(
+            UrdfDepthFilterConfig(urdf_path=_urdf_path), device="cuda:0"
+        )
+        _held_planner = HeldObjectPlanner()
+        # Use the same GPU Warp URDF filter in HeldObjectPlanner so planning does not
+        # fall back to slow CPU ray casting.
+        _held_planner._urdf_filter = _held_extractor.planner._urdf_filter
+        _failure_dump_dir = _repo_root / "tests" / "held_object" / "k6_pick_place_integration"
+        _debug_enabled = os.environ.get("COSMOS_HELD_OBJECT_DEBUG", "1").lower() in {"1", "true", "yes"}
+
+        def _dump_held_object_image(observation, env, cfg, debug, tag, task_name, episode_id):
+            from memory_system.geometry import world_to_pixel
+
+            _failure_dump_dir.mkdir(parents=True, exist_ok=True)
+            height, width = observation["agentview_image"].shape[:2]
+            camera = build_camera_params(env.sim, "agentview", height, width)
+
+            r_world_base = np.asarray(debug["r_world_base"], dtype=np.float64).reshape(3, 3)
+            t_world_base = np.asarray(debug["t_world_base"], dtype=np.float64).reshape(3)
+            p0 = np.asarray(debug["p0"], dtype=np.float64).reshape(3)
+            r0 = np.asarray(debug["r0"], dtype=np.float64).reshape(3, 3)
+            points_hand = np.asarray(debug["points_hand"], dtype=np.float64).reshape(-1, 3)
+            surface_base = np.asarray(debug["surface_points"], dtype=np.float64).reshape(-1, 3)
+
+            held_world = (
+                r_world_base @ (r0 @ points_hand.T + p0[:, None]) + t_world_base[:, None]
+            ).T
+            surface_world = (
+                r_world_base @ surface_base.T + t_world_base[:, None]
+            ).T
+
+            robot_residual = np.zeros(len(surface_world), dtype=bool)
+            if len(surface_world):
+                px = world_to_pixel(surface_world, camera).astype(np.int64)
+                valid = (
+                    (px[:, 0] >= 0) & (px[:, 0] < height)
+                    & (px[:, 1] >= 0) & (px[:, 1] < width)
+                )
+                if valid.any():
+                    try:
+                        seg_render, _ = env.sim.render(
+                            height, width, camera_name="agentview", depth=True, segmentation=True
+                        )
+                        seg_canon = np.flipud(seg_render)
+                        for i in np.flatnonzero(valid):
+                            objtype, objid = seg_canon[px[i, 0], px[i, 1]]
+                            objtype = int(objtype)
+                            objid = int(objid)
+                            if objtype == 5:
+                                name = env.sim.model.geom_id2name(objid)
+                                if name and (
+                                    "robot" in name.lower()
+                                    or "gripper" in name.lower()
+                                    or name.lower().startswith("panda")
+                                    or "link" in name.lower()
+                                ):
+                                    robot_residual[i] = True
+                    except Exception:
+                        pass
+
+            other_world = surface_world[~robot_residual]
+            robot_residual_world = surface_world[robot_residual]
+            target = np.asarray(debug["target"], dtype=np.float64).reshape(6)
+
+            conflict_point_world = None
+            conflict_sphere_world = None
+            last_conflict_info = debug.get("last_conflict_info")
+            if last_conflict_info is not None:
+                conflict_point_world = (
+                    r_world_base @ np.asarray(last_conflict_info["point"], dtype=np.float64).reshape(3)
+                    + t_world_base
+                )
+                conflict_sphere_world = (
+                    r_world_base @ np.asarray(last_conflict_info["sphere_center"], dtype=np.float64).reshape(3)
+                    + t_world_base
+                )
+
+            nearest_target_point_world = None
+            nearest_target_info = debug.get("nearest_obstacle_to_target")
+            if nearest_target_info is not None:
+                nearest_target_point_world = (
+                    r_world_base @ np.asarray(nearest_target_info["point"], dtype=np.float64).reshape(3)
+                    + t_world_base
+                )
+
+            # Crop to the region around the EEF / main camera, matching the
+            # existing held-object diagnostic visualizations.
+            eef = np.asarray(observation["robot0_eef_pos"], dtype=np.float64).reshape(3)
+            crop_lo = eef + np.array([-0.55, -0.55, -0.40], dtype=np.float64)
+            crop_hi = eef + np.array([0.55, 0.55, 0.35], dtype=np.float64)
+
+            def _crop(points):
+                if len(points) == 0:
+                    return points
+                return points[np.all((points >= crop_lo) & (points <= crop_hi), axis=1)]
+
+            held_world = _crop(held_world)
+            robot_residual_world = _crop(robot_residual_world)
+            other_world = _crop(other_world)
+
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            views = [
+                ("front-left", 25, -60),
+                ("front-right", 25, 30),
+                ("top-ish", 60, -60),
+                ("side", 10, -120),
+            ]
+            colors = {
+                "robot_residual": "#d62728",
+                "held_object": "#ff7f0e",
+                "other": "#7f7f7f",
+                "target": "#2ca02c",
+            }
+            rng = np.random.default_rng(0)
+
+            def draw(ax, show_legend=False, title=None):
+                for points, color, label, size in [
+                    (robot_residual_world, colors["robot_residual"], f"robot_residual ({len(robot_residual_world)})", 0.8),
+                    (held_world, colors["held_object"], f"held_object ({len(held_world)})", 0.8),
+                    (other_world, colors["other"], f"other ({len(other_world)})", 0.6),
+                ]:
+                    if len(points) == 0:
+                        continue
+                    idx = np.arange(len(points))
+                    if len(idx) > 20000:
+                        idx = rng.choice(idx, 20000, replace=False)
+                    pts = points[idx]
+                    ax.scatter(
+                        pts[:, 0], pts[:, 1], pts[:, 2],
+                        s=size, c=color, alpha=0.8, label=label,
+                    )
+                ax.scatter(
+                    [target[0]], [target[1]], [target[2]],
+                    s=120, c=colors["target"], marker="*", label="ready_pose",
+                )
+                if conflict_point_world is not None:
+                    ax.scatter(
+                        [conflict_point_world[0]], [conflict_point_world[1]], [conflict_point_world[2]],
+                        s=180, c="black", marker="X", label="closest_obstacle_point",
+                    )
+                    ax.scatter(
+                        [conflict_sphere_world[0]], [conflict_sphere_world[1]], [conflict_sphere_world[2]],
+                        s=140, c="blue", marker="o", label="robot_sphere_center",
+                    )
+                    ax.plot(
+                        [conflict_point_world[0], conflict_sphere_world[0]],
+                        [conflict_point_world[1], conflict_sphere_world[1]],
+                        [conflict_point_world[2], conflict_sphere_world[2]],
+                        c="black", linestyle="--", linewidth=1.0,
+                    )
+                if nearest_target_point_world is not None:
+                    ax.scatter(
+                        [nearest_target_point_world[0]], [nearest_target_point_world[1]], [nearest_target_point_world[2]],
+                        s=180, c="purple", marker="^", label="nearest_obstacle_to_target",
+                    )
+                if title:
+                    ax.set_title(title, fontsize=10)
+                if show_legend:
+                    ax.legend(loc="upper right", fontsize=8)
+                ax.set_xlabel("x (m)")
+                ax.set_ylabel("y (m)")
+                ax.set_zlabel("z (m)")
+
+            fig = plt.figure(figsize=(20, 16))
+            for idx, (name, elev, azim) in enumerate(views, start=1):
+                ax = fig.add_subplot(2, 2, idx, projection="3d")
+                draw(
+                    ax,
+                    show_legend=(idx == 1),
+                    title=f"HeldObjectPlanner {tag} - {name}",
+                )
+                ax.view_init(elev=elev, azim=azim)
+            fig.suptitle(f"HeldObjectPlanner {tag} point cloud", fontsize=14)
+            safe_task = str(task_name).replace("/", "_").replace(" ", "_")
+            out_png = _failure_dump_dir / f"i_planner_{tag}_{safe_task}_ep{episode_id}_multiview.png"
+            fig.savefig(out_png, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"[HELD_OBJECT] saved {tag} point cloud image to {out_png}")
+
+        def _held_object_hook(
+            *,
+            observation,
+            completed_phase,
+            next_phase,
+            task_name,
+            demo_id,
+            episode_id,
+            env,
+            cfg,
+            log_file,
+        ):
+            item = completed_phase.arguments.get("item") or "white_yellow_mug_1"
+            height, width = observation["agentview_image"].shape[:2]
+            camera = build_camera_params(env.sim, "agentview", height, width)
+            depth = run_libero_eval_mod._make_main_depth(observation, camera, cfg.flip_images)
+            robot_base_pose = np.concatenate(
+                [env.robots[0].base_pos, env.robots[0].base_ori]
+            ).astype(np.float64)
+
+            held = _held_extractor.extract(
+                depth=depth,
+                camera_params=camera,
+                joint_positions=observation["robot0_joint_pos"],
+                gripper_joint_positions=observation.get("robot0_gripper_qpos"),
+                robot_base_pose=robot_base_pose,
+                eef_pos=observation["robot0_eef_pos"],
+                item=item,
+            )
+            if held is None:
+                msg = f"[HELD_OBJECT] extract failed for {item}"
+                print(msg)
+                run_libero_eval_mod.log_message(msg, log_file)
+                return None
+
+            candidates = _held_memory.select(
+                task_name,
+                next_phase.planner_step_id,
+                next_phase.skill,
+                next_phase.arguments,
+            )
+            exact = [c for c in candidates if str(c.get("demo_id")) == str(demo_id)]
+            if not exact:
+                msg = f"[HELD_OBJECT] no exact ready pose for demo={demo_id}"
+                print(msg)
+                run_libero_eval_mod.log_message(msg, log_file)
+                return None
+
+            ready_pose = np.asarray(exact[0]["ee_states"], dtype=np.float64).reshape(6)
+            current_ee = np.concatenate(
+                [
+                    observation["robot0_eef_pos"],
+                    Rotation.from_quat(observation["robot0_eef_quat"]).as_rotvec(),
+                ]
+            ).astype(np.float32)
+
+            inp = HeldObjectPlannerInput(
+                joint_positions=observation["robot0_joint_pos"],
+                ee_states=current_ee,
+                depth=depth,
+                camera_params=camera,
+                held_object=held,
+                ready_pose=ready_pose,
+                gripper_joint_positions=observation.get("robot0_gripper_qpos"),
+                robot_base_pose=robot_base_pose,
+            )
+            result = _held_planner.plan(inp)
+            if result is None:
+                msg = "[HELD_OBJECT] HeldObjectPlanner failed"
+                if getattr(_held_planner, "last_failure", None):
+                    msg += f": {_held_planner.last_failure}"
+                print(msg)
+                run_libero_eval_mod.log_message(msg, log_file)
+                if _debug_enabled and getattr(_held_planner, "last_debug", None):
+                    try:
+                        _dump_held_object_image(observation, env, cfg, _held_planner.last_debug, "failure", task_name, episode_id)
+                    except Exception as exc:
+                        print(f"[HELD_OBJECT] failed to dump failure point cloud: {exc}")
+            else:
+                msg = f"[HELD_OBJECT] plan ok waypoints={len(result.waypoints)}"
+                print(msg)
+                run_libero_eval_mod.log_message(msg, log_file)
+                if _debug_enabled and getattr(_held_planner, "last_debug", None):
+                    try:
+                        _dump_held_object_image(observation, env, cfg, _held_planner.last_debug, "success", task_name, episode_id)
+                    except Exception as exc:
+                        print(f"[HELD_OBJECT] failed to dump success point cloud: {exc}")
+            return result
+
+        run_libero_eval_mod._PHASE_TRANSITION_HOOK = _held_object_hook
+        print("[HELD_OBJECT] held-object Pick->Place pipeline enabled")
+
+
 def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/logs"):
     unnorm_key = "libero_10" if suite_name == "libero_mix" else suite_name
     deterministic_reset = os.environ["COSMOS_SMOKE_DETERMINISTIC_RESET"].lower() in {"1", "true", "yes"}

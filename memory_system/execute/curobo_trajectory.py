@@ -21,32 +21,57 @@ def find_minimum_feasible_backoff(
     max_backoff: float = 0.08,
     initial_step: float = 0.002,
     resolution: float = 0.001,
+    min_backoff: float | None = None,
 ) -> tuple[float, Any] | None:
-    """Bracket then refine the smallest backoff accepted by ``probe``."""
+    """Find the smallest feasible signed backoff around the direct target.
+
+    ``min_backoff=None`` preserves the historical one-sided ``[0, max]``
+    search. Passing a negative value enables a two-sided search; each half is
+    bracketed and refined independently, then the closest feasible result is
+    returned.
+    """
     direct = probe(0.0)
     if direct is not None:
         return 0.0, direct
-    low = 0.0
-    high = min(float(initial_step), float(max_backoff))
-    feasible = None
-    while high <= max_backoff + 1e-12:
-        feasible = probe(high)
-        if feasible is not None:
-            break
-        low = high
-        if high >= max_backoff:
+    lower = 0.0 if min_backoff is None else float(min_backoff)
+    upper = float(max_backoff)
+
+    def search(sign: float, bound: float) -> tuple[float, Any] | None:
+        bound = abs(float(bound))
+        if bound <= 0.0:
             return None
-        high = min(2.0 * high, float(max_backoff))
-    if feasible is None:
+        low = 0.0
+        high = min(abs(float(initial_step)), bound)
+        feasible = None
+        while True:
+            feasible = probe(sign * high)
+            if feasible is not None:
+                break
+            low = high
+            if high >= bound - 1e-12:
+                return None
+            high = min(2.0 * high, bound)
+        while high - low > resolution:
+            middle = 0.5 * (low + high)
+            candidate = probe(sign * middle)
+            if candidate is None:
+                low = middle
+            else:
+                high, feasible = middle, candidate
+        return sign * high, feasible
+
+    candidates = []
+    if lower < 0.0:
+        result = search(-1.0, lower)
+        if result is not None:
+            candidates.append(result)
+    if upper > 0.0:
+        result = search(1.0, upper)
+        if result is not None:
+            candidates.append(result)
+    if not candidates:
         return None
-    while high - low > resolution:
-        middle = 0.5 * (low + high)
-        candidate = probe(middle)
-        if candidate is None:
-            low = middle
-        else:
-            high, feasible = middle, candidate
-    return high, feasible
+    return min(candidates, key=lambda item: abs(item[0]))
 
 
 def _matrix(value: Any, name: str) -> np.ndarray:

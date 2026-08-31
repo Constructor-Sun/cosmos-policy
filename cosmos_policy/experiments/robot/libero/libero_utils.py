@@ -21,7 +21,7 @@ import os
 import imageio
 import numpy as np
 from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.envs import OffScreenRenderEnv, SegmentationRenderEnv
 from PIL import Image, ImageDraw, ImageFont
 
 from cosmos_policy.experiments.robot.robot_utils import DATE, DATE_TIME
@@ -34,7 +34,26 @@ def get_libero_env(task, model_family, resolution=256, camera_depths=None):
     env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
     if camera_depths is not None:
         env_args["camera_depths"] = camera_depths
-    env = OffScreenRenderEnv(**env_args)
+    shadow_enabled = os.environ.get("COSMOS_SKILL_COMPLETION_SHADOW", "").lower() in {
+        "1", "true", "yes"
+    }
+    active_enabled = os.environ.get("COSMOS_SKILL_COMPLETION_ACTIVE", "").lower() in {
+        "1", "true", "yes"
+    }
+    completion_observation_enabled = shadow_enabled or active_enabled
+    if completion_observation_enabled:
+        from memory_system.execute.skill_completion.shadow import (
+            patch_numpy2_segmentation,
+        )
+
+        patch_numpy2_segmentation()
+        env_args["camera_segmentations"] = "instance"
+    env_class = (
+        SegmentationRenderEnv
+        if completion_observation_enabled
+        else OffScreenRenderEnv
+    )
+    env = env_class(**env_args)
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
 

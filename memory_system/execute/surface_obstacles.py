@@ -28,6 +28,9 @@ class TrajectoryConflict:
     first_step: int
     last_step: int
     min_clearance: float
+    min_clearance_point: np.ndarray
+    min_clearance_step: int
+    min_clearance_sphere_center: np.ndarray
 
 
 def points_from_depth(depth: np.ndarray, camera: CameraParams) -> np.ndarray:
@@ -182,6 +185,7 @@ def find_trajectory_conflict(
     surface_points: np.ndarray,
     robot_spheres: np.ndarray,
     safety_margin: float = 0.01,
+    return_min_clearance: bool = False,
 ) -> TrajectoryConflict | None:
     """Check all trajectory robot spheres against the complete surface cloud."""
     points = np.asarray(surface_points, dtype=np.float64).reshape(-1, 3)
@@ -193,10 +197,18 @@ def find_trajectory_conflict(
     hit_indices: set[int] = set()
     first_step, last_step = len(spheres), -1
     min_clearance = float("inf")
+    min_clearance_point = np.zeros(3, dtype=np.float64)
+    min_clearance_step = -1
+    min_clearance_sphere_center = np.zeros(3, dtype=np.float64)
     for step, step_spheres in enumerate(spheres):
-        distance, _ = tree.query(step_spheres[:, :3], k=1)
+        distance, index = tree.query(step_spheres[:, :3], k=1)
         clearance = distance - step_spheres[:, 3]
-        min_clearance = min(min_clearance, float(clearance.min()))
+        local_min = int(np.argmin(clearance))
+        if float(clearance[local_min]) < min_clearance:
+            min_clearance = float(clearance[local_min])
+            min_clearance_step = step
+            min_clearance_point = points[int(index[local_min])].copy()
+            min_clearance_sphere_center = step_spheres[local_min, :3].copy()
         colliding = np.flatnonzero(clearance <= float(safety_margin))
         if not len(colliding):
             continue
@@ -207,10 +219,23 @@ def find_trajectory_conflict(
         )
         hit_indices.update(index for group in neighborhoods for index in group)
     if last_step < 0:
+        if return_min_clearance:
+            return TrajectoryConflict(
+                point_indices=np.array([], dtype=np.int64),
+                first_step=min_clearance_step,
+                last_step=min_clearance_step,
+                min_clearance=min_clearance,
+                min_clearance_point=min_clearance_point,
+                min_clearance_step=min_clearance_step,
+                min_clearance_sphere_center=min_clearance_sphere_center,
+            )
         return None
     return TrajectoryConflict(
         point_indices=np.asarray(sorted(hit_indices), dtype=np.int64),
         first_step=first_step,
         last_step=last_step,
         min_clearance=min_clearance,
+        min_clearance_point=min_clearance_point,
+        min_clearance_step=min_clearance_step,
+        min_clearance_sphere_center=min_clearance_sphere_center,
     )

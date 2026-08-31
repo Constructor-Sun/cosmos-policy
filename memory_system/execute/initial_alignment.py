@@ -20,7 +20,11 @@ from typing import Any
 import numpy as np
 
 from memory_system.artifacts import FeasibleRecoveryMemory
-from memory_system.execute.plan import PhaseSpec, load_phase_plans
+from memory_system.execute.plan import (
+    PhaseSpec,
+    load_phase_plans,
+    load_phase_sequences,
+)
 from memory_system.execute.recovery.controller import PoseController
 from memory_system.execute.recovery.retrieval import similarity, token
 from memory_system.types import RecoveryTarget
@@ -73,6 +77,7 @@ class InitialAlignmentSelector:
         planner: Any | None = None,
     ):
         self.plans = load_phase_plans(segments_manifest)
+        self.phase_sequences = load_phase_sequences(segments_manifest)
         self.memory = FeasibleRecoveryMemory(feasible_recovery_targets)
         self.correction_steps = max(2, int(correction_steps))
         # The initial alignment moves to the ready pose but keeps the end
@@ -85,6 +90,15 @@ class InitialAlignmentSelector:
         # moka_pot_2 before moka_pot_1 even though its step ids are 3/4 then 1/2).
         # For initial alignment we need the actual first phase in the demos.
         self.first_phases = self._build_first_phases(segments_manifest)
+
+    def sequence_for_demo(
+        self, task_name: str, demo_id: str
+    ) -> tuple[PhaseSpec, ...] | None:
+        """Return the exact ordered sequence selected from memory."""
+        base_task = self.resolve_task_name(task_name)
+        if base_task is None:
+            return None
+        return self.phase_sequences.get((base_task, str(demo_id)))
 
     def _build_first_phases(self, segments_manifest: str | Path) -> dict[str, PhaseSpec]:
         """Return the most common first phase per task in demo order."""

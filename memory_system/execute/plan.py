@@ -54,3 +54,43 @@ def load_phase_plans(path: str | Path) -> dict[str, tuple[PhaseSpec, ...]]:
         task_name: tuple(task_phases[index] for index in sorted(task_phases))
         for task_name, task_phases in phases.items()
     }
+
+
+def load_phase_sequences(
+    path: str | Path,
+) -> dict[tuple[str, str], tuple[PhaseSpec, ...]]:
+    """Load each valid memory demo in its original segment order.
+
+    ``planner_step_id`` is an identity/retrieval key, not an execution-order
+    key.  The memory record's segment list is the only ordering source used by
+    active skill continuation.  Records are keyed by the exact task and demo
+    identifiers so a sequence is never assembled by voting across demos.
+    """
+    payload = json.loads(Path(path).read_text())
+    sequences: dict[tuple[str, str], tuple[PhaseSpec, ...]] = {}
+    for record in payload.get("records", []):
+        if not record.get("valid"):
+            continue
+        task_name = str(record["task_name"])
+        demo_id = str(record["demo_id"])
+        phases: list[PhaseSpec] = []
+        for segment in record.get("segments", []):
+            if segment.get("status") == "already_satisfied":
+                continue
+            phases.append(
+                PhaseSpec(
+                    int(segment["planner_step_id"]),
+                    str(segment["skill"]),
+                    {
+                        str(key): str(value)
+                        for key, value in segment.get("arguments", {}).items()
+                    },
+                )
+            )
+        key = (task_name, demo_id)
+        sequence = tuple(phases)
+        existing = sequences.get(key)
+        if existing is not None and existing != sequence:
+            raise ValueError(f"Inconsistent memory sequence for {task_name}/{demo_id}")
+        sequences[key] = sequence
+    return sequences
