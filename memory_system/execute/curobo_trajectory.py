@@ -19,8 +19,8 @@ def backoff_pose(target_ee: np.ndarray, distance: float) -> np.ndarray:
 def find_minimum_feasible_backoff(
     probe: Any,
     max_backoff: float = 0.08,
-    initial_step: float = 0.002,
-    resolution: float = 0.001,
+    initial_step: float = 0.005,
+    resolution: float = 0.005,
     min_backoff: float | None = None,
 ) -> tuple[float, Any] | None:
     """Find the smallest feasible signed backoff around the direct target.

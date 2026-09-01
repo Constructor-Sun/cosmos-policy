@@ -76,6 +76,7 @@ class CuroboPlanner:
         self._planner = None
         self._urdf_filter = None
         self._urdf_filter_failed = False
+        self.last_debug = None
 
     def _ensure_urdf_filter(self):
         if not self.enable_urdf_robot_filter or self._urdf_filter_failed:
@@ -220,6 +221,20 @@ class CuroboPlanner:
                 sample_target = Rw @ target[:3] + tw
             robot_spheres = start_kinematics.robot_spheres.detach().cpu().numpy()
             surface_points = self._filter_robot(points, robot_spheres)
+            if robot_base_pose is not None:
+                r_world_base = base_rotation
+                t_world_base = base[:3]
+            else:
+                r_world_base = Rw.T
+                t_world_base = -Rw.T @ tw
+            self.last_debug = {
+                "r_world_base": r_world_base,
+                "t_world_base": t_world_base,
+                "surface_points": surface_points,
+                "target": target,
+                "last_conflict_info": None,
+                "nearest_obstacle_to_target": None,
+            }
             if len(surface_points) == 0:
                 logger.warning("CuroboPlanner: all depth points belong to the robot")
                 return None
@@ -258,7 +273,7 @@ class CuroboPlanner:
                 goal_tools = GoalToolPose.from_poses({tool_frames[0]: goal.unsqueeze(1)}, ordered_tool_frames=tool_frames)
                 for refinement in range(self.max_surface_replans + 1):
                     outcome = planner.plan_pose(
-                        current_state=start, goal_tool_poses=goal_tools, max_attempts=5
+                        current_state=start, goal_tool_poses=goal_tools, max_attempts=3
                     )
                     if outcome is None or not bool(torch.as_tensor(outcome.success).any().item()):
                         logger.info("CuroboPlanner: backoff %.4fm is infeasible", distance)
@@ -279,6 +294,13 @@ class CuroboPlanner:
                     )
                     if conflict is None:
                         return candidate, outcome, interp
+                    if self.last_debug is not None:
+                        self.last_debug["last_conflict_info"] = {
+                            "point": conflict.min_clearance_point,
+                            "sphere_center": conflict.min_clearance_sphere_center,
+                            "clearance": conflict.min_clearance,
+                            "step": conflict.min_clearance_step,
+                        }
                     logger.info(
                         "CuroboPlanner: dense surface conflict steps=%d..%d "
                         "clearance=%.4fm refinement=%d",
@@ -297,6 +319,8 @@ class CuroboPlanner:
                 logger.warning("CuroboPlanner: no feasible goal within 0.080m backoff")
                 return None
             backoff, (target, result, interp) = selected
+            if self.last_debug is not None:
+                self.last_debug["target"] = target
             logger.info("CuroboPlanner: selected collision-free backoff=%.4fm", backoff)
             if self.joint_execution:
                 trajectory = JointTrajectoryPlan.from_curobo(

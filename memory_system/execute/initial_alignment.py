@@ -4,8 +4,7 @@ This module implements the standalone online intervention path.  It only:
 
 * loads phase plans and feasible/ready-pose memory,
 * maps a LIBERO-plus perturbed task back to its base task,
-* selects the most visually similar first-phase ready pose using the main
-  camera VAE only,
+* selects a first-Pick ready pose by target XYZ, with VAE fallback,
 * returns one alignment trajectory/controller for ``run_episode`` to execute.
 
 No skill verifier state is kept and no online recovery is triggered.
@@ -19,14 +18,18 @@ from typing import Any
 
 import numpy as np
 
-from memory_system.artifacts import FeasibleRecoveryMemory
+from memory_system.artifacts import FeasibleRecoveryMemory, Ready3DMemory
 from memory_system.execute.plan import (
     PhaseSpec,
     load_phase_plans,
     load_phase_sequences,
 )
 from memory_system.execute.recovery.controller import PoseController
-from memory_system.execute.recovery.retrieval import similarity, token
+from memory_system.execute.recovery.retrieval import mean_ee_states, similarity, token
+from memory_system.execute.skill_completion.shadow import (
+    PickTargetPointCloud,
+    resolve_target_instance,
+)
 from memory_system.types import RecoveryTarget
 
 
@@ -61,7 +64,7 @@ class InitialAlignmentResult:
 
 
 class InitialAlignmentSelector:
-    """Select a single first-phase ready pose using main-camera VAE similarity.
+    """Select one first-phase ready pose, using target XYZ for Pick phases.
 
     The selector loads the skill plan and ready-pose memory itself.  By default
     the selected target is raised 2 cm in z so the robot moves to the ready
@@ -75,10 +78,13 @@ class InitialAlignmentSelector:
         correction_steps: int = 48,
         z_offset: float = 0.02,
         planner: Any | None = None,
+        ready3d_targets: str | Path | None = None,
     ):
         self.plans = load_phase_plans(segments_manifest)
         self.phase_sequences = load_phase_sequences(segments_manifest)
         self.memory = FeasibleRecoveryMemory(feasible_recovery_targets)
+        self.ready3d = Ready3DMemory(ready3d_targets) if ready3d_targets else None
+        self.last_spatial_match: tuple[np.ndarray, tuple] | None = None
         self.correction_steps = max(2, int(correction_steps))
         # The initial alignment moves to the ready pose but keeps the end
         # effector 2 cm above the final height by default.
@@ -168,12 +174,13 @@ class InitialAlignmentSelector:
         joint_positions: Any = None,
         gripper_joint_positions: Any = None,
         robot_base_pose: Any = None,
+        observation: Any = None,
+        env: Any = None,
     ) -> InitialAlignmentResult | None:
         """Return the best-matching first-phase ready pose, or ``None``.
 
-        The match is based only on main-camera VAE cosine similarity.  There is
-        intentionally no similarity threshold: if any candidate exists, the best
-        one is returned.
+        First-Pick phases use target XYZ distance when available.  All other
+        phases, and failed XYZ extraction, retain the existing VAE selection.
         """
         base_task = self.resolve_task_name(task_name)
         if base_task is None:
@@ -200,25 +207,74 @@ class InitialAlignmentSelector:
         if not candidates:
             return None
 
+        self.last_spatial_match = None
         current_token = token(current_vae_main)
         best_item = None
         best_sim = -float("inf")
-        for item in candidates:
+        target_items = []
+
+        if (
+            first_phase.skill == "Pick"
+            and self.ready3d
+            and observation is not None
+            and env is not None
+        ):
             try:
-                item_token = token(item["ready_vae_main"])
+                instance = resolve_target_instance(
+                    env, first_phase.arguments, first_phase.skill
+                )
+                resolution = observation["agentview_image"].shape[0]
+                points = None if instance is None else PickTargetPointCloud(
+                    env, resolution
+                ).points(observation, instance)
+                if points is not None:
+                    xyz = np.median(points, axis=0)
+                    ranked = self.ready3d.nearest(
+                        base_task,
+                        first_phase.planner_step_id,
+                        first_phase.skill,
+                        first_phase.arguments,
+                        xyz,
+                    )
+                    self.last_spatial_match = (xyz, ranked)
+                    by_demo = {str(item["demo_id"]): item for item in candidates}
+                    if ranked:
+                        best_item = by_demo.get(str(ranked[0][0]["demo_id"]))
+                        if best_item is not None:
+                            target_items = [
+                                by_demo[str(prototype["demo_id"])]
+                                for prototype, _distance in ranked
+                                if str(prototype["demo_id"]) in by_demo
+                            ]
             except Exception:
-                continue
-            sim = similarity(current_token, item_token)
-            if sim > best_sim:
-                best_sim = sim
-                best_item = item
+                best_item = None
+
+        if best_item is None:
+            for item in candidates:
+                try:
+                    item_token = token(item["ready_vae_main"])
+                except Exception:
+                    continue
+                sim = similarity(current_token, item_token)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_item = item
+        else:
+            best_sim = similarity(current_token, token(best_item["ready_vae_main"]))
 
         if best_item is None:
             return None
+        if not target_items:
+            target_items = [best_item]
 
         # Copy before modifying: the memory items are reused across episodes and
         # must not be mutated in-place.
-        target_ee = np.array(best_item["ee_states"], dtype=np.float32).reshape(6)
+        target_ee = (
+            mean_ee_states(target_items)
+            if len(target_items) > 1
+            else np.asarray(best_item["ee_states"], dtype=np.float32).reshape(6).copy()
+        )
+        demo_ids = tuple(str(item["demo_id"]) for item in target_items)
         # Keep the final target 2 cm above the stored ready pose.
         target_ee[2] += self.z_offset
         if self.planner is not None:
@@ -240,7 +296,7 @@ class InitialAlignmentSelector:
                     )
                     return InitialAlignmentResult(
                         target=RecoveryTarget(
-                            demo_ids=(str(best_item["demo_id"]),),
+                            demo_ids=demo_ids,
                             target_ee_states=planned_target,
                             similarity=float(best_sim),
                             frame=int(best_item.get("ready_frame", 0)),
@@ -258,7 +314,7 @@ class InitialAlignmentSelector:
         controller = PoseController(target_ee_states=target_ee, z_lift=0.0)
         return InitialAlignmentResult(
             target=RecoveryTarget(
-                demo_ids=(str(best_item["demo_id"]),),
+                demo_ids=demo_ids,
                 target_ee_states=target_ee,
                 similarity=float(best_sim),
                 frame=int(best_item.get("ready_frame", 0)),

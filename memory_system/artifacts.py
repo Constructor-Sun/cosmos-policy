@@ -187,6 +187,44 @@ class ReadyDistanceMemory:
         return tuple(sorted(by_demo.values(), key=lambda item: item.demo_id))
 
 
+class Ready3DMemory:
+    """Rank ready-frame targets by distance to a live target XYZ."""
+
+    def __init__(self, path: str | Path):
+        payload = _load_artifact(path, "libero_ready3d_targets_v1")
+        self.path = Path(path)
+        self._by_phase: dict[tuple, list[dict[str, Any]]] = {}
+        for prototype in payload.get("prototypes", []):
+            key = _phase_key(
+                prototype["task_name"],
+                prototype["planner_step_id"],
+                prototype["skill"],
+                prototype.get("arguments", {}),
+            )
+            self._by_phase.setdefault(key, []).append(prototype)
+
+    def nearest(
+        self,
+        task_name: str,
+        planner_step_id: int,
+        skill: str,
+        arguments: dict[str, Any],
+        target_xyz_world: Any,
+        limit: int = 3,
+    ) -> tuple[tuple[dict[str, Any], float], ...]:
+        query = np.asarray(target_xyz_world, dtype=np.float64).reshape(3)
+        ranked = [
+            (prototype, float(np.linalg.norm(
+                np.asarray(prototype["target_xyz_world"], dtype=np.float64).reshape(3)
+                - query
+            )))
+            for prototype in self._by_phase.get(
+                _phase_key(task_name, planner_step_id, skill, arguments), []
+            )
+        ]
+        return tuple(sorted(ranked, key=lambda item: item[1])[:max(0, int(limit))])
+
+
 class PoseRecoveryMemory:
     """Index over ``libero_recovery_targets_v1``."""
 

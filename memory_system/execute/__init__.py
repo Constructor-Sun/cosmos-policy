@@ -16,6 +16,11 @@ from memory_system.execute.vla_skill_runtime import (
     make_completion,
 )
 from memory_system.execute.recovery import PoseController
+from memory_system.execute.skill_transition import (
+    SkillTransitionCoordinator,
+    SkillTransitionSession,
+    TransitionIntervention,
+)
 
 __all__ = [
     "CuroboPlanner",
@@ -25,6 +30,9 @@ __all__ = [
     "PlanResult",
     "PhaseSpec",
     "PoseController",
+    "SkillTransitionCoordinator",
+    "SkillTransitionSession",
+    "TransitionIntervention",
     "load_phase_plans",
     "load_phase_sequences",
     "SKILL_MAX_ACTION_CHUNKS",

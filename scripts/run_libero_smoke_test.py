@@ -16,6 +16,11 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.benchmark import Task
 
 
+# Read-only completion telemetry is opt-in.  Some diagnostic modules use
+# setdefault("...", "1"), so establish the production default before any of
+# those modules can be imported while preserving an explicit caller override.
+os.environ.setdefault("COSMOS_SKILL_COMPLETION_SHADOW", "0")
+
 mode = os.environ["COSMOS_SMOKE_MODE"]
 flip_images = os.environ["COSMOS_SMOKE_FLIP_IMAGES"].lower() in {"1", "true", "yes"}
 policy_dir = os.environ["COSMOS_POLICY_MODEL_DIR"]
@@ -237,57 +242,82 @@ if os.environ.get("COSMOS_HELD_OBJECT", "").lower() in {"1", "true", "yes"}:
     import numpy as np
     from scipy.spatial.transform import Rotation
 
-    from memory_system.artifacts import FeasibleRecoveryMemory
+    from memory_system.artifacts import FeasibleRecoveryMemory, Ready3DMemory
+    from memory_system.execute.skill_completion.shadow import (
+        PickTargetPointCloud,
+        resolve_target_instance,
+    )
     from memory_system.geometry import camera_params as build_camera_params
 
     _repo_root = pathlib.Path(__file__).resolve().parents[1]
     _feasible_path = _repo_root / "skill_memory_test" / "libero_10" / "feasible_recovery_targets.pt"
+    _ready3d_path = _repo_root / "skill_memory_test" / "libero_10" / "ready3d_targets.pt"
     _held_memory = FeasibleRecoveryMemory(str(_feasible_path))
+    _ready3d_memory = Ready3DMemory(str(_ready3d_path))
     _place_mode = os.environ.get("COSMOS_PLACE_MODE", "curobo").lower()
 
-    if _place_mode == "simple":
-        from memory_system.execute.planner.place_fine_aligner import PlaceFineAligner
+    def _nearest_spatial_candidates(*, task_name, phase, observation, env, cfg, log_file):
+        del cfg
+        instance = resolve_target_instance(env, phase.arguments, phase.skill)
+        height = observation["agentview_image"].shape[0]
+        points = None if instance is None else PickTargetPointCloud(
+            env, height
+        ).points(observation, instance)
+        if points is None:
+            run_libero_eval_mod.log_message(
+                f"[TARGET_3D] target unavailable ({instance}); using bound demo",
+                log_file,
+            )
+            return ()
 
-        def _held_object_hook(
-            *,
-            observation,
-            completed_phase,
-            next_phase,
+        xyz = np.median(points, axis=0)
+        ranked = _ready3d_memory.nearest(
             task_name,
-            demo_id,
-            episode_id,
-            env,
-            cfg,
-            log_file,
-        ):
-            del observation, completed_phase, env, cfg
-            run_libero_eval_mod._PLACE_ALIGNER = None
-            candidates = _held_memory.select(
+            phase.planner_step_id,
+            phase.skill,
+            phase.arguments,
+            xyz,
+        )
+        feasible = {
+            str(target["demo_id"]): target
+            for target in _held_memory.select(
                 task_name,
-                next_phase.planner_step_id,
-                next_phase.skill,
-                next_phase.arguments,
+                phase.planner_step_id,
+                phase.skill,
+                phase.arguments,
             )
-            exact = [c for c in candidates if str(c.get("demo_id")) == str(demo_id)]
-            if not exact:
-                msg = f"[PLACE_ALIGN] no exact ready pose for demo={demo_id}"
-                print(msg)
-                run_libero_eval_mod.log_message(msg, log_file)
-                return None
-            ready_pose = np.asarray(exact[0]["ee_states"], dtype=np.float64).reshape(6)
-            aligner = PlaceFineAligner(ready_pose)
-            run_libero_eval_mod._PLACE_ALIGNER = aligner
-            msg = (
-                f"[PLACE_ALIGN] simple mode armed for demo={demo_id} "
-                f"ready_pose={ready_pose.tolist()}"
-            )
-            print(msg)
-            run_libero_eval_mod.log_message(msg, log_file)
-            return None
+        }
+        candidates = tuple(
+            feasible[str(prototype["demo_id"])]
+            for prototype, _distance in ranked
+            if str(prototype["demo_id"]) in feasible
+        )
+        run_libero_eval_mod.log_message(
+            f"[TARGET_3D] xyz={xyz.round(6).tolist()} top3="
+            f"{[(str(p['demo_id']), round(d, 4)) for p, d in ranked]}",
+            log_file,
+        )
+        return candidates
 
-        run_libero_eval_mod._PHASE_TRANSITION_HOOK = _held_object_hook
-        print("[PLACE_ALIGN] simple Place fine-align mode enabled")
+    if _place_mode == "simple":
+        from memory_system.execute.skill_transition import (
+            SkillTransitionCoordinator,
+            SkillTransitionSession,
+        )
+
+        def _coordinator_factory(task_name, demo_id):
+            session = SkillTransitionSession(task_name=task_name, demo_id=demo_id)
+            return SkillTransitionCoordinator(
+                session,
+                _held_memory,
+                mode="simple",
+                spatial_candidate_selector=_nearest_spatial_candidates,
+                log=lambda msg: print(msg),
+            )
+
+        print("[PLACE_ALIGN] simple Place fine-align coordinator enabled")
     else:
+        from memory_system.execute.curobo_planner import CuroboPlanner
         from memory_system.execute.planner.held_object.connected_component import (
             HeldObjectConnectedComponentExtractor,
         )
@@ -322,10 +352,21 @@ if os.environ.get("COSMOS_HELD_OBJECT", "").lower() in {"1", "true", "yes"}:
         # Use the same GPU Warp URDF filter in HeldObjectPlanner so planning does not
         # fall back to slow CPU ray casting.
         _held_planner._urdf_filter = _held_extractor.planner._urdf_filter
+        _motion_planner = CuroboPlanner(
+            joint_execution=os.environ.get(
+                "COSMOS_CUROBO_JOINT_EXECUTION", ""
+            ).lower() in {"1", "true", "yes"},
+            enable_urdf_robot_filter=os.environ.get(
+                "COSMOS_URDF_ROBOT_FILTER", ""
+            ).lower() in {"1", "true", "yes"},
+        )
+        # Reuse the same GPU Warp URDF filter so generic motion planning also
+        # avoids slow CPU ray casting.
+        _motion_planner._urdf_filter = _held_planner._urdf_filter
         _failure_dump_dir = _repo_root / "tests" / "held_object" / "k6_pick_place_integration"
-        _debug_enabled = os.environ.get("COSMOS_HELD_OBJECT_DEBUG", "1").lower() in {"1", "true", "yes"}
+        _debug_enabled = os.environ.get("COSMOS_HELD_OBJECT_DEBUG", "0").lower() in {"1", "true", "yes"}
 
-        def _dump_held_object_image(observation, env, cfg, debug, tag, task_name, episode_id):
+        def _dump_held_object_image(observation, env, cfg, debug, tag, task_name, episode_id, prefix="i_planner", label="HeldObjectPlanner"):
             from memory_system.geometry import world_to_pixel
 
             _failure_dump_dir.mkdir(parents=True, exist_ok=True)
@@ -487,29 +528,37 @@ if os.environ.get("COSMOS_HELD_OBJECT", "").lower() in {"1", "true", "yes"}:
                 draw(
                     ax,
                     show_legend=(idx == 1),
-                    title=f"HeldObjectPlanner {tag} - {name}",
+                    title=f"{label} {tag} - {name}",
                 )
                 ax.view_init(elev=elev, azim=azim)
-            fig.suptitle(f"HeldObjectPlanner {tag} point cloud", fontsize=14)
+            fig.suptitle(f"{label} {tag} point cloud", fontsize=14)
             safe_task = str(task_name).replace("/", "_").replace(" ", "_")
-            out_png = _failure_dump_dir / f"i_planner_{tag}_{safe_task}_ep{episode_id}_multiview.png"
+            out_png = _failure_dump_dir / f"{prefix}_{tag}_{safe_task}_ep{episode_id}_multiview.png"
             fig.savefig(out_png, dpi=150, bbox_inches="tight")
             plt.close(fig)
             print(f"[HELD_OBJECT] saved {tag} point cloud image to {out_png}")
 
-        def _held_object_hook(
-            *,
-            observation,
-            completed_phase,
-            next_phase,
-            task_name,
-            demo_id,
-            episode_id,
-            env,
-            cfg,
-            log_file,
-        ):
-            item = completed_phase.arguments.get("item") or "white_yellow_mug_1"
+        def _dump_motion_planner_image(observation, env, cfg, debug, tag, task_name, episode_id):
+            debug = dict(debug)
+            debug.setdefault("points_hand", np.zeros((0, 3), dtype=np.float64))
+            debug.setdefault("p0", np.zeros(3, dtype=np.float64))
+            debug.setdefault("r0", np.eye(3, dtype=np.float64))
+            try:
+                _dump_held_object_image(
+                    observation,
+                    env,
+                    cfg,
+                    debug,
+                    tag,
+                    task_name,
+                    episode_id,
+                    prefix="i_motion",
+                    label="MotionPlanner",
+                )
+            except Exception as exc:
+                print(f"[MOTION_PLANNER] failed to dump {tag} point cloud: {exc}")
+
+        def _held_extract(*, observation, env, cfg, item):
             height, width = observation["agentview_image"].shape[:2]
             camera = build_camera_params(env.sim, "agentview", height, width)
             depth = run_libero_eval_mod._make_main_depth(observation, camera, cfg.flip_images)
@@ -529,29 +578,32 @@ if os.environ.get("COSMOS_HELD_OBJECT", "").lower() in {"1", "true", "yes"}:
             if held is None:
                 msg = f"[HELD_OBJECT] extract failed for {item}"
                 print(msg)
-                run_libero_eval_mod.log_message(msg, log_file)
-                return None
+            return held
 
-            candidates = _held_memory.select(
-                task_name,
-                next_phase.planner_step_id,
-                next_phase.skill,
-                next_phase.arguments,
-            )
-            exact = [c for c in candidates if str(c.get("demo_id")) == str(demo_id)]
-            if not exact:
-                msg = f"[HELD_OBJECT] no exact ready pose for demo={demo_id}"
-                print(msg)
-                run_libero_eval_mod.log_message(msg, log_file)
-                return None
-
-            ready_pose = np.asarray(exact[0]["ee_states"], dtype=np.float64).reshape(6)
+        def _held_plan(
+            *,
+            held,
+            ready_pose,
+            observation,
+            env,
+            cfg,
+            task_name,
+            demo_id,
+            episode_id,
+            log_file,
+        ):
+            height, width = observation["agentview_image"].shape[:2]
+            camera = build_camera_params(env.sim, "agentview", height, width)
+            depth = run_libero_eval_mod._make_main_depth(observation, camera, cfg.flip_images)
             current_ee = np.concatenate(
                 [
                     observation["robot0_eef_pos"],
                     Rotation.from_quat(observation["robot0_eef_quat"]).as_rotvec(),
                 ]
             ).astype(np.float32)
+            robot_base_pose = np.concatenate(
+                [env.robots[0].base_pos, env.robots[0].base_ori]
+            ).astype(np.float64)
 
             inp = HeldObjectPlannerInput(
                 joint_positions=observation["robot0_joint_pos"],
@@ -565,7 +617,7 @@ if os.environ.get("COSMOS_HELD_OBJECT", "").lower() in {"1", "true", "yes"}:
             )
             result = _held_planner.plan(inp)
             if result is None:
-                msg = "[HELD_OBJECT] HeldObjectPlanner failed"
+                msg = f"[HELD_OBJECT] HeldObjectPlanner failed demo={demo_id}"
                 if getattr(_held_planner, "last_failure", None):
                     msg += f": {_held_planner.last_failure}"
                 print(msg)
@@ -576,7 +628,12 @@ if os.environ.get("COSMOS_HELD_OBJECT", "").lower() in {"1", "true", "yes"}:
                     except Exception as exc:
                         print(f"[HELD_OBJECT] failed to dump failure point cloud: {exc}")
             else:
-                msg = f"[HELD_OBJECT] plan ok waypoints={len(result.waypoints)}"
+                msg = (
+                    f"[HELD_OBJECT] plan ok demo={demo_id} "
+                    f"waypoints={len(result.waypoints)} "
+                    f"target_ee={np.asarray(result.target_ee_states, dtype=np.float64).round(6).tolist()} "
+                    f"last_wp={np.asarray(result.waypoints[-1], dtype=np.float64).round(6).tolist()}"
+                )
                 print(msg)
                 run_libero_eval_mod.log_message(msg, log_file)
                 if _debug_enabled and getattr(_held_planner, "last_debug", None):
@@ -586,8 +643,71 @@ if os.environ.get("COSMOS_HELD_OBJECT", "").lower() in {"1", "true", "yes"}:
                         print(f"[HELD_OBJECT] failed to dump success point cloud: {exc}")
             return result
 
-        run_libero_eval_mod._PHASE_TRANSITION_HOOK = _held_object_hook
-        print("[HELD_OBJECT] held-object Pick->Place pipeline enabled")
+        def _motion_plan(
+            *,
+            ready_pose,
+            observation,
+            env,
+            cfg,
+            task_name,
+            demo_id,
+            episode_id,
+            log_file,
+        ):
+            del log_file
+            height, width = observation["agentview_image"].shape[:2]
+            camera = build_camera_params(env.sim, "agentview", height, width)
+            depth = run_libero_eval_mod._make_main_depth(observation, camera, cfg.flip_images)
+            current_ee = np.concatenate(
+                [
+                    observation["robot0_eef_pos"],
+                    Rotation.from_quat(observation["robot0_eef_quat"]).as_rotvec(),
+                ]
+            ).astype(np.float32)
+            robot_base_pose = np.concatenate(
+                [env.robots[0].base_pos, env.robots[0].base_ori]
+            ).astype(np.float64)
+            result = _motion_planner.plan(
+                current_ee_states=current_ee,
+                target_ee_states=np.asarray(ready_pose, dtype=np.float64).reshape(6),
+                depth=depth,
+                camera_params=camera,
+                joint_positions=observation["robot0_joint_pos"],
+                gripper_joint_positions=observation.get("robot0_gripper_qpos"),
+                robot_base_pose=robot_base_pose,
+            )
+            if _debug_enabled and getattr(_motion_planner, "last_debug", None):
+                tag = "success" if result is not None else "failure"
+                _dump_motion_planner_image(
+                    observation,
+                    env,
+                    cfg,
+                    _motion_planner.last_debug,
+                    tag,
+                    task_name,
+                    episode_id,
+                )
+            return result
+
+        from memory_system.execute.skill_transition import (
+            SkillTransitionCoordinator,
+            SkillTransitionSession,
+        )
+
+        def _coordinator_factory(task_name, demo_id):
+            session = SkillTransitionSession(task_name=task_name, demo_id=demo_id)
+            return SkillTransitionCoordinator(
+                session,
+                _held_memory,
+                mode="curobo",
+                held_extractor=_held_extract,
+                held_planner=_held_plan,
+                motion_planner=_motion_plan,
+                spatial_candidate_selector=_nearest_spatial_candidates,
+                log=lambda msg: print(msg),
+            )
+
+        print("[HELD_OBJECT] held-object skill transition coordinator enabled")
 
 
 def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/logs"):
@@ -704,7 +824,10 @@ def run_eval_with_task_filter(
             run_id_note=run_id_note,
             local_log_dir=local_log_dir,
         )
-        return eval_libero.__wrapped__(cfg)
+        return eval_libero.__wrapped__(
+            cfg,
+            coordinator_factory=globals().get("_coordinator_factory"),
+        )
     finally:
         suite_class.__init__ = original_init
         gc.collect()

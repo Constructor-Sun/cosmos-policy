@@ -18,6 +18,7 @@ from memory_system.artifacts import (
     FeasibleRecoveryMemory,
     PhaseTargetMemory,
     PoseRecoveryMemory,
+    Ready3DMemory,
     ReadyDistanceMemory,
     WristCompletionMemory,
     WristFeasibleMemory,
@@ -114,6 +115,39 @@ class MemorySystemArtifactTest(unittest.TestCase):
         prototypes = memory.select("task", 1, "Pick", {"item": "object_1"})
         self.assertEqual(len(prototypes), 2)
         self.assertEqual(prototypes[0].normalized_distance, 0.5)
+
+    def test_ready3d_memory_returns_nearest_exact_phase(self) -> None:
+        path = self.root / "ready3d_targets.pt"
+        prototypes = [
+            {
+                "task_name": "task",
+                "demo_id": demo_id,
+                "planner_step_id": step,
+                "skill": "PlaceOn",
+                "arguments": {"item": "mug", "target": "plate"},
+                "target_xyz_world": np.array(xyz),
+            }
+            for demo_id, step, xyz in (
+                ("demo_0", 2, [0.0, 0.0, 0.0]),
+                ("demo_1", 2, [0.2, 0.0, 0.0]),
+                ("wrong_step", 3, [0.19, 0.0, 0.0]),
+            )
+        ]
+        torch.save(
+            {"format": "libero_ready3d_targets_v1", "prototypes": prototypes},
+            path,
+        )
+
+        ranked = Ready3DMemory(path).nearest(
+            "task",
+            2,
+            "PlaceOn",
+            {"item": "mug", "target": "plate"},
+            [0.19, 0.0, 0.0],
+        )
+
+        self.assertEqual([item[0]["demo_id"] for item in ranked], ["demo_1", "demo_0"])
+        self.assertAlmostEqual(ranked[0][1], 0.01)
 
     def test_pose_recovery_memory_loads_and_selects(self) -> None:
         path = self.root / "recovery_targets.pt"

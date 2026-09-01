@@ -42,6 +42,36 @@ def patch_numpy2_segmentation() -> None:
     binding.MjRenderContext.read_pixels = read_pixels
 
 
+def resolve_target_instance(
+    env: Any, arguments: dict[str, Any], skill: str
+) -> str | None:
+    """Resolve a Pick item or Place target to a visible instance name."""
+    argument = str(arguments.get("item" if skill == "Pick" else "target", ""))
+    instances = getattr(env, "instance_to_id", {})
+    if argument in instances:
+        return argument
+    normalized = argument.lower().replace("_", "")
+    matches = [
+        name for name in instances
+        if name.lower().replace("_", "") == normalized
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    matches = [
+        name for name in instances
+        if normalized in name.lower().replace("_", "")
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    anchors = []
+    for name in instances:
+        stem, suffix = name.rsplit("_", 1) if "_" in name else (name, "")
+        token = (stem if suffix.isdigit() else name).lower().replace("_", "")
+        if len(token) >= 4 and token in normalized:
+            anchors.append((len(token), name))
+    return max(anchors)[1] if anchors else None
+
+
 class PickTargetPointCloud:
     """Extract the visible 3-D cloud for a memory Pick item."""
 

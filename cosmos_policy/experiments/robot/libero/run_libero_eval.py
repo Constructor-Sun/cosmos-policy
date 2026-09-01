@@ -329,6 +329,7 @@ def _create_initial_alignment_selector(cfg: PolicyEvalConfig):
     memory_dir = _REPO_ROOT / "skill_memory_test" / "libero_10"
     segments_manifest = memory_dir / "segments_ready_fixed16.json"
     feasible_recovery_targets = memory_dir / "feasible_recovery_targets.pt"
+    ready3d_targets = memory_dir / "ready3d_targets.pt"
     missing = [
         path for path in (segments_manifest, feasible_recovery_targets)
         if not path.exists()
@@ -349,6 +350,7 @@ def _create_initial_alignment_selector(cfg: PolicyEvalConfig):
     return InitialAlignmentSelector(
         segments_manifest,
         feasible_recovery_targets,
+        ready3d_targets=ready3d_targets if ready3d_targets.exists() else None,
         planner=planner,
     )
 
@@ -424,6 +426,7 @@ def run_episode(
     alignment_task_name=None,
     initial_alignment_selector=None,
     phase_transition_hook=None,
+    coordinator_factory=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -481,12 +484,20 @@ def run_episode(
     # memory demo, and it observes VLA actions only (never planner actions).
     skill_runtime = None
     pick_point_cloud = None
+    session = None
+    coordinator = None
 
     def _begin_vla_window(frame: int) -> None:
         if skill_runtime is None or skill_runtime.active or skill_runtime.exhausted:
             return
         try:
-            phase = skill_runtime.begin_vla(frame=frame)
+            initially_holding = (
+                session.held_item is not None if session is not None else False
+            )
+            phase = skill_runtime.begin_vla(
+                frame=frame,
+                initially_holding=initially_holding,
+            )
             log_message(
                 f"[SKILL_COMPLETION] VLA start phase={skill_runtime.phase_index} "
                 f"skill={phase.skill} args={phase.arguments} demo={skill_runtime.demo_id}",
@@ -521,12 +532,19 @@ def run_episode(
             return None
         phase = skill_runtime.active_phase
         action_array = np.asarray(action, dtype=np.float64).reshape(-1)
+        gripper_qpos = observation.get("robot0_gripper_qpos")
+        if gripper_qpos is None:
+            log_message(
+                "[SKILL_COMPLETION] WARNING active gripper_qpos missing; "
+                "Place completion will rely on timeout",
+                log_file,
+            )
         decision = skill_runtime.observe_vla_frame(
             target_points=_active_vla_points(observation, phase),
             eef_pos=observation.get("robot0_eef_pos"),
             eef_quat=observation.get("robot0_eef_quat"),
             gripper_closed=bool(action_array[-1] > 0.0) if len(action_array) else False,
-            gripper_qpos=observation.get("robot0_gripper_qpos"),
+            gripper_qpos=gripper_qpos,
             frame=frame,
         )
         if decision.advance:
@@ -592,6 +610,7 @@ def run_episode(
         nonlocal _alignment_steps_remaining
         nonlocal _alignment_controller, _alignment_step_index
         nonlocal alignment_gripper_action, action_queue
+        nonlocal session, coordinator
         if initial_alignment_selector is None or _initial_align_attempted:
             return
         # Trigger before the first policy action is executed.
@@ -628,7 +647,17 @@ def run_episode(
                 joint_positions=joint_positions,
                 gripper_joint_positions=obs.get("robot0_gripper_qpos"),
                 robot_base_pose=robot_base_pose,
+                observation=obs,
+                env=env,
             )
+            spatial_match = initial_alignment_selector.last_spatial_match
+            if spatial_match is not None:
+                xyz, ranked = spatial_match
+                log_message(
+                    f"[INIT ALIGN 3D] xyz={np.asarray(xyz).round(6).tolist()} "
+                    f"top3={[(str(p['demo_id']), round(d, 4)) for p, d in ranked]}",
+                    log_fh,
+                )
         except Exception as exc:
             log_message(
                 f"[INIT ALIGN] t={t_now}: error selecting target: {exc}",
@@ -670,6 +699,12 @@ def run_episode(
                     demo_id=demo_id,
                     episode_id=episode_index,
                 )
+                if coordinator_factory is not None:
+                    coordinator = coordinator_factory(
+                        alignment_task_name,
+                        demo_id,
+                    )
+                    session = coordinator.session
                 log_message(
                     f"[SKILL_COMPLETION] active sequence loaded: demo={demo_id} "
                     f"phases={len(sequence)}",
@@ -728,14 +763,47 @@ def run_episode(
     def _maybe_run_phase_transition_hook(decision, observation, frame):
         nonlocal _alignment_controller, _alignment_steps_remaining
         nonlocal _alignment_step_index, alignment_gripper_action
-        hook = phase_transition_hook or _PHASE_TRANSITION_HOOK
-        if hook is None or decision is None or not decision.advance:
+        if decision is None or not decision.advance:
             return
         if skill_runtime is None or skill_runtime.phase_index < 1:
             return
         completed_phase = skill_runtime.phases[skill_runtime.phase_index - 1]
         next_phase = skill_runtime.active_phase
         if completed_phase is None or next_phase is None:
+            return
+
+        if coordinator is not None:
+            try:
+                intervention = coordinator.on_phase_advance(
+                    observation=observation,
+                    completed_phase=completed_phase,
+                    next_phase=next_phase,
+                    env=env,
+                    cfg=cfg,
+                    log_file=log_file,
+                    episode_id=episode_index,
+                )
+            except Exception as exc:
+                log_message(f"[SKILL_TRANSITION] coordinator failed: {exc}", log_file)
+                return
+            if intervention is None:
+                return
+            if intervention.controller is not None:
+                _alignment_controller = intervention.controller
+                _alignment_steps_remaining = int(intervention.step_budget)
+                _alignment_step_index = 0
+                alignment_gripper_action = float(intervention.gripper_action)
+                action_queue.clear()
+                log_message(
+                    f"[SKILL_TRANSITION] t={frame}: intervention armed "
+                    f"kind={intervention.kind} steps={_alignment_steps_remaining}",
+                    log_file,
+                )
+            return
+
+        # Legacy hook fallback for existing held-object integration.
+        hook = phase_transition_hook or _PHASE_TRANSITION_HOOK
+        if hook is None:
             return
         if completed_phase.skill != "Pick" or next_phase.skill not in {"PlaceIn", "PlaceOn"}:
             return
@@ -772,7 +840,7 @@ def run_episode(
     def _maybe_start_place_fine_alignment(obs, frame):
         nonlocal _alignment_controller, _alignment_steps_remaining
         nonlocal _alignment_step_index, alignment_gripper_action
-        aligner = _PLACE_ALIGNER
+        aligner = session.pending_place_aligner if session is not None else None
         if aligner is None or _alignment_controller is not None:
             return
         if skill_runtime is None or not skill_runtime.active:
@@ -945,7 +1013,9 @@ def run_episode(
                     _alignment_step_index = 0
                     log_message(
                         f"[INIT ALIGN] t={t}: alignment finished; "
-                        f"status={getattr(_finished_controller, 'status', 'completed')}; resuming policy",
+                        f"status={getattr(_finished_controller, 'status', 'completed')}; resuming policy "
+                        f"eef_pos={np.asarray(obs['robot0_eef_pos'], dtype=np.float64).round(6).tolist()} "
+                        f"eef_quat={np.asarray(obs['robot0_eef_quat'], dtype=np.float64).round(6).tolist()}",
                         log_file,
                     )
                     _begin_vla_window(t + 1)
@@ -1214,7 +1284,9 @@ def run_episode(
                 _alignment_step_index = 0
                 log_message(
                     f"[INIT ALIGN] t={t}: alignment finished; "
-                    f"status={getattr(_finished_controller, 'status', 'completed')}; resuming policy",
+                    f"status={getattr(_finished_controller, 'status', 'completed')}; resuming policy "
+                    f"eef_pos={np.asarray(obs['robot0_eef_pos'], dtype=np.float64).round(6).tolist()} "
+                    f"eef_quat={np.asarray(obs['robot0_eef_quat'], dtype=np.float64).round(6).tolist()}",
                     log_file,
                 )
                 _begin_vla_window(t + 1)
@@ -1317,6 +1389,7 @@ def run_task(
     log_file=None,
     initial_alignment_selector=None,
     phase_transition_hook=None,
+    coordinator_factory=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -1383,6 +1456,7 @@ def run_task(
             alignment_task_name=alignment_task_name,
             initial_alignment_selector=initial_alignment_selector,
             phase_transition_hook=phase_transition_hook,
+            coordinator_factory=coordinator_factory,
         )
 
         # Update counters
@@ -1476,7 +1550,11 @@ def run_task(
 
 
 @draccus.wrap()
-def eval_libero(cfg: PolicyEvalConfig) -> float:
+def eval_libero(
+    cfg: PolicyEvalConfig,
+    *,
+    coordinator_factory=None,
+) -> float:
     """Main function to evaluate a trained policy on LIBERO benchmark tasks."""
 
     # Set DETERMINISTIC environment variable if on deterministic mode (makes some model operations deterministic)
@@ -1605,6 +1683,7 @@ def eval_libero(cfg: PolicyEvalConfig) -> float:
             total_successes,
             log_file,
             initial_alignment_selector=initial_alignment_selector,
+            coordinator_factory=coordinator_factory,
         )
 
     # Calculate final success rate

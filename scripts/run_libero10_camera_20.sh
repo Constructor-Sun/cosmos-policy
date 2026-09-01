@@ -14,7 +14,7 @@
 #   sh scripts/run_libero10_camera_20.sh
 #
 # Useful overrides:
-#   GPU_ID=5 NUM_CASES=10 SEED=7 OUTPUT_ROOT=/path ROLLOUT_SUBDIR=camera \
+#   GPU_IDS="0 1 2 3" NUM_CASES=10 SEED=7 OUTPUT_ROOT=/path ROLLOUT_SUBDIR=camera \
 #     COSMOS_INIT_STATE_OFFSET=0 sh scripts/run_libero10_camera_20.sh
 #
 # Scope:
@@ -32,12 +32,21 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 # Defaults
 # ---------------------------------------------------------------------------
 GPU_ID=${GPU_ID:-${ROBOTINIT_GPU:-7}}
+GPU_IDS=${GPU_IDS:-"0 1 2 3"}
+MAX_PARALLEL=${MAX_PARALLEL:-4}
 NUM_CASES=${NUM_CASES:-20}
 SEED=${SEED:-7}
 TASK_SCOPE=${TASK_SCOPE:-all}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_camera_20}
 ROLLOUT_SUBDIR=${ROLLOUT_SUBDIR:-camera}
 COSMOS_INIT_STATE_OFFSET=${COSMOS_INIT_STATE_OFFSET:-0}
+COSMOS_INITIAL_ALIGNMENT=${COSMOS_INITIAL_ALIGNMENT:-1}
+COSMOS_HELD_OBJECT=${COSMOS_HELD_OBJECT:-1}
+COSMOS_PLACE_MODE=${COSMOS_PLACE_MODE:-curobo}
+COSMOS_SKILL_COMPLETION_ACTIVE=${COSMOS_SKILL_COMPLETION_ACTIVE:-1}
+COSMOS_CUROBO_JOINT_EXECUTION=${COSMOS_CUROBO_JOINT_EXECUTION:-0}
+COSMOS_URDF_ROBOT_FILTER=${COSMOS_URDF_ROBOT_FILTER:-1}
+COSMOS_HELD_OBJECT_DEBUG=${COSMOS_HELD_OBJECT_DEBUG:-0}
 SMOKE_GL_BACKEND=${SMOKE_GL_BACKEND:-egl}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/scripts/run_libero_smoke_test.py}
 
@@ -92,20 +101,48 @@ fi
 
 mkdir -p "$OUTPUT_ROOT"
 
+_n_gpus=0
+for _g in $GPU_IDS; do _n_gpus=$((_n_gpus+1)); done
+if [ "$_n_gpus" -eq 0 ]; then
+    echo "ERROR: GPU_IDS is empty" >&2
+    exit 1
+fi
+_gpu_index=0
+_jobs=0
+
 echo "======================================================"
 echo "LIBERO-10 camera_viewpoints evaluation (no clean)"
 echo "Output root : $OUTPUT_ROOT"
-echo "GPU_ID      : $GPU_ID"
+echo "GPU_IDS     : $GPU_IDS"
 echo "NUM_CASES   : $NUM_CASES"
 echo "SEED        : $SEED"
 echo "TASK_SCOPE  : $TASK_SCOPE"
+echo "InitAlign   : $COSMOS_INITIAL_ALIGNMENT"
+echo "PlaceMode   : $COSMOS_PLACE_MODE"
 echo "======================================================"
 
 # ---------------------------------------------------------------------------
-# Run camera perturbations.
+# Run camera perturbations in parallel across GPU_IDS.
 # ---------------------------------------------------------------------------
-printf '%s\n' "$RUN_PLAN" | while IFS='|' read -r task language pert_name pert_category pert_task variant_tag variant_display; do
+_run_plan_file=$(mktemp)
+printf '%s\n' "$RUN_PLAN" > "$_run_plan_file"
+
+while IFS='|' read -r task language pert_name pert_category pert_task variant_tag variant_display; do
     [ -z "$task" ] && continue
+
+    _gpu=""
+    _i=0
+    for _g in $GPU_IDS; do
+        if [ "$_i" -eq "$_gpu_index" ]; then
+            _gpu=$_g
+            break
+        fi
+        _i=$((_i + 1))
+    done
+    if [ -z "$_gpu" ]; then
+        _gpu=$GPU_ID
+    fi
+    _gpu_index=$(( (_gpu_index + 1) % _n_gpus ))
 
     pert_dir="$OUTPUT_ROOT/$task/$pert_name"
     mkdir -p "$pert_dir"
@@ -113,15 +150,23 @@ printf '%s\n' "$RUN_PLAN" | while IFS='|' read -r task language pert_name pert_c
     echo ""
     echo "=== $pert_name: $task ==="
     echo "    variant: $variant_display"
+    echo "    gpu: $_gpu"
     echo "    results: $pert_dir"
 
     (
         cd "$REPO_ROOT"
+        COSMOS_INITIAL_ALIGNMENT="$COSMOS_INITIAL_ALIGNMENT" \
+        COSMOS_HELD_OBJECT="$COSMOS_HELD_OBJECT" \
+        COSMOS_PLACE_MODE="$COSMOS_PLACE_MODE" \
+        COSMOS_SKILL_COMPLETION_ACTIVE="$COSMOS_SKILL_COMPLETION_ACTIVE" \
+        COSMOS_CUROBO_JOINT_EXECUTION="$COSMOS_CUROBO_JOINT_EXECUTION" \
+        COSMOS_URDF_ROBOT_FILTER="$COSMOS_URDF_ROBOT_FILTER" \
+        COSMOS_HELD_OBJECT_DEBUG="$COSMOS_HELD_OBJECT_DEBUG" \
         COSMOS_ROLLOUT_SUBDIR="$ROLLOUT_SUBDIR" \
         COSMOS_SKIP_PLAIN_ROLLOUT=1 \
         COSMOS_INIT_STATE_OFFSET="$COSMOS_INIT_STATE_OFFSET" \
         SMOKE_PYTHON_SCRIPT="$SMOKE_PYTHON_SCRIPT" \
-        GPU_ID="$GPU_ID" \
+        GPU_ID="$_gpu" \
         SMOKE_GL_BACKEND="$SMOKE_GL_BACKEND" \
         SMOKE_ONLY_CONDITION=perturb \
         SMOKE_PAIR_SUITE=libero_10 \
@@ -133,12 +178,20 @@ printf '%s\n' "$RUN_PLAN" | while IFS='|' read -r task language pert_name pert_c
         SMOKE_NUM_PAIRS="$NUM_CASES" \
         SMOKE_SEED="$SEED" \
         SMOKE_RESULTS_DIR="$pert_dir" \
-        SMOKE_RUN_ID="camera_${variant_tag}_gpu${GPU_ID}_${task}" \
+        SMOKE_RUN_ID="camera_${variant_tag}_gpu${_gpu}_${task}" \
         sh "$REPO_ROOT/scripts/run_libero_smoke_test.sh" > "$pert_dir/run.log" 2>&1
-    )
+    ) &
+    _jobs=$((_jobs + 1))
 
-    echo "    finished: $pert_dir"
-done
+    if [ "$_jobs" -ge "$MAX_PARALLEL" ]; then
+        wait
+        _jobs=0
+    fi
+done < "$_run_plan_file"
+
+rm -f "$_run_plan_file"
+
+wait
 
 echo ""
 echo "All LIBERO-10 camera evaluations complete."

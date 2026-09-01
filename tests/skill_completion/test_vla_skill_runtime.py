@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from memory_system.execute.plan import PhaseSpec, load_phase_sequences
+from memory_system.execute.skill_completion import ReleaseSkillCompletion
 from memory_system.execute.vla_skill_runtime import (
     SKILL_MAX_ACTION_CHUNKS,
     VLASkillRuntime,
@@ -75,6 +76,39 @@ class VLASkillRuntimeTest(unittest.TestCase):
         self.assertEqual(SKILL_MAX_ACTION_CHUNKS["Pick"], 7)
         self.assertEqual(SKILL_MAX_ACTION_CHUNKS["PlaceOn"], 3)
         self.assertEqual(make_completion(PhaseSpec(1, "Open", {})).max_action_chunks, 3)
+
+    def test_place_uses_release_completion_and_initially_holding(self) -> None:
+        phase = PhaseSpec(2, "PlaceIn", {"item": "a"})
+        runtime = VLASkillRuntime((phase,), demo_id="demo_0")
+        runtime.begin_vla(frame=0, initially_holding=True)
+        self.assertIsInstance(runtime.completion, ReleaseSkillCompletion)
+        self.assertTrue(runtime.completion.closed_confirmed)
+
+    def test_place_release_rule_advances_after_open_frames(self) -> None:
+        phase = PhaseSpec(2, "PlaceIn", {"item": "a"})
+        runtime = VLASkillRuntime((phase,), demo_id="demo_0")
+        runtime.begin_vla(frame=0, initially_holding=True)
+        for _ in range(4):
+            self.assertFalse(
+                runtime.observe_vla_frame(gripper_closed=False, frame=1).advance
+            )
+        decision = runtime.observe_vla_frame(gripper_closed=False, frame=2)
+        self.assertTrue(decision.advance)
+        self.assertEqual(decision.reason, "rule")
+
+    def test_place_timeout_via_runtime(self) -> None:
+        phase = PhaseSpec(2, "PlaceIn", {"item": "a"})
+        runtime = VLASkillRuntime((phase,), demo_id="demo_0")
+        runtime.begin_vla(frame=0, initially_holding=True)
+        self.assertFalse(runtime.finish_action_chunk(frame=1).advance)
+        self.assertFalse(runtime.finish_action_chunk(frame=1).advance)
+        decision = runtime.finish_action_chunk(frame=2)
+        self.assertTrue(decision.advance)
+        self.assertEqual(decision.reason, "timeout")
+
+    def test_make_completion_rejects_unknown_skill(self) -> None:
+        with self.assertRaises(KeyError):
+            make_completion(PhaseSpec(1, "Unknown", {}))
 
 
 if __name__ == "__main__":

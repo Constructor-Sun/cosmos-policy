@@ -426,7 +426,7 @@ class HeldObjectPlanner:
                         goal_tool_poses=GoalToolPose.from_poses(
                             {tool_frame: cgoal.unsqueeze(1)}, ordered_tool_frames=[tool_frame]
                         ),
-                        max_attempts=5,
+                        max_attempts=3,
                     )
                     if outcome is None or not bool(torch.as_tensor(outcome.success).any().item()):
                         print(f"[HeldObjectPlanner] backoff={distance:.4f}: cuRobo plan_pose failed")
@@ -441,15 +441,21 @@ class HeldObjectPlanner:
                         torch.as_tensor(dense, device=self.device, dtype=torch.float32),
                         joint_names=planner.joint_names,
                     )
+                    trajectory_spheres = (
+                        planner.compute_kinematics(state)
+                        .robot_spheres.detach()
+                        .cpu()
+                        .numpy()
+                    )
                     conflict = find_trajectory_conflict(
                         surface_points,
-                        planner.compute_kinematics(state).robot_spheres.detach().cpu().numpy(),
+                        trajectory_spheres,
                         self.path_safety_margin,
                     )
                     if conflict is None:
                         min_info = find_trajectory_conflict(
                             surface_points,
-                            planner.compute_kinematics(state).robot_spheres.detach().cpu().numpy(),
+                            trajectory_spheres,
                             self.path_safety_margin,
                             return_min_clearance=True,
                         )

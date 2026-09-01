@@ -79,12 +79,13 @@ def test_backoff_search_keeps_direct_goal_when_feasible():
 
 
 def test_backoff_search_finds_and_refines_first_feasible_interval():
+    threshold = 0.0133
     result = find_minimum_feasible_backoff(
-        lambda distance: distance if distance >= 0.0133 else None
+        lambda distance: distance if distance >= threshold else None
     )
     assert result is not None
     distance, plan = result
-    assert 0.0133 <= distance <= 0.0143
+    assert threshold <= distance <= threshold + 0.005
     assert plan == distance
 
 

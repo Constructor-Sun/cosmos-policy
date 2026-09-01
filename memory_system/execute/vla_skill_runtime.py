@@ -10,11 +10,10 @@ from typing import Any, Iterable
 
 from memory_system.execute.plan import PhaseSpec
 from memory_system.execute.skill_completion import (
+    COMPLETION_REGISTRY,
     DEFAULT_MAX_ACTION_CHUNKS,
-    PickSkillCompletion,
     SkillDecision,
     TimedSkillCompletion,
-    TimeoutOnlySkillCompletion,
 )
 
 SKILL_MAX_ACTION_CHUNKS: dict[str, int] = {
@@ -27,12 +26,26 @@ SKILL_MAX_ACTION_CHUNKS: dict[str, int] = {
 }
 
 
-def make_completion(phase: PhaseSpec) -> TimedSkillCompletion:
-    """Construct the checker configured for one memory phase."""
+def make_completion(
+    phase: PhaseSpec,
+    *,
+    initially_holding: bool = False,
+) -> TimedSkillCompletion:
+    """Construct the checker configured for one memory phase.
+
+    Unknown skills are rejected instead of silently falling back to a generic
+    timeout checker.
+    """
     budget = SKILL_MAX_ACTION_CHUNKS.get(phase.skill, DEFAULT_MAX_ACTION_CHUNKS)
-    if phase.skill == "Pick":
-        return PickSkillCompletion(max_action_chunks=budget)
-    return TimeoutOnlySkillCompletion(max_action_chunks=budget)
+    cls = COMPLETION_REGISTRY.get(phase.skill)
+    if cls is None:
+        raise KeyError(f"Unknown skill completion: {phase.skill!r}")
+    if phase.skill in {"PlaceIn", "PlaceOn"}:
+        return cls(
+            max_action_chunks=budget,
+            closed_confirmed=initially_holding,
+        )
+    return cls(max_action_chunks=budget)
 
 
 class VLASkillRuntime:
@@ -87,14 +100,22 @@ class VLASkillRuntime:
     def summaries(self) -> tuple[dict[str, Any], ...]:
         return tuple(dict(summary) for summary in self._summaries)
 
-    def begin_vla(self, *, frame: int | None = None) -> PhaseSpec:
+    def begin_vla(
+        self,
+        *,
+        frame: int | None = None,
+        initially_holding: bool = False,
+    ) -> PhaseSpec:
         """Activate the current phase and reset its completion state."""
         phase = self.active_phase
         if phase is None:
             raise RuntimeError("memory phase sequence is exhausted")
         if self._active:
             raise RuntimeError("current VLA phase is already active")
-        self._completion = make_completion(phase)
+        self._completion = make_completion(
+            phase,
+            initially_holding=initially_holding,
+        )
         # Make the lifecycle contract explicit even though construction resets.
         self._completion.reset()
         self._active = True
