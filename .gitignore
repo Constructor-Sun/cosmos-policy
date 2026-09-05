@@ -16,3 +16,12 @@ skill_memory_test/
 *.log
 *.png
 *.jpg
+*.json
+
+# pointcloud_action
+memory_system/pointcloud_action/*.pt
+memory_system/pointcloud_action/*.pt.bak
+memory_system/pointcloud_action/generated_*/
+memory_system/pointcloud_action/**/*.bak
+memory_system/pointcloud_action/**/*.jsonl
+memory_system/pointcloud_action/**/*.mp4
