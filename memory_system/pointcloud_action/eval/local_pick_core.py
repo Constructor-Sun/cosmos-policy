@@ -58,6 +58,7 @@ def run_local_pick(
     top_k: int = 1,
     max_steps: int = 200,
     stable_hold_steps: int = 20,
+    post_replay_lift_steps: int = 12,
     move_to_ready: bool = True,
     init_at_ready: bool = False,
     save_video: str | None = None,
@@ -77,6 +78,9 @@ def run_local_pick(
         max_steps: Maximum execution steps.
         stable_hold_steps: After Pick replay, keep the gripper closed for this
             many steps before checking stable Pick success.
+        post_replay_lift_steps: After Pick replay, execute this many steps of
+            vertical +5 cm/step (commanded) lift with the gripper closed.
+            Compensates memory chunks that end at the grasp without a lift.
         move_to_ready: If True, run the ready-motion planner before replay.
         init_at_ready: If True, directly IK to the mapped ready pose instead of
             running the ready-motion planner.  Useful only as a diagnostic.
@@ -167,6 +171,23 @@ def run_local_pick(
     pos_after_replay = object_position(env.env, item)
     lift_after_replay = float(pos_after_replay[2] - start_pos[2])
     grasping_after_replay = bool(is_grasping(env.env, item))
+
+    # Scripted post-replay lift: some memory chunks end at the grasp without a
+    # lift segment, so raise the gripper vertically with the gripper closed
+    # before the stability hold.  The +1.0 z command maps to the OSC +5 cm
+    # per-step delta; realization is partial, hence the step count.
+    if post_replay_lift_steps > 0:
+        lift_action = np.zeros(7, dtype=np.float32)
+        lift_action[2] = 1.0
+        lift_action[-1] = 1.0
+        for _ in range(int(post_replay_lift_steps)):
+            step_result = env.step(lift_action.tolist())
+            if isinstance(step_result, tuple):
+                obs = step_result[0]
+            else:
+                obs = step_result
+            if frames is not None:
+                frames.append(_main_image(obs))
 
     # Stable Pick criterion: after the Pick replay, keep the gripper closed for
     # a fixed number of steps. Success requires that the object is still grasped

@@ -20,8 +20,9 @@ skill_memory_test/
 
 # pointcloud_action
 memory_system/pointcloud_action/*.pt
-memory_system/pointcloud_action/*.pt.bak
+memory_system/pointcloud_action/*.pt.*
 memory_system/pointcloud_action/generated_*/
 memory_system/pointcloud_action/**/*.bak
 memory_system/pointcloud_action/**/*.jsonl
 memory_system/pointcloud_action/**/*.mp4
+/data1/liu/exp/counterfactual/external/cosmos-policy/memory_system/pointcloud_action/pointcloud_action_memory.pt.pre-surgical-20260905_224349

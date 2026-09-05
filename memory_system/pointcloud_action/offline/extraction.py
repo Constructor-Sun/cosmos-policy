@@ -78,18 +78,21 @@ def _body_id(sim, instance_name: str) -> int:
         return sim.model.body_name2id(main_name)
     except Exception:
         pass
-    matches = [
-        index
-        for index, name in enumerate(sim.model.body_names)
-        if name == instance_name or name.endswith(f"_{instance_name}") or instance_name in name
-    ]
+    matches = []
+    for index in range(sim.model.nbody):
+        name = sim.model.body_id2name(index)
+        if name and (
+            name == instance_name or name.endswith(f"_{instance_name}") or instance_name in name
+        ):
+            matches.append(index)
     if len(matches) == 1:
         return matches[0]
     for index in matches:
-        if sim.model.body_names[index].endswith("_main"):
+        if sim.model.body_id2name(index).endswith("_main"):
             return index
     raise KeyError(
-        f"Cannot resolve MuJoCo body for {instance_name!r}; matches={[sim.model.body_names[i] for i in matches]}"
+        f"Cannot resolve MuJoCo body for {instance_name!r}; "
+        f"matches={[sim.model.body_id2name(i) for i in matches]}"
     )
 
 
@@ -167,9 +170,8 @@ def _geom_world_points(sim, geom_id: int, body_id: int, count: int) -> np.ndarra
     geom_rotation = Rotation.from_quat(
         [geom_quat[1], geom_quat[2], geom_quat[3], geom_quat[0]]
     ).as_matrix()
-    # Use the geom's actual parent body, not the object root body.  A geom can
-    # be parented to a child/other body even when its name starts with the
-    # object prefix.
+    # Use the geom's actual parent body, not the object root body: a geom may
+    # sit on a child body of the object root.
     parent_body_id = int(sim.model.geom_bodyid[geom_id])
     body_rotation = sim.data.body_xmat[parent_body_id].reshape(3, 3)
     body_pos = sim.data.body_xpos[parent_body_id]
@@ -183,47 +185,40 @@ def complete_point_cloud(
 ) -> np.ndarray:
     """Sample complete points from geoms owned by the object instance.
 
-    A geom is considered part of the object only if:
+    A geom belongs to the object only if:
       1. its name starts with ``<instance_name>_``, and
-      2. its actual parent body also belongs to this object instance.
+      2. its parent body is the object root body or another body of the
+         same instance.
 
-    This avoids including geoms that are merely name-prefixed but attached to
-    other bodies (a known issue in some LIBERO/MuJoCo scenes).
+    Name lookups must go through ``geom_id2name()``/``body_id2name()``: the
+    ``geom_names``/``body_names`` tuples produced by the robosuite binding
+    skip unnamed geoms and are therefore not index-aligned with geom/body
+    ids whenever the scene contains unnamed geoms (e.g. the arena table
+    collision geoms), so pairing them by position silently matches the
+    wrong geoms.
     """
     sim = env.env.sim
-    body_id = _body_id(sim, instance_name)
     prefix = f"{instance_name}_"
     geom_ids = []
-    for index, name in enumerate(sim.model.geom_names):
-        if name is None or not name.startswith(prefix):
+    for index in range(sim.model.ngeom):
+        name = sim.model.geom_id2name(index)
+        if not name or not name.startswith(prefix):
             continue
         parent_body_id = int(sim.model.geom_bodyid[index])
-        parent_body_name = sim.model.body_names[parent_body_id]
+        parent_body_name = sim.model.body_id2name(parent_body_id)
         # Only keep geoms physically attached to this object instance.
-        if parent_body_name == instance_name or parent_body_name.startswith(prefix):
+        if parent_body_name and (
+            parent_body_name == instance_name or parent_body_name.startswith(prefix)
+        ):
             geom_ids.append(index)
 
     all_points = []
     per_geom = max(8, max_points // max(len(geom_ids), 1))
     for geom_id in geom_ids:
         parent_body_id = int(sim.model.geom_bodyid[geom_id])
-        points = _geom_world_points(sim, int(geom_id), parent_body_id, per_geom)
+        points = _geom_world_points(sim, geom_id, parent_body_id, per_geom)
         if len(points):
             all_points.append(points)
-    if not all_points:
-        # Fall back to the previous name-only selection if the stricter filter
-        # removed everything (e.g. unusual object body naming).
-        geom_ids = [
-            index
-            for index, name in enumerate(sim.model.geom_names)
-            if name is not None and name.startswith(prefix)
-        ]
-        all_points = []
-        per_geom = max(8, max_points // max(len(geom_ids), 1))
-        for geom_id in geom_ids:
-            points = _geom_world_points(sim, int(geom_id), body_id, per_geom)
-            if len(points):
-                all_points.append(points)
     if not all_points:
         return np.empty((0, 3), dtype=np.float64)
     points = np.concatenate(all_points, axis=0)

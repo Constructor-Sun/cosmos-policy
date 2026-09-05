@@ -163,10 +163,11 @@ def main() -> int:
                     row["stable_success"] = bool(result.get("success", False))
                 finally:
                     env.close()
-            except Exception:
-                # Deliberately keep only distance/stable_success; no error reason.
+            except Exception as exc:
+                # Keep the row slim but record why it failed for later triage.
                 row["distance"] = None
                 row["stable_success"] = False
+                row["error"] = f"{type(exc).__name__}: {exc}"
 
             results.append(row)
             args.output.parent.mkdir(parents=True, exist_ok=True)
