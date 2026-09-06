@@ -106,7 +106,7 @@ V1（open-loop）成功、V2（wp_time）失败；消除穿模后 V2 能举 21.4
    闭爪期间继续沿路径运动（复现演示的"运动中合爪"）。适用于 salad 与 ketchup V2（hold 丢夹同族）。
    未实现；需重过全量回归。
 2. **salad 4 个摆放的失败视频逐帧分析**（素材：`rollouts/multiseed_libero_object_videos/`）。
-3. **B 类检索/迁移**：0/10（2 例摆放敏感成功说明非铁板一块）；根子在检索无稳健性信号。
+3. **B 类检索/迁移**：多 seed 下 0/10 主导（2 例摆放敏感成功，非铁板一块）。注意：已有加载缺陷诊断——plus-only 物体 MJCF 的 geom 被挂到 gripper 而非自由物体（见 `PLUS_ONLY_OBJECT_LOADING_ISSUE.md`，已备份），B 类失败的根子更可能是资产加载而非检索本身；该文档同时在解冻 B 类时的评测章程见 `OBJECT_GENERALIZATION_EVAL.md`（Seen/Novel-like 分组、Transfer Gap 指标；salad_dressing 属 near-OOD）。
 4. **HDF5 一帧错位**（ee_states[i] ↔ states[i+1]，偏 8.7–11.9mm）：已复现未修正；当前无实害，闭环会放大。
 5. **检索平局**：同物体 ESF 距离全零按文件序取 top-1。
 6. **默认值切换**：config/runner 默认仍为 Run 1 语义；路线 C 需显式 flags。
