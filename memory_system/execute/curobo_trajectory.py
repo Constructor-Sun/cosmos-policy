@@ -141,7 +141,8 @@ class WaypointPoseController:
         action_clip: float = 0.5,
         eps_pos: float = 0.005,
         eps_rot: float = 0.02,
-        max_steps: int = 96,
+        max_steps: int | None = None,
+        dwell_timeout: int = 0,
     ) -> None:
         self.waypoints = np.asarray(waypoints, dtype=np.float64).reshape(-1, 6)
         self.k = float(k)
@@ -149,6 +150,16 @@ class WaypointPoseController:
         self.action_clip = float(action_clip)
         self.eps_pos = float(eps_pos)
         self.eps_rot = float(eps_rot)
+        # Per-waypoint dwell timeout: a waypoint not reached within this many
+        # steps is force-advanced with its final error recorded.  0 disables
+        # force-advance, preserving the original stall behaviour.
+        self.dwell_timeout = int(dwell_timeout)
+        self._dwell = 0
+        self.waypoint_pos_errors: list[float] = []
+        self.waypoint_rot_errors: list[float] = []
+        self.forced_advances = 0
+        if max_steps is None:
+            max_steps = max(1, len(self.waypoints)) * max(dwell_timeout, 8)
         self.max_steps = int(max_steps)
         if self.max_steps <= 0:
             raise ValueError("max_steps must be positive")
@@ -176,12 +187,24 @@ class WaypointPoseController:
                 self._converged = True
                 return np.zeros(6, dtype=np.float32)
             error = self._error(current, target)
-            if not (
-                np.linalg.norm(error[:3]) <= self.eps_pos
-                and np.linalg.norm(error[3:]) <= self.eps_rot
-            ):
-                break
-            self.index += 1
+            pos_err = float(np.linalg.norm(error[:3]))
+            rot_err = float(np.linalg.norm(error[3:]))
+            if pos_err <= self.eps_pos and rot_err <= self.eps_rot:
+                self.waypoint_pos_errors.append(pos_err)
+                self.waypoint_rot_errors.append(rot_err)
+                self.index += 1
+                self._dwell = 0
+                continue
+            # Current waypoint not reached yet.
+            self._dwell += 1
+            if self.dwell_timeout > 0 and self._dwell >= self.dwell_timeout:
+                self.waypoint_pos_errors.append(pos_err)
+                self.waypoint_rot_errors.append(rot_err)
+                self.forced_advances += 1
+                self.index += 1
+                self._dwell = 0
+                continue
+            break
         action = np.clip(
             (self.k / self.scale) * error, -self.action_clip, self.action_clip
         )

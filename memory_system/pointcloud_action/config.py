@@ -44,6 +44,27 @@ READY_DISTANCE_M = 0.14
 # "complete" uses the oracle complete object cloud from the simulator.
 POINT_CLOUD_SOURCE = "complete"
 
+# Pick replay mode.
+# "open_loop" replays the recorded action commands (original behaviour).
+# "closed_loop" tracks the recorded realized EE path with a
+#   convergence-guaranteed waypoint controller and closes the gripper by path
+#   progress with grasp confirmation.  Opt-in; validated in
+#   CLOSED_LOOP_REPLAY_PLAN.md (V1-V5).
+# "wp_time" tracks the recorded realized EE path with the same waypoint
+#   controller but keeps the source time-indexed gripper.  P0-1 2x2 ablation
+#   (2026-09-06, moka only): the waypoint tracking is the component that fixes
+#   the open-loop realization error there.  The V4 regression attribution
+#   between waypoint tracking and the position trigger is NOT yet isolated --
+#   full-coverage runs are in PICK_MEMORY_REUSE.md (§2.2/§4).
+REPLAY_MODE = "open_loop"
+
+# Re-anchor the Pick trajectory to the object pose measured after the ready
+# motion completes (re-map the ready target and realign before replay).
+# P0-2 ablation (2026-09-06): equivalent to settling before the first anchor
+# (6/6 cases), while waiting without re-anchoring never fixes them (0/6) --
+# the first anchor happens before the object has settled.
+REANCHOR_AFTER_READY = True
+
 # Ready-motion mode.
 # "legacy" keeps the original CuroboPlanner path.
 # "waypoint" uses the ASPIRE-inspired lightweight waypoint path.

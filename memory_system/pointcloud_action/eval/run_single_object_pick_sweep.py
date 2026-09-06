@@ -67,14 +67,34 @@ def main() -> int:
     parser.add_argument("--generated-dir", type=Path, default=DEFAULT_GENERATED_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--save-video-dir", type=Path, default=None)
+    parser.add_argument(
+        "--settle-steps", type=int, default=0,
+        help="Zero-displacement/gripper-open actions after env.reset(), before "
+             "anchoring (V1-style settle-first; 15 steps covers the measured "
+             "12-15 step convergence confirmation of coverage objects).",
+    )
+    parser.add_argument(
+        "--no-reanchor", action="store_true",
+        help="Disable REANCHOR_AFTER_READY (V1 semantics; default config uses re-anchor).",
+    )
+    parser.add_argument(
+        "--retry-wptime", action="store_true",
+        help="Hybrid max-success strategy: attempt 1 = V1 semantics (settle-first, "
+             "open_loop, no re-anchor); on failure reset the scene and retry once "
+             "with V2 semantics (REANCHOR_AFTER_READY + wp_time).  Success is "
+             "judged on final object state; the producing attempt is recorded.",
+    )
     args = parser.parse_args()
 
     # Set config before importing modules that read config values at import time.
     from memory_system.pointcloud_action import config as pc_config
 
     pc_config.POINT_CLOUD_SOURCE = args.point_cloud_source
+    if args.no_reanchor:
+        pc_config.REANCHOR_AFTER_READY = False
 
     from memory_system.pointcloud_action.eval.local_pick_core import run_local_pick
+    from memory_system.offline.label_segments import object_position
     from memory_system.pointcloud_action.execute.pointcloud_selector import (
         PointCloudSelector,
     )
@@ -142,6 +162,27 @@ def main() -> int:
                 )
                 try:
                     obs = env.reset()
+                    row["object_pos_reset"] = [
+                        round(float(v), 4)
+                        for v in object_position(env.env, object_name)
+                    ]
+                    if args.settle_steps > 0:
+                        settle_action = np.zeros(7, dtype=np.float32)
+                        settle_action[-1] = -1.0
+                        for _ in range(args.settle_steps):
+                            step_result = env.step(settle_action.tolist())
+                            obs = (
+                                step_result[0]
+                                if isinstance(step_result, tuple)
+                                else step_result
+                            )
+                        row["object_pos_anchor"] = [
+                            round(float(v), 4)
+                            for v in object_position(env.env, object_name)
+                        ]
+                    first_mode = "open_loop" if args.retry_wptime else None
+                    if args.retry_wptime:
+                        pc_config.REANCHOR_AFTER_READY = False
                     result = run_local_pick(
                         env,
                         obs,
@@ -158,7 +199,43 @@ def main() -> int:
                         task=safe_name,
                         demo=f"seed{seed}",
                         frame=0,
+                        replay_mode=first_mode,
                     )
+                    row["attempt1_success"] = bool(result.get("success", False))
+                    row["attempts"] = 1
+                    if args.retry_wptime:
+                        row["strategy"] = "settle_first_openloop"
+                    if args.retry_wptime and not result.get("success", False):
+                        # Clean-scene retry with V2 semantics.
+                        row["attempts"] = 2
+                        row["strategy"] = "settle_first_openloop_then_wptime_retry"
+                        pc_config.REANCHOR_AFTER_READY = True
+                        np.random.seed(seed)
+                        obs = env.reset()
+                        row["object_pos_retry"] = [
+                            round(float(v), 4)
+                            for v in object_position(env.env, object_name)
+                        ]
+                        result = run_local_pick(
+                            env,
+                            obs,
+                            object_name,
+                            selector,
+                            resolution=args.resolution,
+                            top_k=args.top_k,
+                            max_steps=args.max_steps,
+                            stable_hold_steps=args.stable_hold_steps,
+                            move_to_ready=True,
+                            save_video=(
+                                str(args.save_video_dir)
+                                if args.save_video_dir
+                                else None
+                            ),
+                            task=safe_name,
+                            demo=f"seed{seed}_v2retry",
+                            frame=0,
+                            replay_mode="wp_time",
+                        )
                     row["distance"] = result.get("distance")
                     row["stable_success"] = bool(result.get("success", False))
                 finally:
