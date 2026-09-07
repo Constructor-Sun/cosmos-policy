@@ -140,6 +140,7 @@ def _move_to_ready(
     resolution: int,
     max_steps: int,
     frames: list | None = None,
+    gripper_command: float = -1.0,
 ) -> dict:
     current_ee = _ee_from_obs(obs)
     if READY_MOTION_MODE == "legacy":
@@ -175,7 +176,9 @@ def _move_to_ready(
 
     planner = ReadyMotionPlanner(current_ee, target_ee)
     plan = planner.plan()
-    motion = MotionPrimitives(env)
+    # gripper_command: -1.0 keeps the gripper open during Pick ready motion;
+    # +1.0 keeps it closed so a held object is not dropped (Place).
+    motion = MotionPrimitives(env, gripper_command=gripper_command)
     # The joint-space controller can declare a plan infeasible if its internal
     # deadline is too tight.  Give the ready motion a more generous budget than
     # the later open-loop Pick replay, and fail loudly if it cannot even start.

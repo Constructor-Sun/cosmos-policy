@@ -52,6 +52,7 @@ class PointCloudSelector:
                 {
                     "record": record,
                     "distance": float(hit["distance"]),
+                    "key_stage": hit.get("key_stage", "shape"),
                     "ready_ee_states": ee_states[0].copy(),
                     "ee_pose_world_sequence": ee_world,
                     "ee_states_sequence": ee_states,

@@ -1,7 +1,10 @@
-"""Artifact schema for PointCloud Action Memory v1."""
+"""Artifact schema for PointCloud Action Memory."""
 from __future__ import annotations
 
 MEMORY_FORMAT = "libero_pointcloud_action_memory_v1"
+MEMORY_FORMAT_V2 = "libero_pointcloud_action_memory_v2"
+ACCEPTED_MEMORY_FORMATS = (MEMORY_FORMAT, MEMORY_FORMAT_V2)
+ANCHOR_ROLE_DESTINATION = "destination"
 SUITE = "libero_90"
 RETRIEVAL_KEY = "target_points_object"
 
@@ -28,6 +31,7 @@ RECORD_FIELDS = (
     "planner_step_id",
     "skill",
     "arguments",
+    "anchor_role",
     "target_points_world",
     "target_points_object",
     "target_xyz_world",

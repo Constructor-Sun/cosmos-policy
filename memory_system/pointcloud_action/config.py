@@ -36,7 +36,7 @@ CONTROLLER_CONFIG = {
     "ramp_ratio": 0.2,
 }
 
-# Desired EE-to-target distance used to select Pick ready_frame.
+# Desired EE-to-target distance used to select a ready frame.
 READY_DISTANCE_M = 0.14
 
 # Point cloud source used for retrieval.

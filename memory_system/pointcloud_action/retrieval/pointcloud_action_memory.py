@@ -15,9 +15,7 @@ from memory_system.pointcloud_action.retrieval.descriptors import (
     normalize_points,
     size_ratio_within,
 )
-from memory_system.pointcloud_action.schema import MEMORY_FORMAT
-
-
+from memory_system.pointcloud_action.schema import ACCEPTED_MEMORY_FORMATS
 class PointCloudActionMemory:
     """Index over pointcloud_action_memory.pt records."""
 
@@ -27,7 +25,7 @@ class PointCloudActionMemory:
         cloud_key: str = "target_points_object",
     ):
         payload = torch.load(Path(path), map_location="cpu", weights_only=False)
-        if payload.get("format") != MEMORY_FORMAT:
+        if payload.get("format") not in ACCEPTED_MEMORY_FORMATS:
             raise ValueError(f"unsupported format: {payload.get('format')!r}")
         self.cloud_key = cloud_key
         self.records = list(payload.get("records", []))
@@ -64,8 +62,10 @@ class PointCloudActionMemory:
         top_k: int = 5,
         size_threshold: float = 1.5,
         lambda_size: float = 1.0,
+        item: str | None = None,
+        target: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return top-k memory records by ESF chi2 + OBB size distance."""
+        """Rank by shape, optionally restricted to an exact instance pair."""
         points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
         if len(points) < 4:
             return []
@@ -76,21 +76,32 @@ class PointCloudActionMemory:
         query_extent = extent_key(extent)
 
         candidates = []
-        for item in self._index:
-            if skill and item["skill"] != skill:
+        for entry in self._index:
+            if skill and entry["skill"] != skill:
                 continue
-            if not size_ratio_within(query_extent, item["extent"], size_threshold):
+            arguments = entry["record"].get("arguments", {})
+            if item is not None and (
+                arguments.get("item") != item or arguments.get("target") != target
+            ):
+                continue
+            if item is None and not size_ratio_within(
+                query_extent, entry["extent"], size_threshold
+            ):
                 continue
             size_distance = float(
                 np.linalg.norm(
-                    np.log(query_extent / np.maximum(item["extent"], 1e-8))
+                    np.log(query_extent / np.maximum(entry["extent"], 1e-8))
                 )
             )
-            distance = chi2_distance(query_esf, item["esf"]) + lambda_size * size_distance
-            candidates.append((distance, item["record"]))
+            distance = chi2_distance(query_esf, entry["esf"]) + lambda_size * size_distance
+            candidates.append((distance, entry))
 
         candidates.sort(key=lambda value: value[0])
         return [
-            {"record": record, "distance": float(distance)}
-            for distance, record in candidates[:top_k]
+            {
+                "record": entry["record"],
+                "distance": float(distance),
+                "key_stage": "exact" if item is not None else "shape",
+            }
+            for distance, entry in candidates[:top_k]
         ]

@@ -210,6 +210,7 @@ def _reanchor_after_ready(
     resolution: int,
     max_steps: int,
     frames: list | None = None,
+    gripper_command: float = -1.0,
 ) -> tuple[dict, np.ndarray, np.ndarray, float]:
     """Re-anchor the pick trajectory to the object pose measured after the
     ready motion, then realign the gripper before replay.
@@ -232,7 +233,8 @@ def _reanchor_after_ready(
         float(np.linalg.norm(T_ready[:3, 3] - T_world_object[:3, 3]) * 1000), 2
     )
     obs = _move_to_ready(
-        env, obs, ready_target, resolution, max_steps, frames=frames
+        env, obs, ready_target, resolution, max_steps, frames=frames,
+        gripper_command=gripper_command,
     )
     return obs, ready_target, reanchored_world_seq, anchor_to_ready_disp_mm
 

@@ -28,8 +28,17 @@ from memory_system.pointcloud_action.offline.extraction import (
     object_frame,
     visible_point_cloud,
 )
+from memory_system.pointcloud_action.offline.demo_state_restore import (
+    reset_from_demo_xml,
+    restore_demo_frame,
+)
 from memory_system.pointcloud_action.offline.ready_frame import select_ready_frame
-from memory_system.pointcloud_action.schema import MEMORY_FORMAT, SUITE
+from memory_system.pointcloud_action.schema import (
+    ANCHOR_ROLE_DESTINATION,
+    MEMORY_FORMAT,
+    MEMORY_FORMAT_V2,
+    SUITE,
+)
 from memory_system.offline.build_ready3d import resolve_instance
 from memory_system.offline.build_targets import patch_numpy2_segmentation
 
@@ -48,6 +57,9 @@ def _make_record(
     rotation: np.ndarray,
     actions: np.ndarray,
     ee_states: np.ndarray,
+    skill: str = "Pick",
+    anchor_role: str | None = None,
+    extras: dict | None = None,
 ) -> dict | None:
     ready_frame = int(ready_frame)
     segment_end = int(segment_end)
@@ -66,12 +78,12 @@ def _make_record(
         ee_states, ready_frame, segment_end, T_world_object
     )
 
-    return {
+    record = {
         "memory_id": f"{task_name}::{demo_id}::step{int(segment['planner_step_id'])}",
         "source_task": task_name,
         "source_demo": demo_id,
         "planner_step_id": int(segment["planner_step_id"]),
-        "skill": "Pick",
+        "skill": skill,
         "arguments": dict(segment.get("arguments", {})),
         "target_points_world": visible.astype(np.float32),
         "target_points_object": (
@@ -100,6 +112,10 @@ def _make_record(
         "ee_pose_world_sequence": ee_world.astype(np.float32),
         "ee_pose_object_sequence": ee_object.astype(np.float32),
     }
+    if anchor_role is not None:
+        record["anchor_role"] = anchor_role
+    record.update(extras or {})
+    return record
 
 
 def build_memory(
@@ -109,6 +125,8 @@ def build_memory(
     resolution: int = DEFAULT_RESOLUTION,
     max_demos: int = DEFAULT_MAX_DEMOS,
     tasks: tuple[str, ...] = (),
+    skills: tuple[str, ...] = ("Pick",),
+    max_records: int = 0,
 ) -> dict:
     manifest = json.loads(Path(manifest_path).read_text())
     demo_dir = Path(demo_dir)
@@ -139,17 +157,37 @@ def build_memory(
                     states = group["states"][:]
                     actions = group["actions"][:]
                     ee_states = group["obs"]["ee_states"][:]
+                    if any(skill in ("PlaceIn", "PlaceOn") for skill in skills):
+                        reset_from_demo_xml(env, group.attrs["model_file"])
                     for segment in record.get("segments", []):
                         if segment.get("status") == "already_satisfied":
                             continue
-                        if segment.get("skill") != "Pick":
+                        skill = segment.get("skill")
+                        if skill not in skills:
                             continue
+                        if max_records and len(all_records) >= max_records:
+                            break
                         ref_ready = segment.get("ready_frame")
                         segment_end = segment.get("success_end") or segment.get("end")
                         if ref_ready is None or segment_end is None:
                             continue
+                        segment_end = int(segment_end)
+                        sequence_end = segment_end
+                        place = skill in ("PlaceIn", "PlaceOn")
+                        segment_start = max(0, int(segment.get("start", 0)))
+                        release_frame = None
+                        if place:
+                            sequence_end = min(len(actions), segment_end - 1)
+                            grip = actions[segment_start:sequence_end, -1]
+                            edges = np.where((grip[:-1] > 0) & (grip[1:] < 0))[0]
+                            if not len(edges):
+                                warnings.append(
+                                    f"{record['demo_id']} step {segment.get('planner_step_id')}: no release"
+                                )
+                                continue
+                            release_frame = segment_start + int(edges[0]) + 1
                         instance = resolve_instance(
-                            env, segment.get("arguments", {}), "Pick"
+                            env, segment.get("arguments", {}), skill
                         )
                         if instance is None:
                             warnings.append(
@@ -157,18 +195,30 @@ def build_memory(
                             )
                             continue
                         ref_frame = min(max(int(ref_ready), 0), len(states) - 1)
-                        obs_ref = env.regenerate_obs_from_state(states[ref_frame])
-                        ref_visible = visible_point_cloud(
-                            env, obs_ref, instance, resolution
-                        )
-                        if len(ref_visible) < 4:
-                            warnings.append(
-                                f"{record['demo_id']} step {segment.get('planner_step_id')}: no reference cloud"
+                        ready_segment = segment
+                        item_instance = None
+                        if place:
+                            item_instance = resolve_instance(
+                                env, {"item": segment["arguments"]["item"]}, "Pick"
                             )
-                            continue
-                        target_xyz = np.median(ref_visible, axis=0)
+                            if item_instance is None:
+                                continue
+                            end_frame = min(sequence_end, len(states) - 1)
+                            restore_demo_frame(env, states[end_frame], actions, end_frame)
+                            T_item_end, _, _ = object_frame(env, item_instance)
+                            target_xyz = T_item_end[:3, 3]
+                            ready_segment = dict(segment)
+                            ready_segment["end"] = release_frame
+                        else:
+                            obs_ref = env.regenerate_obs_from_state(states[ref_frame])
+                            ref_visible = visible_point_cloud(
+                                env, obs_ref, instance, resolution
+                            )
+                            if len(ref_visible) < 4:
+                                continue
+                            target_xyz = np.median(ref_visible, axis=0)
                         ready_frame = select_ready_frame(
-                            segment, ee_states, target_xyz, READY_DISTANCE_M
+                            ready_segment, ee_states, target_xyz, READY_DISTANCE_M
                         )
                         if ready_frame is None:
                             warnings.append(
@@ -176,19 +226,39 @@ def build_memory(
                             )
                             continue
                         ready_frame = int(ready_frame)
+                        if place and (
+                            ready_frame >= release_frame or actions[ready_frame, -1] <= 0
+                        ):
+                            ready_frame = release_frame - 1
                         frame = min(max(ready_frame, 0), len(states) - 1)
-                        obs = env.regenerate_obs_from_state(states[frame])
+                        if place:
+                            obs = restore_demo_frame(env, states[frame], actions, frame)
+                        else:
+                            obs = env.regenerate_obs_from_state(states[frame])
                         visible = visible_point_cloud(env, obs, instance, resolution)
                         complete = complete_point_cloud(env, instance)
                         T_world_object, translation, rotation = object_frame(
                             env, instance
                         )
+                        extras = None
+                        anchor_role = None
+                        if place:
+                            T_item, _, _ = object_frame(env, item_instance)
+                            extras = {
+                                "restore_frame": segment_start,
+                                "segment_end": segment_end,
+                                "action_stop": sequence_end,
+                                "item_pose_anchor_ready": (
+                                    np.linalg.inv(T_world_object) @ T_item
+                                ).astype(np.float32),
+                            }
+                            anchor_role = ANCHOR_ROLE_DESTINATION
                         memory = _make_record(
                             task_name,
                             record["demo_id"],
                             segment,
                             ready_frame,
-                            segment_end,
+                            sequence_end,
                             instance,
                             visible,
                             complete,
@@ -197,6 +267,9 @@ def build_memory(
                             rotation,
                             actions,
                             ee_states,
+                            skill=skill,
+                            anchor_role=anchor_role,
+                            extras=extras,
                         )
                         if memory is None:
                             warnings.append(
@@ -204,6 +277,8 @@ def build_memory(
                             )
                             continue
                         all_records.append(memory)
+                    if max_records and len(all_records) >= max_records:
+                        break
         finally:
             env.close()
 
@@ -211,7 +286,11 @@ def build_memory(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "format": MEMORY_FORMAT,
+            "format": (
+                MEMORY_FORMAT_V2
+                if any(skill in ("PlaceIn", "PlaceOn") for skill in skills)
+                else MEMORY_FORMAT
+            ),
             "suite": SUITE,
             "controller_config": CONTROLLER_CONFIG,
             "records": all_records,
@@ -236,14 +315,21 @@ def main() -> None:
     parser.add_argument("--resolution", type=int, default=DEFAULT_RESOLUTION)
     parser.add_argument("--max-demos", type=int, default=DEFAULT_MAX_DEMOS)
     parser.add_argument("--tasks", nargs="*", default=())
+    parser.add_argument("--skills", nargs="+", default=["Pick"])
+    parser.add_argument("--max-records", type=int, default=0)
     args = parser.parse_args()
+    output = args.output
+    if args.skills != ["Pick"] and output == DEFAULT_OUTPUT:
+        output = Path(DEFAULT_OUTPUT).with_name("pointcloud_action_memory_place.pt")
     build_memory(
         args.manifest,
         args.demo_dir,
-        args.output,
+        output,
         resolution=args.resolution,
         max_demos=args.max_demos,
         tasks=tuple(args.tasks),
+        skills=tuple(args.skills),
+        max_records=args.max_records,
     )
 
 
