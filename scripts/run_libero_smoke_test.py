@@ -905,6 +905,10 @@ def annotate_episodes(
     instruction_mode,
 ):
     annotated = []
+    # Init states are sliced as states[offset : offset + num_trials], so the env's
+    # init-state index is the in-run episode index shifted by the offset. Record the
+    # absolute index so runs with different offsets can be joined on it.
+    _offset = int(os.environ.get("COSMOS_INIT_STATE_OFFSET", "0"))
     for episode in episodes:
         episode_idx = int(episode["episode"])
         annotated_episode = {
@@ -920,7 +924,7 @@ def annotate_episodes(
             "task_name": task_name,
             "language": language,
             "episode": episode_idx,
-            "init_state_index": episode.get("init_state_index", episode_idx),
+            "init_state_index": episode.get("init_state_index", episode_idx + _offset),
             "success": bool(episode["success"]),
             "log_path": log_path,
             "instruction_mode": instruction_mode,
@@ -1175,7 +1179,9 @@ if mode == "paired":
                         "task_id": variant_id,
                         "task_name": variant_task.name,
                         "language": variant_task.language,
-                        "init_state_index": 0,
+                        # Single trial per variant: get_repeated_init_states returns
+                        # states[offset : offset + 1], so the true index is the offset.
+                        "init_state_index": int(os.environ.get("COSMOS_INIT_STATE_OFFSET", "0")),
                         "log_path": variant_log,
                         "instruction_mode": item.get("instruction_mode", "task"),
                         "run_id": run_id,

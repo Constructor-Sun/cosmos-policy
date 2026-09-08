@@ -411,6 +411,16 @@ def prepare_observation(obs, resize_size, flip_images: bool = False):
     return observation  # Return processed observation
 
 
+def _load_tta_repair_request():
+    """Optional single-shot TTA repair request, selected by COSMOS_TTA_REPAIR."""
+    path = os.environ.get("COSMOS_TTA_REPAIR", "").strip()
+    if not path:
+        return None
+    request = json.load(open(path))
+    request["actions"] = np.asarray(request.get("actions", []), dtype=np.float32)
+    return request
+
+
 def run_episode(
     cfg: PolicyEvalConfig,
     env,
@@ -440,6 +450,17 @@ def run_episode(
         obs = env.set_init_state(initial_state)
     else:
         obs = env.get_observation()
+    _repair_request = _load_tta_repair_request()
+    _repair_armed = False
+    _repair_result = {"status": "not_started"}
+    if _repair_request is not None:
+        # Deterministic settle + prefix replay puts the robot at the cut-in.
+        for _ in range(10):
+            obs, _, _, _ = env.step([0, 0, 0, 0, 0, 0, -1])
+        for _action in _repair_request["actions"][: int(_repair_request["t_star"])]:
+            obs, _, _, _ = env.step(_action.tolist())
+        _repair_result = {"status": "prefix_replayed", "t_star": int(_repair_request["t_star"])}
+        log_message(f"[TTA REPAIR] replayed actions[:{_repair_request['t_star']}]", log_file)
 
     # Optional read-only skill-completion telemetry.  Its return value is
     # deliberately ignored: it never changes the action stream or episode end.
@@ -611,6 +632,8 @@ def run_episode(
         nonlocal _alignment_controller, _alignment_step_index
         nonlocal alignment_gripper_action, action_queue
         nonlocal session, coordinator
+        if _repair_request is not None:  # repair mode owns the takeover
+            return
         if initial_alignment_selector is None or _initial_align_attempted:
             return
         # Trigger before the first policy action is executed.
@@ -718,9 +741,7 @@ def run_episode(
                 )
         alignment_gripper_action = float(bool(last_gripper_closed))
         if alignment.joint_trajectory is not None:
-            from cosmos_policy.experiments.robot.libero.libero_joint_control import (
-                LiberoJointTrajectoryController,
-            )
+            from cosmos_policy.experiments.robot.libero.libero_joint_control import LiberoJointTrajectoryController
             _alignment_controller = LiberoJointTrajectoryController(
                 env,
                 alignment.joint_trajectory,
@@ -868,6 +889,71 @@ def run_episode(
             log_file,
         )
 
+    def _maybe_start_repair_alignment(t_now, observation, obs, log_fh) -> None:
+        nonlocal _repair_armed, _repair_result
+        nonlocal _alignment_controller, _alignment_steps_remaining
+        nonlocal _alignment_step_index, alignment_gripper_action, action_queue
+        if _repair_request is None or _repair_armed:
+            return
+        _repair_armed = True
+        if initial_alignment_selector is None or not _captured_latent:
+            _repair_result = {"status": "route_failed", "reason": "selector_or_latent_missing"}
+            return
+        raw_phase = _repair_request["phase"]
+        phase = type("Phase", (), raw_phase)
+        main_depth = (
+            _make_main_depth(obs, alignment_camera_params, cfg.flip_images)
+            if alignment_camera_params is not None and "agentview_depth" in obs else None
+        )
+        current_vae_main = _captured_latent[0][0, :, 3:4, :, :]
+        current_ee_states = np.concatenate([obs["robot0_eef_pos"], Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec()]).astype(np.float32)
+        robot_base_pose = np.concatenate([env.robots[0].base_pos, env.robots[0].base_ori])
+        try:
+            alignment = initial_alignment_selector.select(
+                _repair_request["task"], current_vae_main, current_ee_states,
+                main_depth=main_depth,
+                camera_params=alignment_camera_params,
+                joint_positions=(
+                    np.asarray(obs["robot0_joint_pos"], dtype=np.float32)
+                    if "robot0_joint_pos" in obs else None
+                ),
+                gripper_joint_positions=obs.get("robot0_gripper_qpos"),
+                robot_base_pose=robot_base_pose,
+                observation=obs, env=env, phase=phase,
+            )
+        except Exception as exc:
+            _repair_result = {"status": "route_failed", "reason": f"select_error:{exc}"}
+            return
+        if alignment is None:
+            _repair_result = {"status": "route_failed", "reason": "no_matching_ready_pose_for_phase"}
+            return
+        if alignment.joint_trajectory is not None:
+            from cosmos_policy.experiments.robot.libero.libero_joint_control import LiberoJointTrajectoryController
+            _alignment_controller = LiberoJointTrajectoryController(
+                env, alignment.joint_trajectory, alignment.target_ee_states,
+                float(bool(last_gripper_closed)),
+            )
+            _alignment_steps_remaining = _alignment_controller.max_steps
+        else:
+            _alignment_steps_remaining = alignment.correction_steps
+            _alignment_controller = alignment.controller
+        _alignment_step_index = 0
+        # Preserve the gripper state: an empty-gripper default would drop a
+        # held object during Place repairs.
+        alignment_gripper_action = float(bool(last_gripper_closed))
+        action_queue.clear()
+        _repair_result = {
+            "status": "aligned_pending", "t_star": int(_repair_request["t_star"]),
+            "phase": dict(raw_phase), "demos": list(alignment.demo_ids),
+            "target": np.asarray(alignment.target_ee_states).tolist(),
+            "similarity": float(alignment.similarity),
+        }
+        log_message(
+            f"[TTA REPAIR] t={t_now}: armed phase={raw_phase.get('skill')} "
+            f"target={_repair_result['target']} steps={_alignment_steps_remaining}",
+            log_fh,
+        )
+
     # Setup
     t = 0
     replay_images = []
@@ -948,6 +1034,12 @@ def run_episode(
                     action = np.zeros(7, dtype=np.float32)
                     action[:6] = _step_action
                     action[6] = alignment_gripper_action
+                if getattr(_alignment_controller, "converged", False) or getattr(
+                    _alignment_controller, "finished", False
+                ):
+                    # Arrived: hand over immediately instead of holding pose
+                    # for the rest of the fixed step budget.
+                    _alignment_steps_remaining = min(_alignment_steps_remaining, 1)
                 print(f"t: {t}\t initial alignment action: {action}")
 
                 _debug_init_align = (
@@ -976,6 +1068,9 @@ def run_episode(
                 last_gripper_closed = bool(float(action[-1]) > 0.0)
                 obs, reward, done, info = env.step(action.tolist())
                 observe_skill_shadow(obs, action, t)
+                if _repair_request is not None and _alignment_steps_remaining == 1 and _repair_result.get("status") == "aligned_pending":
+                    _repair_result["status"] = "reached"
+                    _repair_result["final_ee"] = np.concatenate([obs["robot0_eef_pos"], Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec()]).astype(np.float32).tolist()
                 _alignment_steps_remaining -= 1
                 _alignment_step_index += 1
                 if _debug_init_align:
@@ -1232,6 +1327,7 @@ def run_episode(
                         })
 
                 _maybe_start_initial_alignment(t, observation, obs, log_file)
+                _maybe_start_repair_alignment(t, observation, obs, log_file)
 
                 if _capture_vae:
                     model.get_data_and_condition = _orig_gdac
@@ -1254,6 +1350,10 @@ def run_episode(
                     action = np.zeros(7, dtype=np.float32)
                     action[:6] = _step_action
                     action[6] = alignment_gripper_action
+                if getattr(_alignment_controller, "converged", False) or getattr(
+                    _alignment_controller, "finished", False
+                ):
+                    _alignment_steps_remaining = min(_alignment_steps_remaining, 1)
                 _alignment_steps_remaining -= 1
                 _alignment_step_index += 1
             else:
@@ -1312,6 +1412,12 @@ def run_episode(
         log_message(f"{error_msg}\nFull traceback:\n{traceback_str}", log_file)
 
     _close_alignment_controller(_alignment_controller)
+    if _repair_request is not None:
+        _repair_result["task_success"] = bool(success)
+        _repair_out = os.environ.get("COSMOS_TTA_REPAIR_OUT", "").strip()
+        if _repair_out:
+            json.dump(_repair_result, open(_repair_out, "w"), indent=2)
+        log_message("[TTA REPAIR] result " + json.dumps(_repair_result), log_file)
     if skill_runtime is not None:
         for summary in skill_runtime.finalize(success):
             log_message(
@@ -1502,7 +1608,7 @@ def run_task(
 
             def _save_episode_data():
                 """Save collected episode data to HDF5 file."""
-                ep_filename = f"episode_data--suite={cfg.task_suite_name}--{DATE_TIME}--task={task_id}--ep={total_episodes}--success={success}--{cfg.run_id_note}.hdf5"
+                ep_filename = f"episode_data--{os.environ.get('COSMOS_TTA_REPAIR_TAG', 'notag').strip() or 'notag'}--suite={cfg.task_suite_name}--{DATE_TIME}--task={task_id}--ep={total_episodes}--success={success}--{cfg.run_id_note}.hdf5"
                 rollout_data_dir = os.path.join(cfg.local_log_dir, "rollout_data")
                 os.makedirs(rollout_data_dir, exist_ok=True)
                 ep_filepath = os.path.join(rollout_data_dir, ep_filename)

@@ -28,3 +28,4 @@ memory_system/pointcloud_action/**/*.mp4
 memory_system/pointcloud_action/pointcloud_action_memory.pt.pre-surgical-20260905_224349
 memory_system/pointcloud_action/archive/
 memory_system/pointcloud_action/diagnostics/
+memory_system/pointcloud_action/results

@@ -176,6 +176,7 @@ class InitialAlignmentSelector:
         robot_base_pose: Any = None,
         observation: Any = None,
         env: Any = None,
+        phase: Any = None,
     ) -> InitialAlignmentResult | None:
         """Return the best-matching first-phase ready pose, or ``None``.
 
@@ -188,7 +189,7 @@ class InitialAlignmentSelector:
         if base_task not in self.plans or not self.plans[base_task]:
             return None
 
-        first_phase = self.first_phases.get(base_task)
+        first_phase = phase if phase is not None else self.first_phases.get(base_task)
         if first_phase is None:
             if base_task not in self.plans or not self.plans[base_task]:
                 return None
