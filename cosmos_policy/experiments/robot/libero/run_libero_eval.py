@@ -282,6 +282,7 @@ class PolicyEvalConfig:
     # Data collection parameters
     #################################################################################################################
     data_collection: bool = False                                        # If True, save episodic data for later offline use
+    adapter_path: str = ""                                               # Optional LoRA adapter (TTA DPO) to attach to the policy
     jpeg_compress: bool = True                                           # If True, apply JPEG compression to images before saving
     save_vector_db: bool = False                                         # If True, save VAE latents + proprio at action chunk boundaries
     vector_db_output_dir: str = ""                                       # Output directory for vector DB .pt files
@@ -453,11 +454,28 @@ def run_episode(
     _repair_request = _load_tta_repair_request()
     _repair_armed = False
     _repair_result = {"status": "not_started"}
+    # Prefix capture: frames from the replayed reference prefix are recorded so
+    # SFT data covers the perturbed-init -> cut-in approach. Static settle and
+    # wait frames stay out (the eval harness performs its own 10-step wait).
+    _prefix_frames, _prefix_proprio, _prefix_actions, _prefix_rgbd = [], [], [], []
     if _repair_request is not None:
         # Deterministic settle + prefix replay puts the robot at the cut-in.
         for _ in range(10):
             obs, _, _, _ = env.step([0, 0, 0, 0, 0, 0, -1])
+        _capture_prefix = cfg.data_collection
         for _action in _repair_request["actions"][: int(_repair_request["t_star"])]:
+            if _capture_prefix:
+                _observation = prepare_observation(obs, resize_size, cfg.flip_images)
+                _prefix_frames.append((_observation["primary_image"], _observation["wrist_image"]))
+                _prefix_proprio.append(_observation["proprio"])
+                _prefix_actions.append(np.asarray(_action, dtype=np.float32).copy())
+                if os.environ.get("COSMOS_TTA_RGBD") == "1":
+                    _d = np.asarray(obs["robot0_eye_in_hand_depth"]).copy()
+                    _prefix_rgbd.append((
+                        _d,
+                        np.asarray(obs["robot0_eye_in_hand_segmentation_instance"]).copy(),
+                        build_camera_params(env.sim, "robot0_eye_in_hand", _d.shape[0], _d.shape[1]).T_c2w,
+                    ))
             obs, _, _, _ = env.step(_action.tolist())
         _repair_result = {"status": "prefix_replayed", "t_star": int(_repair_request["t_star"])}
         log_message(f"[TTA REPAIR] replayed actions[:{_repair_request['t_star']}]", log_file)
@@ -613,6 +631,11 @@ def run_episode(
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
     alignment_gripper_action = None
     last_gripper_closed = None
+    # Screening annotation (memory_system/tta/screen_repaired_place.py): frames
+    # are stored as indices into the collected h5, i.e. episode step t minus
+    # the 10-step settle wait that is not recorded.
+    _screen_place_start = None
+    _screen_release_frame = None
 
     _alignment_controller = None
     _alignment_steps_remaining = 0
@@ -784,6 +807,7 @@ def run_episode(
     def _maybe_run_phase_transition_hook(decision, observation, frame):
         nonlocal _alignment_controller, _alignment_steps_remaining
         nonlocal _alignment_step_index, alignment_gripper_action
+        nonlocal _screen_place_start
         if decision is None or not decision.advance:
             return
         if skill_runtime is None or skill_runtime.phase_index < 1:
@@ -792,6 +816,8 @@ def run_episode(
         next_phase = skill_runtime.active_phase
         if completed_phase is None or next_phase is None:
             return
+        if _screen_place_start is None and next_phase.skill in {"PlaceIn", "PlaceOn"}:
+            _screen_place_start = frame - NUM_STEPS_WAIT
 
         if coordinator is not None:
             try:
@@ -970,6 +996,23 @@ def run_episode(
         wrist_images_list = []
         proprio_list = []
         actions_list = []
+        frame_indices = []
+        rgbd = os.environ.get("COSMOS_TTA_RGBD") == "1"
+        if rgbd: wrist_depth_list, wrist_segmentation_list, wrist_c2w_list = [], [], []
+        # Prepend the captured prefix so the episode starts at the perturbed
+        # init pose. frame_indices for prefix frames are 0..t_star-1; main-loop
+        # indices continue from 10 (metadata only, arrays are positional).
+        if _prefix_frames:
+            primary_images_list[:0] = [f[0] for f in _prefix_frames]
+            wrist_images_list[:0] = [f[1] for f in _prefix_frames]
+            proprio_list[:0] = list(_prefix_proprio)
+            frame_indices[:0] = list(range(len(_prefix_frames)))
+            actions_list[:0] = list(_prefix_actions)
+            if rgbd:
+                wrist_depth_list[:0] = [r[0] for r in _prefix_rgbd]
+                wrist_segmentation_list[:0] = [r[1] for r in _prefix_rgbd]
+                wrist_c2w_list[:0] = [r[2] for r in _prefix_rgbd]
+            log_message(f"[TTA REPAIR] recorded {len(_prefix_frames)} prefix frames into episode data", log_file)
     vector_db_chunks: list = []  # always created; populated only when save_vector_db=True
     _dump_wrist_dir = os.environ.get("COSMOS_DUMP_WRIST_DIR")
     _wrist_dump: list = []
@@ -1013,6 +1056,11 @@ def run_episode(
                 primary_images_list.append(observation["primary_image"])
                 wrist_images_list.append(observation["wrist_image"])
                 proprio_list.append(observation["proprio"])
+                frame_indices.append(t)
+                if rgbd:
+                    d = np.asarray(obs["robot0_eye_in_hand_depth"]).copy()
+                    wrist_depth_list.append(d); wrist_segmentation_list.append(np.asarray(obs["robot0_eye_in_hand_segmentation_instance"]).copy())
+                    wrist_c2w_list.append(build_camera_params(env.sim, "robot0_eye_in_hand", d.shape[0], d.shape[1]).T_c2w)
 
             _alignment_active = (
                 _alignment_steps_remaining > 0
@@ -1366,7 +1414,13 @@ def run_episode(
             if cfg.data_collection:
                 actions_list.append(action.copy())
             # Execute action in environment
+            _prev_gripper_closed = last_gripper_closed
             last_gripper_closed = bool(float(action[-1]) > 0.0)
+            if (
+                _screen_place_start is not None and _screen_release_frame is None
+                and _prev_gripper_closed and not last_gripper_closed
+            ):
+                _screen_release_frame = t - NUM_STEPS_WAIT
             obs, reward, done, info = env.step(action.tolist())
             observe_skill_shadow(obs, action, t)
             if hasattr(_alignment_controller, "observe"):
@@ -1429,13 +1483,35 @@ def run_episode(
 
     # Fill data collection buffers
     if cfg.data_collection:
+        if _screen_place_start is None and actions_list:
+            # Repair mode bypasses skill phase transitions, so derive the
+            # screening frames from the executed gripper stream instead:
+            # place_start = last grasp (open→closed) before the final
+            # release (closed→open).
+            _acts = np.stack(actions_list, axis=0)
+            _closed = _acts[:, -1] > 0.0
+            if _closed.any():
+                _close_ev = np.nonzero(_closed[1:] & ~_closed[:-1])[0] + 1
+                _open_ev = np.nonzero(~_closed[1:] & _closed[:-1])[0] + 1
+                if len(_open_ev):
+                    _rel = int(_open_ev[-1])
+                    _pre_close = _close_ev[_close_ev < _rel]
+                    if len(_pre_close):
+                        _screen_place_start = int(_pre_close[-1])
+                        _screen_release_frame = _rel
         collected_data = dict(
             primary_images=np.stack(primary_images_list, axis=0),  # (T, H, W, C)
             wrist_images=np.stack(wrist_images_list, axis=0),  # (T, H, W, C)
             proprio=np.stack(proprio_list, axis=0),  # (T, D)
             actions=np.stack(actions_list, axis=0),  # (T, action_dim)
+            frame_indices=np.asarray(frame_indices, dtype=np.int32),
             success=success,
+            place_start=-1 if _screen_place_start is None else int(_screen_place_start),
+            release_frame=-1 if _screen_release_frame is None else int(_screen_release_frame),
         )
+        if rgbd:
+            cam = build_camera_params(env.sim, "robot0_eye_in_hand", wrist_depth_list[0].shape[0], wrist_depth_list[0].shape[1])
+            collected_data.update(wrist_depth=np.stack(wrist_depth_list), wrist_segmentation=np.stack(wrist_segmentation_list), wrist_c2w=np.stack(wrist_c2w_list), camera_K=cam.K, depth_metric=False, depth_near=cam.near, depth_far=cam.far)
         # Add future image predictions if available
         if len(future_image_predictions_list) > 0:
             if cfg.use_third_person_image:
@@ -1517,9 +1593,9 @@ def run_task(
         task,
         cfg.model_family,
         resolution=cfg.env_img_res,
-        camera_depths=[True, False] if (
+        camera_depths=[True, True] if os.environ.get("COSMOS_TTA_RGBD") == "1" else ([True, False] if (
             cfg.enable_initial_alignment and cfg.enable_collision_aware_initial_alignment
-        ) else None,
+        ) else None),
     )
 
     # Start episodes
@@ -1698,6 +1774,10 @@ def eval_libero(
     # If using serial inference, initialize model and Cosmos config
     else:
         model, cosmos_config = get_model(cfg)
+        if cfg.adapter_path:
+            from memory_system.tta.model import attach_adapter
+
+            attach_adapter(model, cfg.adapter_path)
         assert cfg.chunk_size == cosmos_config.dataloader_train.dataset.chunk_size, (
             f"Mismatch found between train and test chunk sizes! Train: {cosmos_config.dataloader_train.dataset.chunk_size}, Test: {cfg.chunk_size}"
         )

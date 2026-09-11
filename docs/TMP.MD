@@ -101,6 +101,6 @@
 4. 修复武装时传入 `main_depth`，cuRobo 避障路径真正启用。
 5. 对齐控制器收敛后立即截断剩余步数预算并交接，消除到达后的站桩停顿。
 
-**测试结果：最终失败的挽救。** 68 条 baseline 失败轨迹全部完成单次修复：对齐 68/68 到达目标位姿，任务恢复 **62/68 = 91.2%**；未恢复 6 条为 KSCENE4-init013、KSCENE6-init013、KSCENE8-init011、LRSCENE5-005/017、LRSCENE6-021（视频在 `results/tta_repair_videos/failed/`），汇总在 `results/tta_repair_68_summary.json`。
+**测试结果：最终失败的挽救。** 68 条 baseline 失败轨迹全部完成单次修复：对齐 68/68 到达目标位姿，任务恢复 **64/68 = 94.1%**（复核重跑与首跑逐 case 一致，±2 条为 policy 运行间波动）；未恢复 4 条为 KSCENE4-init013、LRSCENE5-005/017、LRSCENE6-021（视频在 `results/tta_repair_videos/failed/`），汇总在 `results/tta_repair_68_summary.json`。
 
-剩余未成功的 6 条还需要逐条看一下。
+剩余未成功的 4 条还需要逐条看一下。

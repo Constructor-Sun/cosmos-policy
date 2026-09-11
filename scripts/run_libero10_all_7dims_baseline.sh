@@ -41,7 +41,7 @@ SEED=${SEED:-7}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_all_7dims_baseline}
 SMOKE_GL_BACKEND=${SMOKE_GL_BACKEND:-egl}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/scripts/run_libero_smoke_test.py}
-SMOKE_T5_EXTRA_EMBEDDINGS=${SMOKE_T5_EXTRA_EMBEDDINGS:-$REPO_ROOT/experiments/libero_plus_language_t5_libero10.pkl}
+SMOKE_T5_EXTRA_EMBEDDINGS=${SMOKE_T5_EXTRA_EMBEDDINGS:-$REPO_ROOT/experiments/cache/libero_plus_language_t5_libero10.pkl}
 SMOKE_T5_ALLOW_STRICT_COMPUTE=${SMOKE_T5_ALLOW_STRICT_COMPUTE:-false}
 
 # Force original CosmosPolicy baseline behavior: disable data collection and

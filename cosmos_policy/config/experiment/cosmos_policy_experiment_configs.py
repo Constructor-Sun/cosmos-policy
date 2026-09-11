@@ -13,6 +13,7 @@
 # -----------------------------------------------------------------------------
 
 import os
+from pathlib import Path
 
 from hydra.core.config_store import ConfigStore
 from megatron.core import parallel_state
@@ -34,6 +35,18 @@ val_sampling_size_override = dict(
     video_width=1280,
 )
 BASE_DATASETS_DIR = os.environ.get("BASE_DATASETS_DIR", ".")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+TTA_REPAIR_SFT_METADATA_DIR = os.environ.get(
+    "TTA_REPAIR_SFT_METADATA_DIR", str(REPO_ROOT / "experiments" / "tta_sft_metadata")
+)
+TTA_REPAIR_SFT_ROLLOUT_DIR = os.environ.get(
+    "TTA_REPAIR_SFT_ROLLOUT_DIR", str(REPO_ROOT / "training" / "tta_sft_success_v2")
+)
+TTA_REPAIR_SFT_BASE_CHECKPOINT = os.environ.get(
+    "TTA_REPAIR_SFT_BASE_CHECKPOINT",
+    "/data1/liu/exp/counterfactual/checkpoints/Cosmos-Policy-LIBERO-Predict2-2B/"
+    "Cosmos-Policy-LIBERO-Predict2-2B.pt",
+)
 
 
 # *** Main checkpoint ***
@@ -195,6 +208,69 @@ cosmos_predict2_2b_480p_libero__inference_only = LazyDict(
         job=dict(
             group="cosmos_v2_inference",
             name="cosmos_predict2_2b_480p_libero__inference_only",
+        ),
+    )
+)
+
+
+# Success-only policy LoRA SFT over repaired robot-initial-state rollouts.
+# Reclassify successful rollouts as demonstrations and train only the action
+# latent; keep the stock LIBERO image augmentation and logging behavior.
+tta_repair_sft_dataset = L(LIBERODataset)(
+    data_dir=TTA_REPAIR_SFT_METADATA_DIR,
+    t5_text_embeddings_path=os.path.join(TTA_REPAIR_SFT_METADATA_DIR, "t5_embeddings.pkl"),
+    chunk_size=16,
+    rollout_data_dir=TTA_REPAIR_SFT_ROLLOUT_DIR,
+    demonstration_sampling_prob=1.0,
+    treat_success_rollouts_as_demos=True,
+)
+tta_repair_sft = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_libero",
+            "_self_",
+        ],
+        trainer=dict(
+            max_iter=200,
+        ),
+        optimizer=dict(
+            lr=1e-5,
+        ),
+        scheduler=dict(
+            cycle_lengths=[200, 100000000000000],
+            warm_up_steps=[10, 0],
+        ),
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                use_lora=True,
+                lora_rank=8,
+                lora_alpha=16,
+                mask_loss_for_action_future_state_prediction=True,
+            ),
+        ),
+        checkpoint=dict(
+            load_path=TTA_REPAIR_SFT_BASE_CHECKPOINT,
+            save_iter=50,
+            load_ema_to_reg=False,
+        ),
+        dataloader_train=L(DataLoader)(
+            num_workers=2,
+            persistent_workers=True,
+            pin_memory=True,
+            dataset=tta_repair_sft_dataset,
+            sampler=L(DistributedSampler)(
+                dataset=tta_repair_sft_dataset,
+                num_replicas=L(parallel_state.get_data_parallel_world_size)(),
+                rank=L(parallel_state.get_data_parallel_rank)(),
+                shuffle=True,
+                seed=0,
+            ),
+            batch_size=1,
+            drop_last=True,
+        ),
+        job=dict(
+            name="tta_repair_sft",
+            wandb_mode="disabled",
         ),
     )
 )
@@ -461,6 +537,7 @@ def register_configs():
         # LIBERO
         cosmos_predict2_2b_480p_libero,  # *** Main checkpoint ***
         cosmos_predict2_2b_480p_libero__inference_only,
+        tta_repair_sft,
         # RoboCasa
         cosmos_predict2_2b_480p_robocasa_50_demos_per_task,  # *** Main checkpoint ***
         cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference,

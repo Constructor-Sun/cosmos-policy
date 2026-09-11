@@ -568,6 +568,40 @@ class DistributedCheckpointer(AbstractCheckpointer):
                     checkpoint_state_dict = {}
 
                 log.info("Broadcasting consolidated model checkpoint from rank 0")
+
+                # Consolidated .pt files store plain parameter names (e.g.
+                # "blocks.0.self_attn.q_proj.weight"), but a LoRA-injected model
+                # keeps the base weights under "...base_layer.weight", and
+                # activation-checkpointing wrappers add "_checkpoint_wrapped_module"
+                # segments to the live parameter names. Without remapping, a
+                # non-strict load silently leaves every wrapped layer at random
+                # init. Map each checkpoint key onto the actual model parameter.
+                if distributed.is_rank0():
+                    model_keys = {k: None for k in model.state_dict().keys()}
+                    canon = lambda k: k.replace("_checkpoint_wrapped_module.", "")
+                    canon_model_keys = {}
+                    for mk in model_keys:
+                        canon_model_keys.setdefault(canon(mk), mk)
+                    remapped = {}
+                    for ck, v in checkpoint_state_dict.items():
+                        ck_canon = canon(ck)
+                        target = None
+                        if ck_canon in canon_model_keys:
+                            target = canon_model_keys[ck_canon]
+                        else:
+                            # base weight of a LoRA-wrapped linear: "<...>.weight" -> "<...>.base_layer.weight"
+                            name, _, suffix = ck_canon.rpartition(".")
+                            bl = canon_model_keys.get(f"{name}.base_layer.{suffix}")
+                            if bl is not None:
+                                target = bl
+                        if target is None:
+                            log.warning(f"Skipping checkpoint key with no matching model parameter: {ck}")
+                            continue
+                        remapped[target] = v
+                    n_mapped = len(remapped)
+                    checkpoint_state_dict = remapped
+                    log.critical(f"Remapped {n_mapped} checkpoint keys onto model parameter names")
+
                 set_model_state_dict(
                     model,
                     model_state_dict=checkpoint_state_dict,

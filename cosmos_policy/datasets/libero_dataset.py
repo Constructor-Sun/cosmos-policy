@@ -56,6 +56,240 @@ from cosmos_policy.utils.utils import duplicate_array
 np.set_printoptions(precision=3, linewidth=np.inf)
 
 
+def build_action_chunk_sample(
+    episode_data: dict,
+    relative_step_idx: int,
+    chunk_size: int,
+    t5_text_embeddings: dict,
+    *,
+    use_proprio: bool = True,
+    use_wrist_images: bool = True,
+    use_third_person_images: bool = True,
+    return_value_function_returns: bool = True,
+    num_duplicates_per_image: int = 4,
+    final_image_size: int = 224,
+    normalize_images: bool = False,
+    use_image_aug: bool = True,
+    stronger_image_aug: bool = False,
+    decompress_jpeg: bool = False,
+    returns: np.ndarray | None = None,
+    rollout_data_mask: int = 0,
+    rollout_data_success_mask: int = 0,
+    world_model_sample_mask: int = 0,
+    value_function_sample_mask: int = 0,
+    global_rollout_idx: int = -1,
+    sample_key=None,
+    extra_fields: dict | None = None,
+) -> dict:
+    """Assemble one action-chunk training sample from a loaded episode.
+
+    Shared by LIBERODataset.__getitem__ and the TTA paired preference dataset
+    (memory_system/tta) so both produce byte-identical sample layouts. Pure
+    extraction from the former inline body of LIBERODataset.__getitem__ — the
+    per-sample behavior is unchanged.
+
+    Args:
+        episode_data: dict with images, wrist_images, proprio, actions,
+            command, num_steps, success, is_jpeg and (optionally) returns.
+        relative_step_idx: episode step the chunk starts at.
+        decompress_jpeg: decode jpeg-encoded frames on the fly (rollout data).
+
+    Returns:
+        dict: the standard training sample (same fields as before).
+    """
+    # Calculate future frame index if needed
+    future_frame_idx = relative_step_idx + chunk_size
+    max_possible_idx = episode_data["num_steps"] - 1
+    if future_frame_idx > max_possible_idx:
+        future_frame_idx = max_possible_idx
+
+    # Handle JPEG decompression for rollout data if needed
+    decompressed_images = {}
+    decompressed_wrist_images = {}
+    frames_needed = {relative_step_idx, future_frame_idx}
+    for frame_idx in frames_needed:
+        if decompress_jpeg:
+            # Decompress JPEG frames
+            decompressed_images[frame_idx] = decode_single_jpeg_frame(episode_data["images"][frame_idx])
+            decompressed_wrist_images[frame_idx] = decode_single_jpeg_frame(episode_data["wrist_images"][frame_idx])
+        else:
+            # Use images as-is
+            decompressed_images[frame_idx] = episode_data["images"][frame_idx]
+            decompressed_wrist_images[frame_idx] = episode_data["wrist_images"][frame_idx]
+
+    # Initialize list to store all images
+    image_list = []
+    current_sequence_idx = 0  # Used to track which sequence of images we are on
+
+    # Get blank array for the first input frame (needed for the tokenizer)
+    # Do not duplicate this image
+    first_input_image = np.expand_dims(np.zeros_like(decompressed_images[relative_step_idx]), axis=0)
+    image_list.append(first_input_image)
+    current_sequence_idx += 1
+
+    # Add proprio state if using proprio
+    if use_proprio:
+        proprio = episode_data["proprio"][relative_step_idx]
+        # Proprio values will be injected into latent diffusion sequence later
+        # For now just add blank image
+        blank_image = np.zeros_like(decompressed_images[relative_step_idx])
+        blank_image = duplicate_array(blank_image, total_num_copies=num_duplicates_per_image)
+        image_list.append(blank_image)
+        current_proprio_latent_idx = current_sequence_idx
+        current_sequence_idx += 1
+    else:
+        current_proprio_latent_idx = -1
+
+    # Add wrist image if using wrist images
+    if use_wrist_images:
+        wrist_image = decompressed_wrist_images[relative_step_idx]
+        # Duplicate wrist image
+        wrist_image = duplicate_array(wrist_image, total_num_copies=num_duplicates_per_image)
+        image_list.append(wrist_image)
+        current_wrist_image_latent_idx = current_sequence_idx
+        current_sequence_idx += 1
+    else:
+        current_wrist_image_latent_idx = -1
+
+    # Add current third-person image
+    if use_third_person_images:
+        current_image = decompressed_images[relative_step_idx]
+        current_image = duplicate_array(current_image, total_num_copies=num_duplicates_per_image)
+        image_list.append(current_image)
+        current_image_latent_idx = current_sequence_idx
+        current_sequence_idx += 1
+    else:
+        current_image_latent_idx = -1
+
+    # Add blank image for action chunk
+    blank_image = np.zeros_like(decompressed_images[relative_step_idx])
+    # Duplicate blank image
+    blank_image = duplicate_array(blank_image, total_num_copies=num_duplicates_per_image)
+    image_list.append(blank_image)
+    action_latent_idx = current_sequence_idx
+    current_sequence_idx += 1
+
+    # Add future proprio
+    if use_proprio:
+        future_proprio = episode_data["proprio"][future_frame_idx]
+        # Not using proprio image; proprio values will be injected into latent diffusion sequence later
+        # For now just add blank image
+        image_list.append(blank_image)
+        future_proprio_latent_idx = current_sequence_idx
+        current_sequence_idx += 1
+    else:
+        future_proprio_latent_idx = -1
+
+    # Add future wrist image
+    if use_wrist_images:
+        future_wrist_image = decompressed_wrist_images[future_frame_idx]
+        future_wrist_image = duplicate_array(future_wrist_image, total_num_copies=num_duplicates_per_image)
+        image_list.append(future_wrist_image)
+        future_wrist_image_latent_idx = current_sequence_idx
+        current_sequence_idx += 1
+    else:
+        future_wrist_image_latent_idx = -1
+
+    # Add future primary image
+    if use_third_person_images:
+        future_image = decompressed_images[future_frame_idx]
+        future_image = duplicate_array(future_image, total_num_copies=num_duplicates_per_image)
+        image_list.append(future_image)
+        future_image_latent_idx = current_sequence_idx
+        current_sequence_idx += 1
+    else:
+        future_image_latent_idx = -1
+
+    # Add blank value image
+    if return_value_function_returns:
+        image_list.append(blank_image)
+        value_latent_idx = current_sequence_idx
+        current_sequence_idx += 1
+        value_function_return = returns[future_frame_idx]
+    else:
+        value_latent_idx = -1
+        value_function_return = float("-100")  # Just a placeholder
+
+    # Stack images and preprocess
+    images = np.concatenate(image_list, axis=0)
+    images = preprocess_image(
+        images,
+        final_image_size=final_image_size,
+        normalize_images=normalize_images,
+        use_image_aug=use_image_aug,
+        stronger_image_aug=stronger_image_aug,
+    )
+
+    # Calculate how many actions we can get from the current index
+    action_chunk = get_action_chunk_with_padding(
+        actions=episode_data["actions"],
+        relative_step_idx=relative_step_idx,
+        chunk_size=chunk_size,
+        num_steps=episode_data["num_steps"],
+    )
+
+    # Return the next action chunk as well
+    # Calculate how many actions we can get from the current index
+    next_relative_step_idx = min(relative_step_idx + chunk_size, episode_data["num_steps"] - 1)
+    next_action_chunk = get_action_chunk_with_padding(
+        actions=episode_data["actions"],
+        relative_step_idx=next_relative_step_idx,
+        chunk_size=chunk_size,
+        num_steps=episode_data["num_steps"],
+    )
+
+    # Calculate next future frame index if needed
+    next_future_frame_idx = next_relative_step_idx + chunk_size
+    max_possible_idx = episode_data["num_steps"] - 1
+    if next_future_frame_idx > max_possible_idx:
+        next_future_frame_idx = max_possible_idx
+
+    # Return the next value function return as well
+    if return_value_function_returns:
+        next_value_function_return = returns[next_future_frame_idx]
+    else:
+        next_value_function_return = float("-100")  # Just a placeholder
+
+    sample_dict = {
+        "video": images,
+        "actions": action_chunk,
+        "t5_text_embeddings": torch.squeeze(t5_text_embeddings[episode_data["command"]]),
+        "t5_text_mask": torch.ones(512, dtype=torch.int64),  # Just copying what others have done in this codebase
+        "fps": 16,  # Just set to some fixed value since we aren't generating videos anyway
+        "padding_mask": torch.zeros(
+            1, final_image_size, final_image_size
+        ),  # Just copying what others have done in this codebase
+        "image_size": final_image_size
+        * torch.ones(
+            4
+        ),  # Just copying what others have done in this codebase; important because it shows up as model input
+        "proprio": proprio if use_proprio else np.zeros_like(episode_data["proprio"][relative_step_idx]),
+        "future_proprio": (
+            future_proprio if use_proprio else np.zeros_like(episode_data["proprio"][future_frame_idx])
+        ),
+        "__key__": sample_key,  # Unique sample identifier (required for callbacks)
+        "rollout_data_mask": rollout_data_mask,
+        "rollout_data_success_mask": rollout_data_success_mask,
+        "world_model_sample_mask": world_model_sample_mask,
+        "value_function_sample_mask": value_function_sample_mask,
+        "global_rollout_idx": global_rollout_idx,
+        "action_latent_idx": action_latent_idx,
+        "value_latent_idx": value_latent_idx,
+        "current_proprio_latent_idx": current_proprio_latent_idx,
+        "current_wrist_image_latent_idx": current_wrist_image_latent_idx,
+        "current_image_latent_idx": current_image_latent_idx,
+        "future_proprio_latent_idx": future_proprio_latent_idx,
+        "future_wrist_image_latent_idx": future_wrist_image_latent_idx,
+        "future_image_latent_idx": future_image_latent_idx,
+        "value_function_return": value_function_return,
+        "next_action_chunk": next_action_chunk,
+        "next_value_function_return": next_value_function_return,
+    }
+    if extra_fields:
+        sample_dict.update(extra_fields)
+    return sample_dict
+
+
 class LIBERODataset(Dataset):
     def __init__(
         self,
@@ -558,199 +792,39 @@ class LIBERODataset(Dataset):
                 is_world_model_sample = True
                 is_value_function_sample = False
 
-        # Calculate future frame index if needed
-        future_frame_idx = relative_step_idx + self.chunk_size
-        max_possible_idx = episode_data["num_steps"] - 1
-        if future_frame_idx > max_possible_idx:
-            future_frame_idx = max_possible_idx
+        # Rollout episodes keep their value-function returns in the (lazily
+        # loaded) episode metadata; demonstration episodes carry them in the
+        # episode data itself.
+        if sample_type != "demo":
+            returns = episode_metadata.get("returns") if episode_metadata is not None else None
+            if returns is None:
+                returns = episode_data.get("returns")
+        else:
+            returns = episode_data.get("returns")
 
-        # Handle JPEG decompression for rollout data if needed
-        decompressed_images = {}
-        decompressed_wrist_images = {}
-        frames_needed = {relative_step_idx, future_frame_idx}
-        for frame_idx in frames_needed:
-            if sample_type != "demo" and episode_data["is_jpeg"]:
-                # Decompress JPEG frames
-                decompressed_images[frame_idx] = decode_single_jpeg_frame(episode_data["images"][frame_idx])
-                decompressed_wrist_images[frame_idx] = decode_single_jpeg_frame(episode_data["wrist_images"][frame_idx])
-            else:
-                # Use images as-is
-                decompressed_images[frame_idx] = episode_data["images"][frame_idx]
-                decompressed_wrist_images[frame_idx] = episode_data["wrist_images"][frame_idx]
-
-        # Initialize list to store all images
-        image_list = []
-        current_sequence_idx = 0  # Used to track which sequence of images we are on
-
-        # Get blank array for the first input frame (needed for the tokenizer)
-        # Do not duplicate this image
-        first_input_image = np.expand_dims(np.zeros_like(decompressed_images[relative_step_idx]), axis=0)
-        image_list.append(first_input_image)
-        current_sequence_idx += 1
-
-        # Add proprio state if using proprio
-        if self.use_proprio:
-            proprio = episode_data["proprio"][relative_step_idx]
-            image = decompressed_images[relative_step_idx]
-            # Proprio values will be injected into latent diffusion sequence later
-            # For now just add blank image
-            blank_image = np.zeros_like(decompressed_images[relative_step_idx])
-            blank_image = duplicate_array(blank_image, total_num_copies=self.num_duplicates_per_image)
-            image_list.append(blank_image)
-            current_proprio_latent_idx = current_sequence_idx
-            current_sequence_idx += 1
-
-        # Add wrist image if using wrist images
-        if self.use_wrist_images:
-            wrist_image = decompressed_wrist_images[relative_step_idx]
-            # Duplicate wrist image
-            wrist_image = duplicate_array(wrist_image, total_num_copies=self.num_duplicates_per_image)
-            image_list.append(wrist_image)
-            current_wrist_image_latent_idx = current_sequence_idx
-            current_sequence_idx += 1
-
-        # Add current third-person image
-        if self.use_third_person_images:
-            current_image = decompressed_images[relative_step_idx]
-            current_image = duplicate_array(current_image, total_num_copies=self.num_duplicates_per_image)
-            image_list.append(current_image)
-            current_image_latent_idx = current_sequence_idx
-            current_sequence_idx += 1
-
-        # Add blank image for action chunk
-        blank_image = np.zeros_like(decompressed_images[relative_step_idx])
-        # Duplicate blank image
-        blank_image = duplicate_array(blank_image, total_num_copies=self.num_duplicates_per_image)
-        image_list.append(blank_image)
-        action_latent_idx = current_sequence_idx
-        current_sequence_idx += 1
-
-        # Add future proprio
-        if self.use_proprio:
-            future_proprio = episode_data["proprio"][future_frame_idx]
-            # Not using proprio image; proprio values will be injected into latent diffusion sequence later
-            # For now just add blank image
-            blank_image = np.zeros_like(decompressed_images[relative_step_idx])
-            blank_image = duplicate_array(blank_image, total_num_copies=self.num_duplicates_per_image)
-            image_list.append(blank_image)
-            future_proprio_latent_idx = current_sequence_idx
-            current_sequence_idx += 1
-
-        # Add future wrist image
-        if self.use_wrist_images:
-            future_wrist_image = decompressed_wrist_images[future_frame_idx]
-            future_wrist_image = duplicate_array(future_wrist_image, total_num_copies=self.num_duplicates_per_image)
-            image_list.append(future_wrist_image)
-            future_wrist_image_latent_idx = current_sequence_idx
-            current_sequence_idx += 1
-
-        # Add future primary image
-        if self.use_third_person_images:
-            future_image = decompressed_images[future_frame_idx]
-            future_image = duplicate_array(future_image, total_num_copies=self.num_duplicates_per_image)
-            image_list.append(future_image)
-            future_image_latent_idx = current_sequence_idx
-            current_sequence_idx += 1
-
-        # Add blank value image
-        if self.return_value_function_returns:
-            value_image = np.zeros_like(decompressed_images[relative_step_idx])
-            value_image = duplicate_array(value_image, total_num_copies=self.num_duplicates_per_image)
-            image_list.append(value_image)
-            value_latent_idx = current_sequence_idx
-            current_sequence_idx += 1
-
-        # Stack images and preprocess
-        images = np.concatenate(image_list, axis=0)
-        images = preprocess_image(
-            images,
+        return build_action_chunk_sample(
+            episode_data,
+            relative_step_idx,
+            self.chunk_size,
+            self.t5_text_embeddings,
+            use_proprio=self.use_proprio,
+            use_wrist_images=self.use_wrist_images,
+            use_third_person_images=self.use_third_person_images,
+            return_value_function_returns=self.return_value_function_returns,
+            num_duplicates_per_image=self.num_duplicates_per_image,
             final_image_size=self.final_image_size,
             normalize_images=self.normalize_images,
             use_image_aug=self.use_image_aug,
             stronger_image_aug=self.use_stronger_image_aug,
+            decompress_jpeg=(sample_type != "demo") and episode_data["is_jpeg"],
+            returns=returns,
+            rollout_data_mask=rollout_data_mask,
+            rollout_data_success_mask=rollout_data_success_mask,
+            world_model_sample_mask=1 if is_world_model_sample else 0,
+            value_function_sample_mask=1 if is_value_function_sample else 0,
+            global_rollout_idx=global_rollout_idx,
+            sample_key=idx,
         )
-
-        # Calculate how many actions we can get from the current index
-        action_chunk = get_action_chunk_with_padding(
-            actions=episode_data["actions"],
-            relative_step_idx=relative_step_idx,
-            chunk_size=self.chunk_size,
-            num_steps=episode_data["num_steps"],
-        )
-
-        # Return the next action chunk as well
-        # Calculate how many actions we can get from the current index
-        next_relative_step_idx = min(relative_step_idx + self.chunk_size, episode_data["num_steps"] - 1)
-        next_action_chunk = get_action_chunk_with_padding(
-            actions=episode_data["actions"],
-            relative_step_idx=next_relative_step_idx,
-            chunk_size=self.chunk_size,
-            num_steps=episode_data["num_steps"],
-        )
-
-        # Get return for value function prediction
-        if self.return_value_function_returns:
-            return_timestep = future_frame_idx
-            if episode_metadata is not None:
-                value_function_return = episode_metadata["returns"][return_timestep]
-            else:
-                value_function_return = episode_data["returns"][return_timestep]
-        else:
-            value_function_return = float("-100")  # Just a placeholder
-
-        # Calculate next future frame index if needed
-        next_future_frame_idx = next_relative_step_idx + self.chunk_size
-        max_possible_idx = episode_data["num_steps"] - 1
-        if next_future_frame_idx > max_possible_idx:
-            next_future_frame_idx = max_possible_idx
-
-        # Return the next value function return as well
-        if self.return_value_function_returns:
-            return_timestep = next_future_frame_idx
-            if episode_metadata is not None:
-                next_value_function_return = episode_metadata["returns"][return_timestep]
-            else:
-                next_value_function_return = episode_data["returns"][return_timestep]
-        else:
-            next_value_function_return = float("-100")  # Just a placeholder
-
-        sample_dict = {
-            "video": images,
-            "actions": action_chunk,
-            "t5_text_embeddings": torch.squeeze(self.t5_text_embeddings[episode_data["command"]]),
-            "t5_text_mask": torch.ones(512, dtype=torch.int64),  # Just copying what others have done in this codebase
-            "fps": 16,  # Just set to some fixed value since we aren't generating videos anyway
-            "padding_mask": torch.zeros(
-                1, self.final_image_size, self.final_image_size
-            ),  # Just copying what others have done in this codebase
-            "image_size": self.final_image_size
-            * torch.ones(
-                4
-            ),  # Just copying what others have done in this codebase; important because it shows up as model input
-            "proprio": proprio if self.use_proprio else np.zeros_like(episode_data["proprio"][relative_step_idx]),
-            "future_proprio": (
-                future_proprio if self.use_proprio else np.zeros_like(episode_data["proprio"][future_frame_idx])
-            ),
-            "__key__": idx,  # Unique sample identifier (required for callbacks)
-            "rollout_data_mask": rollout_data_mask,
-            "rollout_data_success_mask": rollout_data_success_mask,
-            "world_model_sample_mask": 1 if is_world_model_sample else 0,
-            "value_function_sample_mask": 1 if is_value_function_sample else 0,
-            "global_rollout_idx": global_rollout_idx,
-            "action_latent_idx": action_latent_idx,
-            "value_latent_idx": value_latent_idx if self.return_value_function_returns else -1,
-            "current_proprio_latent_idx": current_proprio_latent_idx if self.use_proprio else -1,
-            "current_wrist_image_latent_idx": current_wrist_image_latent_idx if self.use_wrist_images else -1,
-            "current_image_latent_idx": current_image_latent_idx if self.use_third_person_images else -1,
-            "future_proprio_latent_idx": future_proprio_latent_idx if self.use_proprio else -1,
-            "future_wrist_image_latent_idx": future_wrist_image_latent_idx if self.use_wrist_images else -1,
-            "future_image_latent_idx": future_image_latent_idx if self.use_third_person_images else -1,
-            "value_function_return": value_function_return,
-            "next_action_chunk": next_action_chunk,
-            "next_value_function_return": next_value_function_return,
-        }
-
-        return sample_dict
 
 
 def create_augmentation_visualization(

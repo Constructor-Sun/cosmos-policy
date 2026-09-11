@@ -11,6 +11,7 @@ experiments/
 outputs/
 skill_memory/
 skill_memory_test/
+training/
 
 *.pyc
 *.log
@@ -29,3 +30,4 @@ memory_system/pointcloud_action/pointcloud_action_memory.pt.pre-surgical-2026090
 memory_system/pointcloud_action/archive/
 memory_system/pointcloud_action/diagnostics/
 memory_system/pointcloud_action/results
+memory_system/tta/results

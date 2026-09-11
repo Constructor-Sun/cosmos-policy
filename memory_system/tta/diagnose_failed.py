@@ -44,6 +44,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from memory_system.tta.variant_spec import resolve_variant
+
 MAX_STEPS = 520
 NUM_WAIT = 10
 
@@ -251,28 +253,43 @@ def diagnose_task(task_entry, variant, cfg, model, dataset_stats, resize_size, o
     pert_name = task_entry["task_name_perturbed"]
     abs_inits = task_entry["fail_init_indices_abs"]
 
-    suite = benchmark.get_benchmark_dict()["libero_10"](category_value="Robot Initial States")
-    match = None
-    for i in range(suite.n_tasks):
-        name = suite.get_task(i).name
-        if name == pert_name or name == base_task or name.startswith(f"{base_task}_"):
-            match = (i, name)
-            if name == pert_name:
-                break
-    if match is None:
-        return {"task": base_task, "status": "task_not_found"}
-    tid, suite_task_name = match
+    variant_spec = resolve_variant(pert_name, suite="libero_10")
+    suite = benchmark.get_benchmark_dict()[variant_spec.suite](
+        category_value=variant_spec.category
+    )
+    exact_matches = [
+        i for i in range(suite.n_tasks) if suite.get_task(i).name == pert_name
+    ]
+    if len(exact_matches) != 1:
+        raise RuntimeError(
+            f"Expected one exact task match for {pert_name!r} in "
+            f"category {variant_spec.category!r}, found {len(exact_matches)}"
+        )
+    tid = exact_matches[0]
+    suite_task = suite.get_task(tid)
+    suite_task_name = suite_task.name
     env, task_description = get_libero_env(
-        suite.get_task(tid), "cosmos", resolution=256, camera_depths=[True, False]
+        suite_task, "cosmos", resolution=256, camera_depths=[True, False]
     )
     init_states = suite.get_task_init_states(tid)
     object_query = SceneObjectQuery(env, resolution=256)
 
     base_resolved, demo_id, phases = load_task_sequence(suite_task_name)
-    print(f"[{variant}] task={suite_task_name[:60]} phases={[p.skill for p in phases]} "
-          f"demo={demo_id}", flush=True)
+    print(
+        f"[{variant}] category={variant_spec.category!r} "
+        f"task={suite_task_name} bddl={suite_task.bddl_file} "
+        f"phases={[p.skill for p in phases]} demo={demo_id}",
+        flush=True,
+    )
 
-    result = {"task": base_task, "variant": variant, "suite_task": suite_task_name}
+    result = {
+        "task": base_task,
+        "variant": variant,
+        "suite_task": suite_task_name,
+        "perturbation_category": variant_spec.category,
+        "perturbation_condition": variant_spec.condition,
+        "bddl_file": suite_task.bddl_file,
+    }
     init_indices = abs_inits
     for init_idx in init_indices:
         recorder = PhaseEventRecorder(
@@ -296,6 +313,9 @@ def diagnose_task(task_entry, variant, cfg, model, dataset_stats, resize_size, o
         record["census_abs_init"] = init_idx
         record["suite_task_name"] = suite_task_name
         record["task_name_perturbed"] = pert_name
+        record["perturbation_category"] = variant_spec.category
+        record["perturbation_condition"] = variant_spec.condition
+        record["bddl_file"] = suite_task.bddl_file
         candidate = None if success else record.get("candidate")
         t_star = event_step = None
         if candidate is not None:
@@ -313,6 +333,8 @@ def diagnose_task(task_entry, variant, cfg, model, dataset_stats, resize_size, o
         cand = record["candidate"]
         info_lines = [
             f"task: {base_task[:52]}",
+            f"category: {variant_spec.category}",
+            f"actual: {suite_task_name[-62:]}",
             f"variant {variant} / init {init_idx}  success={success}",
             "candidate: none" if cand is None else
             (f"candidate: {cand['span']['skill']}#{cand['span']['phase_index']}"
@@ -390,7 +412,7 @@ def main() -> None:
     for r in summary:
         cand = r.get("candidate")
         cand_txt = (
-            f"{cand['skill']}#{cand['phase_index']} {cand['status']} "
+            f"{cand['span']['skill']}#{cand['span']['phase_index']} {cand['status']} "
             f"t*={cand['t_star']} (event={cand['event_step']})"
             if cand else "-"
         )
