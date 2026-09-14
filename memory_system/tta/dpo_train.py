@@ -32,7 +32,9 @@ from memory_system.tta.model import setup_offline_hf_cache  # noqa: E402
 setup_offline_hf_cache()
 
 from memory_system.tta.dataset import PreferenceDataset  # noqa: E402
-from memory_system.tta.model import TTADPOModel, load_policy_model  # noqa: E402
+from memory_system.tta.model import (  # noqa: E402
+    TTADPOModel, CHOSEN, REJECTED, dpo_loss_from_errors, load_policy_model,
+)
 
 
 def pick_gpu(budget_gb: float) -> int:
@@ -71,6 +73,13 @@ def parse_args():
     p.add_argument("--save-every", type=int, default=0, help="0 = save only at the end")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu-memory-budget-gb", type=float, default=20.0)
+    p.add_argument("--anchor-weight", type=float, default=0.0,
+                   help="chosen-protection control: total = DPO + w * E_policy(chosen). "
+                        "0 = pure DPO (registered runs); >0 = the pre-registered "
+                        "chosen-anchor control (2026-09-13).")
+    p.add_argument("--dpo-weight", type=float, default=1.0,
+                   help="weight of the DPO contrast term; 0 = anchor-only "
+                        "(pure window BC — the attribution control, 2026-09-14).")
     return p.parse_args()
 
 
@@ -106,15 +115,23 @@ def main() -> None:
         dataset.set_epoch(epoch)
         for batch in loader:
             batch = model.batch_to_device(batch)
-            loss, margin, _e = model.dpo_forward(batch)
+            e_policy, e_reference = model.errors(batch)
+            delta_pairs = (e_policy - e_reference).view(-1, 2)
+            loss_dpo, margin = dpo_loss_from_errors(delta_pairs[:, CHOSEN], delta_pairs[:, REJECTED], model.beta)
+            loss = args.dpo_weight * loss_dpo
+            anchor_val = 0.0
+            if args.anchor_weight > 0:
+                anchor_val = float(e_policy.view(-1, 2)[:, CHOSEN].mean())
+                loss = loss + args.anchor_weight * e_policy.view(-1, 2)[:, CHOSEN].mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.lora_parameters(), max_norm=1e9)
             optimizer.step()
             step += 1
             if step % args.log_every == 0:
-                print(f"[train] step={step} loss={float(loss):.4f} margin={float(margin):.4f} "
-                      f"grad_norm={float(grad_norm):.3e}")
+                extra = f" anchor={anchor_val:.4f}" if args.anchor_weight > 0 else ""
+                print(f"[train] step={step} loss={float(loss):.4f} dpo={float(loss_dpo):.4f} "
+                      f"margin={float(margin):.4f} grad_norm={float(grad_norm):.3e}{extra}", flush=True)
             if args.save_every and step % args.save_every == 0:
                 model.save_adapter(str(run_dir / f"adapter_step{step}.pt"),
                                    extra_meta={"step": step, "manifest": args.manifest})
@@ -124,7 +141,9 @@ def main() -> None:
 
     final_path = str(run_dir / f"adapter_step{step}.pt")
     model.save_adapter(final_path, extra_meta={"step": step, "manifest": args.manifest,
-                                               "max_steps": args.max_steps})
+                                               "max_steps": args.max_steps,
+                                               "anchor_weight": args.anchor_weight,
+                                               "dpo_weight": args.dpo_weight})
     print(f"[train] done: {step} steps, adapter at {final_path}")
 
 

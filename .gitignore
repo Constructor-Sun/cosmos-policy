@@ -31,3 +31,4 @@ memory_system/pointcloud_action/archive/
 memory_system/pointcloud_action/diagnostics/
 memory_system/pointcloud_action/results
 memory_system/tta/results
+tests/tta/archived_lorafix/

@@ -17,8 +17,8 @@ from memory_system.execute.skill_completion import (
 )
 
 SKILL_MAX_ACTION_CHUNKS: dict[str, int] = {
-    "Pick": 9,
-    "PlaceOn": 5,
+    "Pick": 7,
+    "PlaceOn": 3,
     "PlaceIn": 3,
     "Open": 3,
     "Close": 3,

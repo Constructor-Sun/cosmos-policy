@@ -18,13 +18,14 @@
 # variant for each perturbation, because the valid variant IDs/specs are
 # different across tasks.
 #
-# Default GPU is CUDA device 7; override with GPU_ID=...
+# By default use four currently available GPUs; override with GPU_IDS=...
 #
 # Usage:
 #   sh scripts/run_libero10_all_7dims_baseline.sh
 #
 # Useful overrides:
-#   GPU_ID=7 NUM_CASES=20 SEED=7 OUTPUT_ROOT=/path sh scripts/run_libero10_all_7dims_baseline.sh
+#   GPU_IDS="0 2 3 4" MAX_PARALLEL=4 NUM_CASES=20 SEED=7 OUTPUT_ROOT=/path \
+#     sh scripts/run_libero10_all_7dims_baseline.sh
 #
 
 set -eu
@@ -36,9 +37,13 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 # Defaults
 # ---------------------------------------------------------------------------
 GPU_ID=${GPU_ID:-7}
+GPU_IDS=${GPU_IDS:-"0 2 3 4"}
+MAX_PARALLEL=${MAX_PARALLEL:-4}
 NUM_CASES=${NUM_CASES:-20}
 SEED=${SEED:-7}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/experiments/libero10_all_7dims_baseline}
+ROLLOUT_ROOT=${ROLLOUT_ROOT:-variants/libero10_all_7dims_20260914}
+COSMOS_SKIP_PLAIN_ROLLOUT=${COSMOS_SKIP_PLAIN_ROLLOUT:-1}
 SMOKE_GL_BACKEND=${SMOKE_GL_BACKEND:-egl}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/scripts/run_libero_smoke_test.py}
 SMOKE_T5_EXTRA_EMBEDDINGS=${SMOKE_T5_EXTRA_EMBEDDINGS:-$REPO_ROOT/experiments/cache/libero_plus_language_t5_libero10.pkl}
@@ -125,10 +130,25 @@ fi
 
 mkdir -p "$OUTPUT_ROOT"
 
+_n_gpus=0
+for _g in $GPU_IDS; do _n_gpus=$((_n_gpus + 1)); done
+if [ "$_n_gpus" -eq 0 ]; then
+    echo "ERROR: GPU_IDS is empty" >&2
+    exit 1
+fi
+if [ "$MAX_PARALLEL" -lt 1 ]; then
+    echo "ERROR: MAX_PARALLEL must be at least 1" >&2
+    exit 1
+fi
+_gpu_index=0
+_jobs=0
+
 echo "======================================================"
 echo "LIBERO-10 x selected LIBERO-plus dimensions baseline (no clean, no robot_init)"
 echo "Output root : $OUTPUT_ROOT"
-echo "GPU_ID      : $GPU_ID"
+echo "GPU_IDS     : $GPU_IDS"
+echo "MAX_PARALLEL: $MAX_PARALLEL"
+echo "ROLLOUT_ROOT: $ROLLOUT_ROOT"
 echo "NUM_CASES   : $NUM_CASES"
 echo "SEED        : $SEED"
 echo "======================================================"
@@ -136,8 +156,25 @@ echo "======================================================"
 # ---------------------------------------------------------------------------
 # Run selected perturbations only.
 # ---------------------------------------------------------------------------
-printf '%s\n' "$RUN_PLAN" | while IFS='|' read -r task language pert_name pert_category pert_task variant_display; do
+_run_plan_file=$(mktemp)
+printf '%s\n' "$RUN_PLAN" > "$_run_plan_file"
+
+while IFS='|' read -r task language pert_name pert_category pert_task variant_display; do
     [ -z "$task" ] && continue
+
+    _gpu=""
+    _i=0
+    for _g in $GPU_IDS; do
+        if [ "$_i" -eq "$_gpu_index" ]; then
+            _gpu=$_g
+            break
+        fi
+        _i=$((_i + 1))
+    done
+    if [ -z "$_gpu" ]; then
+        _gpu=$GPU_ID
+    fi
+    _gpu_index=$(( (_gpu_index + 1) % _n_gpus ))
 
     pert_dir="$OUTPUT_ROOT/$task/$pert_name"
     mkdir -p "$pert_dir"
@@ -154,13 +191,16 @@ printf '%s\n' "$RUN_PLAN" | while IFS='|' read -r task language pert_name pert_c
     echo ""
     echo "=== $pert_name: $task ==="
     echo "    variant: $variant_display"
+    echo "    gpu: $_gpu"
     echo "    results: $pert_dir"
 
     (
         cd "$REPO_ROOT"
         COSMOS_INIT_STATE_OFFSET=0 \
+        COSMOS_ROLLOUT_SUBDIR="$ROLLOUT_ROOT/$pert_name/$task" \
+        COSMOS_SKIP_PLAIN_ROLLOUT="$COSMOS_SKIP_PLAIN_ROLLOUT" \
         SMOKE_PYTHON_SCRIPT="$SMOKE_PYTHON_SCRIPT" \
-        GPU_ID="$GPU_ID" \
+        GPU_ID="$_gpu" \
         SMOKE_GL_BACKEND="$SMOKE_GL_BACKEND" \
         SMOKE_ONLY_CONDITION=perturb \
         SMOKE_PAIR_SUITE=libero_10 \
@@ -172,14 +212,21 @@ printf '%s\n' "$RUN_PLAN" | while IFS='|' read -r task language pert_name pert_c
         SMOKE_NUM_PAIRS="$NUM_CASES" \
         SMOKE_SEED="$SEED" \
         SMOKE_RESULTS_DIR="$pert_dir" \
-        SMOKE_RUN_ID="all7dims_baseline_${pert_name}_gpu${GPU_ID}_${task}" \
+        SMOKE_RUN_ID="all7dims_baseline_${pert_name}_gpu${_gpu}_${task}" \
         SMOKE_T5_EXTRA_EMBEDDINGS="$SMOKE_T5_EXTRA_EMBEDDINGS" \
         SMOKE_T5_ALLOW_STRICT_COMPUTE="$SMOKE_T5_ALLOW_STRICT_COMPUTE" \
         sh "$REPO_ROOT/scripts/run_libero_smoke_test.sh" > "$pert_dir/run.log" 2>&1
-    )
+    ) &
+    _jobs=$((_jobs + 1))
 
-    echo "    finished: $pert_dir"
-done
+    if [ "$_jobs" -ge "$MAX_PARALLEL" ]; then
+        wait
+        _jobs=0
+    fi
+done < "$_run_plan_file"
+
+rm -f "$_run_plan_file"
+wait
 
 echo ""
 echo "All selected LIBERO-10 evaluations complete (no clean, no robot_init)."

@@ -56,17 +56,47 @@ def replay_case(env, init_states, init_idx, actions: np.ndarray, resize_size: in
     return success, primary, wrist, np.stack(proprio_buf), actions[: len(primary)]
 
 
-def save_episode(path: Path, primary, wrist, proprio, actions, success, task_description, tag):
-    from cosmos_policy.datasets.dataset_utils import apply_jpeg_compression_np
+def _jpeg_bytes(frame: np.ndarray) -> np.ndarray:
+    """Encode one uint8 frame as JPEG bytes. The *_images_jpeg vlen convention
+    stores REAL jpeg byte strings (decode_single_jpeg_frame does PIL
+    Image.open on each element) — apply_jpeg_compression_np returns a
+    re-decoded image ARRAY and must not be used here (data-corruption bug
+    found 2026-09-13: vlen-of-pixels wrote garbage). Returned as a 1-D uint8
+    ndarray because h5py's vlen writer requires ndarray elements (raw bytes
+    raise 'bytes object has no attribute dtype')."""
+    import io
 
+    from PIL import Image
+
+    assert frame.dtype == np.uint8, f"expected uint8 frame, got {frame.dtype}"
+    buffer = io.BytesIO()
+    Image.fromarray(frame).save(buffer, format="JPEG", quality=95)
+    return np.frombuffer(buffer.getvalue(), dtype=np.uint8)
+
+
+def episode_file_complete(path: Path) -> bool:
+    """True iff the file opens and carries every dataset/attr the dataset
+    loader needs — a crash mid-write leaves a partial file that must be
+    re-captured (overwritten via 'w' mode), never trusted."""
+    try:
+        with h5py.File(path, "r") as f:
+            needed = ("primary_images_jpeg", "wrist_images_jpeg", "actions", "proprio")
+            return all(k in f for k in needed) and "success" in f.attrs
+    except OSError:
+        return False
+
+
+def save_episode(path: Path, primary, wrist, proprio, actions, success, task_description, tag,
+                 suite_task_name: str):
     with h5py.File(path, "w") as f:
         for key, frames in (("primary", primary), ("wrist", wrist)):
-            jpeg = [apply_jpeg_compression_np(frame, quality=95) for frame in frames]
+            jpeg = [_jpeg_bytes(frame) for frame in frames]
             f.create_dataset(f"{key}_images_jpeg", data=jpeg, dtype=h5py.vlen_dtype(np.dtype("uint8")))
         f.create_dataset("actions", data=np.asarray(actions, dtype=np.float32))
         f.create_dataset("proprio", data=np.asarray(proprio, dtype=np.float32))
         f.attrs["success"] = bool(success)
         f.attrs["task_description"] = task_description
+        f.attrs["suite_task_name"] = suite_task_name
         f.attrs["tag"] = tag
         f.attrs["recorded_at"] = datetime.now().isoformat()
 
@@ -91,39 +121,52 @@ def main() -> None:
         tags = tags[: args.limit]
 
     from libero.libero import benchmark
-    from cosmos_policy.experiments.robot.libero.libero_utils import get_libero_env, get_image_resize_size
+    from cosmos_policy.experiments.robot.libero.libero_utils import get_libero_env
+    from cosmos_policy.experiments.robot.robot_utils import get_image_resize_size
 
     resize_size = get_image_resize_size("cosmos")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # One env per EXACT suite task variant: the init-state list and the
+    # language description (T5 lookup key) are per-variant. The old
+    # task-prefix matcher always hit the FIRST *_view variant (e.g.
+    # initstate_4 instead of the meta's initstate_274) and replayed every
+    # case from the WRONG initial state (proprio off by ~0.2 from t=0,
+    # found 2026-09-13) — group by suite_task_name and match by equality.
     by_task: dict[str, list[tuple[str, dict]]] = {}
     for tag in tags:
-        by_task.setdefault(screening[tag]["task"], []).append((tag, screening[tag]))
+        meta_i = screening[tag]
+        key = meta_i.get("suite_task_name") or meta_i["task"]
+        by_task.setdefault(key, []).append((tag, meta_i))
+
+    suite = benchmark.get_benchmark_dict()["libero_10"](category_value="Robot Initial States")
+    suite_names = [suite.get_task(i).name for i in range(suite.n_tasks)]
 
     report = {"cases": [], "skipped_existing": 0}
-    for task, cases in by_task.items():
-        suite = benchmark.get_benchmark_dict()["libero_10"](category_value="Robot Initial States")
-        match = None
-        for i in range(suite.n_tasks):
-            name = suite.get_task(i).name
-            if name.startswith(f"{task}_") or name == task:
-                match = (i, name)
-                if name.startswith(f"{task}_view"):
-                    break
-        if match is None:
+    for suite_task_name, cases in by_task.items():
+        if suite_task_name in suite_names:
+            tid = suite_names.index(suite_task_name)
+        else:
+            # legacy fallback: prefix match on the base task name
+            base_task = cases[0][1]["task"]
+            tid = next((i for i, n in enumerate(suite_names)
+                        if n.startswith(f"{base_task}_view") or n == base_task), None)
+        if tid is None:
             report["cases"] += [{"tag": tag, "status": "task_not_found"} for tag, _ in cases]
             continue
-        tid, _suite_task_name = match
         env, task_description = get_libero_env(suite.get_task(tid), "cosmos", resolution=256, camera_depths=[True, False])
         init_states = suite.get_task_init_states(tid)
         try:
             for tag, meta in cases:
                 out_path = out_dir / f"tta_rejected--{tag}--success=False.hdf5"
-                if out_path.exists():
+                if out_path.exists() and episode_file_complete(out_path) \
+                        and str(h5py.File(out_path, "r").attrs.get("suite_task_name", "")) == suite_task_name:
                     report["skipped_existing"] += 1
                     continue
-                source = Path(args.diagnosis_root) / task / meta["init"] / "episode.h5"
+                if out_path.exists():
+                    print(f"[replay] {tag}: existing file stale/incomplete, re-capturing")
+                source = Path(args.diagnosis_root) / meta["task"] / meta["init"] / "episode.h5"
                 if not source.exists():
                     report["cases"].append({"tag": tag, "status": "no_stored_actions"})
                     continue
@@ -138,8 +181,10 @@ def main() -> None:
                     report["cases"].append({"tag": tag, "status": "rerun_succeeded_skip"})
                     print(f"[replay] {tag}: replay succeeded (expected failure), skipped")
                     continue
-                save_episode(out_path, primary, wrist, proprio, used, success, task_description, tag)
-                report["cases"].append({"tag": tag, "status": "saved", "path": str(out_path), "steps": len(used)})
+                save_episode(out_path, primary, wrist, proprio, used, success, task_description, tag,
+                             suite_task_name=suite_task_name)
+                report["cases"].append({"tag": tag, "status": "saved", "path": str(out_path),
+                                        "steps": len(used), "suite_task_name": suite_task_name})
                 print(f"[replay] {tag}: saved ({len(used)} steps)")
         finally:
             try:

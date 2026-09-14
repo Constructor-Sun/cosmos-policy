@@ -8,8 +8,16 @@ with ONE shared sigma/epsilon draw.
 Objective scope: with K=1 this is a single-chunk preference objective, not a
 trajectory-level sum (docs/TTA_TRAINING_IMPLEMENTATION.md §目标公式).
 
-Chunk choice: deterministic per (pair, epoch) via set_epoch(), so the custom
-training loop can vary chunks across epochs while staying reproducible.
+Chunk choice: contrast chunks live ONLY in the memory-intervention window —
+starts are on a shared absolute grid with start >= t_star (repair cut-in)
+and start + chunk <= phase_end (the failing phase's end on the baseline
+timeline). BOTH sides use the SAME start, so every pair compares memory-
+repair execution vs failure execution at the same task time off a shared
+(bit-exact) prefix. Before t_star the two sides are identical; after
+phase_end both are the VLA's own continuations (on good vs bad states) —
+neither carries an action-preference signal. Under the pre-v3 sampler those
+regions were 64% of all chunks and taught pure state discrimination.
+Deterministic per (pair, epoch) via set_epoch().
 
 Strict labels: the h5 `success` attr is ground truth — chosen must have
 succeeded, rejected must have failed (doc §9).
@@ -137,13 +145,14 @@ class PreferenceDataset(Dataset):
             stats = {k: np.array(v, dtype=np.float32) for k, v in json.load(f).items()}
         self._stats_bytes = tuple(stats[k].tobytes() for k in ("actions_min", "actions_max", "proprio_min", "proprio_max"))
 
-        # Validate pairs once: chunk counts and (optionally) h5 label ground truth.
+        # Validate pairs once: h5 label ground truth (strict mode) and the
+        # shared divergent-region chunk grid.
         self._valid: list[dict] = []
         for pair in self.pairs:
-            entry = {}
-            for key in ("chosen", "rejected"):
-                ep = self._episode(pair[f"{key}_path"])
-                if self.strict_labels:
+            eps = {key: self._episode(pair[f"{key}_path"]) for key in ("chosen", "rejected")}
+            if self.strict_labels:
+                for key in ("chosen", "rejected"):
+                    ep = eps[key]
                     if key == "chosen" and not ep["success"]:
                         raise ValueError(f"{pair['pair_id']}: chosen did not succeed ({pair['chosen_path']})")
                     if key == "rejected" and ep["success"]:
@@ -151,11 +160,26 @@ class PreferenceDataset(Dataset):
                     label = pair.get(f"{key}_success")
                     if label is not None and bool(label) != ep["success"]:
                         raise ValueError(f"{pair['pair_id']}: manifest label contradicts h5 attr for {key}")
-                n = ep["num_steps"]
-                entry[key] = list(range(0, max(0, (n - self.chunk_size) // self.chunk_size + 1)))
-            if not entry["chosen"] or not entry["rejected"]:
-                raise ValueError(f"{pair['pair_id']}: episode shorter than one chunk")
-            self._valid.append(entry)
+            n = min(eps["chosen"]["num_steps"], eps["rejected"]["num_steps"])
+            if "phase_end" not in pair:
+                raise ValueError(
+                    f"{pair['pair_id']}: manifest pair missing phase_end — "
+                    "the divergent-region window cannot be bounded "
+                    "(rebuild the manifest with tools/build_manifest.py)")
+            t_star = int(pair["t_star"])
+            # Contrast chunks must lie ENTIRELY inside the memory-intervention
+            # window [t_star, phase_end): the failing phase's end on the
+            # baseline timeline. Beyond it both sides are the VLA's own
+            # continuations (on good vs bad states) — no preference signal,
+            # only harmful state discrimination (found 2026-09-13).
+            hi = min(n, int(pair["phase_end"]))
+            first = ((t_star + self.chunk_size - 1) // self.chunk_size) * self.chunk_size
+            starts = list(range(first, hi - self.chunk_size + 1, self.chunk_size))
+            if not starts:
+                raise ValueError(
+                    f"{pair['pair_id']}: no chunk in the divergent region "
+                    f"[t*={t_star}, min_len={n}) with chunk_size={self.chunk_size}")
+            self._valid.append({"starts": starts, "t_star": t_star})
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -169,16 +193,16 @@ class PreferenceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         pair = self.pairs[idx]
-        # ONE random ratio per pair per epoch, mapped onto BOTH trajectories:
-        # independent draws would compare unrelated phases and turn the K=1
-        # preference label into noise (review finding, 2026-09-09).
+        # ONE shared absolute start per pair per epoch: both sides are sampled
+        # at the same task time inside the divergent region [t_star, ...), so
+        # the contrast is repair vs failure behavior off the same prefix.
         rng = random.Random(self.seed + 100_000 * self.epoch + idx)
+        starts = self._valid[idx]["starts"]
         ratio = rng.random()
+        start = starts[int(ratio * (len(starts) - 1))]
         sides = []
         for side, key in ((CHOSEN, "chosen"), (REJECTED, "rejected")):
             ep = self._episode(pair[f"{key}_path"])
-            starts = self._valid[idx][key]
-            start = starts[int(ratio * (len(starts) - 1))] * self.chunk_size
             sample = build_action_chunk_sample(
                 ep,
                 start,

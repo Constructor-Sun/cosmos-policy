@@ -108,9 +108,16 @@ def attach_adapter(model, adapter_path: str) -> None:
         lora_target_modules=meta["target_modules"],
         init_lora_weights=True,
     )
-    result = model.net.load_state_dict(blob["lora_state"], strict=False)
+    state = {k.replace("_checkpoint_wrapped_module.", ""): v
+             for k, v in blob["lora_state"].items()}
+    result = model.net.load_state_dict(state, strict=False)
     if result.unexpected_keys:
-        print(f"[attach_adapter] WARNING: {len(result.unexpected_keys)} unexpected keys ignored")
+        raise RuntimeError(
+            f"[attach_adapter] {len(result.unexpected_keys)} unexpected keys after "
+            f"normalization, e.g. {result.unexpected_keys[:3]}")
+    lora_missing = [k for k in result.missing_keys if "lora_" in k]
+    if lora_missing:
+        raise RuntimeError(f"[attach_adapter] {len(lora_missing)} lora keys missing after load")
     print(f"[attach_adapter] LoRA injected + loaded <- {adapter_path}")
 
 
@@ -155,6 +162,15 @@ class TTADPOModel:
                     out[k] = v.to(device, dtype=torch.bfloat16)
                 else:
                     out[k] = v.to(device)
+            elif isinstance(v, (list, tuple)) and len(v) > 0 and \
+                    all(isinstance(x, torch.Tensor) for x in v):
+                # Per-side fields arrive as list-of-tensors after _stack_pair +
+                # default_collate (one entry per pair side, each with a leading
+                # batch dim). Stack to [B, 2, ...] so prepare_inputs' flatten
+                # sees the same layout as the tensor fields. Without this the
+                # conditioner/loss hit raw lists (found by the preflight probe,
+                # 2026-09-13 — dpo_train would crash on its first batch).
+                out[k] = torch.stack(list(v), dim=1).to(device)
             else:
                 out[k] = v
         return out
@@ -238,8 +254,16 @@ class TTADPOModel:
                 if not was_disabled:
                     m.enable_adapters(True)
 
+    @staticmethod
+    def _canonical(name: str) -> str:
+        """Strip gradient-checkpointing wrapper prefixes: training-time
+        named_parameters carry them, a freshly-injected net does not. Adapter
+        files store CANONICAL names; loaders normalize defensively."""
+        return name.replace("_checkpoint_wrapped_module.", "")
+
     def save_adapter(self, path: str, extra_meta: dict | None = None) -> None:
-        state = {n: p.detach().cpu() for n, p in self._iter_params() if p.requires_grad}
+        state = {self._canonical(n): p.detach().cpu()
+                 for n, p in self._iter_params() if p.requires_grad}
         meta = {
             "lora_rank": self.lora_rank,
             "lora_alpha": self.lora_alpha,
@@ -262,8 +286,11 @@ class TTADPOModel:
                               ("target_modules", self.target_modules)):
             if key in meta and meta[key] != expected:
                 raise ValueError(f"adapter {path}: {key}={meta[key]!r} does not match model ({expected!r})")
-        result = self.model.net.load_state_dict(blob["lora_state"], strict=False)
-        if result.unexpected_keys:
-            print(f"[TTADPOModel] WARNING: {len(result.unexpected_keys)} unexpected keys ignored on load")
+        state = {self._canonical(k): v for k, v in blob["lora_state"].items()}
+        result = self.model.net.load_state_dict(state, strict=False)
+        lora_missing = [k for k in result.missing_keys if "lora_" in k]
+        if result.unexpected_keys or lora_missing:
+            raise RuntimeError(
+                f"adapter {path}: unexpected={len(result.unexpected_keys)} lora_missing={len(lora_missing)}")
         print(f"[TTADPOModel] adapter loaded <- {path}")
         return meta
