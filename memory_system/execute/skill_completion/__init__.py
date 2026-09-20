@@ -16,6 +16,10 @@ from memory_system.execute.skill_completion.place import (
     PLACE_SKILLS,
     ReleaseSkillCompletion,
 )
+from memory_system.execute.skill_completion.turnon import (
+    DEFAULT_MIN_ROTATION_DEG,
+    TurnOnCompletion,
+)
 
 COMPLETION_REGISTRY: dict[str, type[TimedSkillCompletion]] = {
     "Pick": PickSkillCompletion,
@@ -23,12 +27,13 @@ COMPLETION_REGISTRY: dict[str, type[TimedSkillCompletion]] = {
     "PlaceOn": ReleaseSkillCompletion,
     "Open": TimeoutOnlySkillCompletion,
     "Close": TimeoutOnlySkillCompletion,
-    "TurnOn": TimeoutOnlySkillCompletion,
+    "TurnOn": TurnOnCompletion,
 }
 
 __all__ = [
     "COMPLETION_REGISTRY",
     "DEFAULT_MAX_ACTION_CHUNKS",
+    "DEFAULT_MIN_ROTATION_DEG",
     "DEFAULT_OPEN_FRAMES",
     "EMPTY_CLOSED_GAP",
     "PLACE_SKILLS",

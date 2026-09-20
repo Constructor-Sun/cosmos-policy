@@ -17,7 +17,7 @@ from memory_system.execute.skill_completion.base import (
     TimedSkillCompletion,
 )
 
-DEFAULT_OPEN_FRAMES = 16
+DEFAULT_OPEN_FRAMES = 5
 DEFAULT_OPEN_GAP_DELTA = 0.01
 PLACE_SKILLS = {"PlaceIn", "PlaceOn"}
 

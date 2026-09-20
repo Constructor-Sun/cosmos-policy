@@ -8,7 +8,7 @@ pair's two sides, and errors() returns policy and reference errors for the
 SAME draw — a paired comparison with minimal variance. Replaces the earlier
 SFT base-vs-merged probe (git history keeps that version).
 
-Registered L1 criterion (TTA_DPO_LAUNCH.md §5):
+Registered L1 criterion (docs/dpo/dpo.md §5):
   chosen   delta = policy - reference  → expect < 0  (adapter improved the
                                         successful side)
   rejected delta = policy - reference  → expect >= chosen delta (worsened or

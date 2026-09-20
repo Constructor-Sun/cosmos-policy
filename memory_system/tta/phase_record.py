@@ -777,20 +777,6 @@ def _memory_span(record: dict, evidence: dict) -> dict:
     )
 
 
-def _phase_attempt_status(skill: str, span: Mapping[str, Any], evidence: Mapping[str, Any]) -> str:
-    if evidence.get("semantic_completed") is True:
-        return CONFIRMED if skill == "Pick" else (
-            RELEASED_ONLY if skill in _OPEN_INTERACTION_SKILLS else CLOSE_RECORDED
-        )
-    if evidence.get("semantic_completed") is False:
-        if skill == "Pick":
-            return GRASP_FAILED
-        if skill in _OPEN_INTERACTION_SKILLS:
-            return NEVER_RELEASED
-        return TIMEOUT_GAP
-    return classify_phase(dict(span)) if span else PENDING
-
-
 def compute_t_star(candidate: dict) -> tuple[int | None, int | None]:
     """Compute a repair prefix from the local close event."""
     if not candidate or not candidate.get("repairable", True):

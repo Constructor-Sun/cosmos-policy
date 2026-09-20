@@ -827,6 +827,40 @@ class LIBERODataset(Dataset):
         )
 
 
+class RepairSliceLIBERODataset(LIBERODataset):
+    """LIBERODataset，但丢弃末尾取不满一个 action chunk 的窗口起点。
+
+    父类对每个时间步都开一个窗口，末尾 chunk_size-1 个起点的 action chunk 会越过
+    episode 末尾，被 get_action_chunk_with_padding 用"重复最后一个动作"填满。
+    在整条 episode 上那是正确的终止行为（任务结束，机器人就该停住），但 SFT 切片
+    （[t*, t*+L)，见 memory_system/tta/tools/build_repair_slices.py）的末尾不是终止
+    状态——VLA 还要继续跑——所以那里成了错误目标。
+
+    tta_repair_sft / TTA_REPAIR_SFT_DROP_TAIL 开启时使用。
+    """
+
+    def _build_step_index_mapping(self):
+        self._step_to_episode_map = {}
+        self._total_steps = 0
+
+        self._suite_to_step_indices = defaultdict(list)
+
+        for episode_idx, episode_data in self.data.items():
+            num_steps = episode_data["num_steps"]
+            # 与父类唯一的差别：尾部 chunk_size-1 个起点取不满 chunk，不注册。
+            for i in range(max(0, num_steps - self.chunk_size + 1)):
+                self._step_to_episode_map[self._total_steps] = (episode_idx, i)
+                self._suite_to_step_indices[episode_data["suite"]].append(self._total_steps)
+                self._total_steps += 1
+
+        self._suites = list(self._suite_to_step_indices.keys())
+        if len(self._suites) > 0:
+            self._max_suite_len = max(len(v) for v in self._suite_to_step_indices.values())
+
+        # 窗口数不再等于步数，而 __getitem__ 用 self.num_steps 取模，必须同步。
+        self.num_steps = self._total_steps
+
+
 def create_augmentation_visualization(
     data_dir: str,
     t5_text_embeddings_path: str,

@@ -6,7 +6,7 @@ shape [B, 2, ...] and the model sees both sides of a pair in a SINGLE forward
 with ONE shared sigma/epsilon draw.
 
 Objective scope: with K=1 this is a single-chunk preference objective, not a
-trajectory-level sum (docs/TTA_TRAINING_IMPLEMENTATION.md §目标公式).
+trajectory-level sum (docs/dpo/dpo.md §目标公式).
 
 Chunk choice: contrast chunks live ONLY in the memory-intervention window —
 starts are on a shared absolute grid with start >= t_star (repair cut-in)

@@ -57,6 +57,7 @@ from cosmos_policy.experiments.robot.libero.run_libero_eval import (
 )
 import cosmos_policy.experiments.robot.libero.run_libero_eval as run_libero_eval_mod
 from cosmos_policy.experiments.robot import cosmos_utils
+from cosmos_policy.experiments.robot.cosmos_utils import strip_libero_plus_metadata
 
 
 prompt_override = os.environ.get("COSMOS_SMOKE_PROMPT_OVERRIDE", "").strip()
@@ -182,26 +183,6 @@ def init_t5_text_embeddings_cache_with_extra(t5_text_embeddings_path, *args, **k
 
 
 eval_libero.__wrapped__.__globals__["init_t5_text_embeddings_cache"] = init_t5_text_embeddings_cache_with_extra
-
-
-def strip_libero_plus_metadata(task_label):
-    cache_label = task_label
-
-    # Camera / init-state / sensor-noise variants.
-    cache_label = re.sub(r" view .+ initstate \d+(?: noise \d+)?$", "", cache_label)
-
-    # Other LIBERO-plus environment variants.
-    for pattern in (
-        r" table \d+$",
-        r" tb \d+$",
-        r" light \d+$",
-        r" add \d+$",
-        r" level\d+ sample\d+$",
-        r" noise \d+$",
-    ):
-        cache_label = re.sub(pattern, "", cache_label)
-
-    return cache_label
 
 
 def get_t5_embedding_for_libero_plus(task_label):

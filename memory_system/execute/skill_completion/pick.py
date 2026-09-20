@@ -7,6 +7,8 @@ for a configured number of consecutive frames.
 """
 from __future__ import annotations
 
+import os
+from collections import deque
 from typing import Any
 
 import numpy as np
@@ -18,6 +20,7 @@ EMPTY_CLOSED_GAP = 0.003
 DEFAULT_MIN_LIFT_DISTANCE = 0.02
 DEFAULT_MAX_RIGID_ERROR = 0.01
 DEFAULT_STABLE_FRAMES = 5
+_TRACE_PICK_COMPLETION = os.environ.get("PICK_COMPLETION_TRACE") == "1"
 
 
 def _vector(value: Any, size: int) -> np.ndarray | None:
@@ -33,8 +36,8 @@ def _vector(value: Any, size: int) -> np.ndarray | None:
     return vector
 
 
-def _target_center(target_points: Any) -> np.ndarray | None:
-    """Return the coordinate-wise median of finite target-cloud points."""
+def _target_geometry(target_points: Any) -> tuple[np.ndarray, float] | None:
+    """Return the median center and lower-z quantile of finite target points."""
     if target_points is None:
         return None
     try:
@@ -46,7 +49,7 @@ def _target_center(target_points: Any) -> np.ndarray | None:
     finite = points[np.isfinite(points).all(axis=1)]
     if len(finite) == 0:
         return None
-    return np.median(finite, axis=0)
+    return np.median(finite, axis=0), float(np.quantile(finite[:, 2], 0.1))
 
 
 class PickCompletionChecker:
@@ -90,11 +93,13 @@ class PickCompletionChecker:
         self.last_object_dz: float | None = None
         self.last_eef_dz: float | None = None
         self.last_rigid_error: float | None = None
+        self._debug_trace = deque(maxlen=5)
         self._reset_candidate()
 
     def _reset_candidate(self) -> None:
         self.confirmation_count = 0
         self.vertical_progress = 0.0
+        self._initial_bottom_z: float | None = None
         self._previous_eef_pos: np.ndarray | None = None
         self._previous_object_center_world: np.ndarray | None = None
         self._previous_object_center_eef: np.ndarray | None = None
@@ -129,6 +134,7 @@ class PickCompletionChecker:
         eef_quat: Any,
         gripper_closed: bool | None,
         gripper_qpos: Any,
+        frame: int | None = None,
     ) -> bool:
         """Consume one frame and return the latched Pick completion decision.
 
@@ -144,10 +150,13 @@ class PickCompletionChecker:
 
         position = _vector(eef_pos, 3)
         rotation = self._eef_rotation(eef_quat)
-        center_world = _target_center(target_points)
-        if position is None or rotation is None or center_world is None:
+        geometry = _target_geometry(target_points)
+        if position is None or rotation is None or geometry is None:
             self._reset_candidate()
             return False
+        center_world, bottom_z = geometry
+        if self._initial_bottom_z is None:
+            self._initial_bottom_z = bottom_z
 
         center_eef = rotation.T @ (center_world - position)
         if self._previous_eef_pos is None:
@@ -173,9 +182,25 @@ class PickCompletionChecker:
         self._previous_eef_pos = position.copy()
         self._previous_object_center_world = center_world.copy()
         self._previous_object_center_eef = center_eef.copy()
-        satisfied = rigid and self.vertical_progress >= self.min_lift_distance
+        bottom_lift = bottom_z - self._initial_bottom_z
+        # Previous center-only completion rule:
+        # satisfied = rigid and self.vertical_progress >= self.min_lift_distance
+        satisfied = (
+            rigid and self.vertical_progress >= self.min_lift_distance
+            and bottom_lift >= self.min_lift_distance
+        )
         self.confirmation_count = self.confirmation_count + 1 if satisfied else 0
         self.completed = self.confirmation_count >= self.stable_frames
+        if _TRACE_PICK_COMPLETION:
+            self._debug_trace.append({
+                "frame": frame, "gripper_gap": self.last_gripper_gap,
+                "object_dz": self.last_object_dz, "eef_dz": self.last_eef_dz,
+                "progress": self.vertical_progress,
+                "bottom_lift": bottom_lift,
+                "rigid_error": self.last_rigid_error, "confirm": self.confirmation_count
+            })
+            if self.completed:
+                print("[PICK_COMPLETION_TRACE]", list(self._debug_trace), flush=True)
         return self.completed
 
 

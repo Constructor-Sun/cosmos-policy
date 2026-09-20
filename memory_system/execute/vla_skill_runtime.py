@@ -141,6 +141,7 @@ class VLASkillRuntime:
             eef_quat=eef_quat,
             gripper_closed=gripper_closed,
             gripper_qpos=gripper_qpos,
+            frame=frame,
         )
         self._last_decision = decision
         if decision.advance:

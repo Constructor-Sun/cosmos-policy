@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Phase/point validation harness: one failed census init per task (TMP.MD).
+"""Phase/point validation harness: one failed census init per task (docs/repair/libero-plus-repair.md).
 
 For each libero_10 task with census failures, rerun ONE failed init with the
 plain policy under the census config, record phases/events observation-only
@@ -413,7 +413,7 @@ def main() -> None:
         cand = r.get("candidate")
         cand_txt = (
             f"{cand['span']['skill']}#{cand['span']['phase_index']} {cand['status']} "
-            f"t*={cand['t_star']} (event={cand['event_step']})"
+            f"t*={cand.get('t_star')} (event={cand.get('event_step')})"
             if cand else "-"
         )
         print(f"{r.get('status', '?'):>16}  {r['task'][:56]:56s}  init={r.get('init')}  {cand_txt}",

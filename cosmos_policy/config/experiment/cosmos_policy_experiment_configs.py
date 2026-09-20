@@ -23,7 +23,7 @@ from cosmos_policy._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_policy._src.imaginaire.lazy_config import LazyDict
 from cosmos_policy._src.imaginaire.utils import log
 from cosmos_policy.datasets.aloha_dataset import ALOHADataset
-from cosmos_policy.datasets.libero_dataset import LIBERODataset
+from cosmos_policy.datasets.libero_dataset import LIBERODataset, RepairSliceLIBERODataset
 from cosmos_policy.datasets.robocasa_dataset import RoboCasaDataset
 from cosmos_policy.models.policy_video2world_model import CosmosPolicyVideo2WorldModel
 from cosmos_policy.modules.hybrid_edm_sde import HybridEDMSDE
@@ -42,6 +42,9 @@ TTA_REPAIR_SFT_METADATA_DIR = os.environ.get(
 TTA_REPAIR_SFT_ROLLOUT_DIR = os.environ.get(
     "TTA_REPAIR_SFT_ROLLOUT_DIR", str(REPO_ROOT / "training" / "tta_sft_success_v2")
 )
+# 切片数据（[t*, t*+L)，见 memory_system/tta/tools/build_repair_slices.py）用
+# RepairSliceLIBERODataset：丢弃末尾取不满一个 action chunk 的窗口起点。
+TTA_REPAIR_SFT_DROP_TAIL = os.environ.get("TTA_REPAIR_SFT_DROP_TAIL", "").lower() in {"1", "true", "yes"}
 TTA_REPAIR_SFT_BASE_CHECKPOINT = os.environ.get(
     "TTA_REPAIR_SFT_BASE_CHECKPOINT",
     "/data1/liu/exp/counterfactual/checkpoints/Cosmos-Policy-LIBERO-Predict2-2B/"
@@ -216,7 +219,7 @@ cosmos_predict2_2b_480p_libero__inference_only = LazyDict(
 # Success-only policy LoRA SFT over repaired robot-initial-state rollouts.
 # Reclassify successful rollouts as demonstrations and train only the action
 # latent; keep the stock LIBERO image augmentation and logging behavior.
-tta_repair_sft_dataset = L(LIBERODataset)(
+tta_repair_sft_dataset = L(RepairSliceLIBERODataset if TTA_REPAIR_SFT_DROP_TAIL else LIBERODataset)(
     data_dir=TTA_REPAIR_SFT_METADATA_DIR,
     t5_text_embeddings_path=os.path.join(TTA_REPAIR_SFT_METADATA_DIR, "t5_embeddings.pkl"),
     chunk_size=16,

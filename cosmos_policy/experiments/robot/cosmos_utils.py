@@ -19,6 +19,7 @@ import json
 import os
 import pickle
 import queue
+import re
 import secrets
 import shutil
 import time
@@ -331,6 +332,42 @@ def get_planning_model(cfg, device: str = "cuda"):
     planning_model.eval()
     planning_model = planning_model.to(device)
     return planning_model, config
+
+
+def strip_libero_plus_metadata(task_label: str) -> str:
+    """
+    Reduce a LIBERO-plus variant task label to the base instruction used as the T5 cache key.
+
+    LIBERO-plus appends environment-variant suffixes to the task name (camera viewpoint,
+    init state, table, light, object add, sensor noise, ...). The only suffix that changes
+    the instruction wording is `language_instructions`, which is looked up verbatim; every
+    other variant resolves to the unperturbed base instruction.
+
+    Shared by the LIBERO-plus eval wrapper and by data prep so both look up the same key.
+
+    Args:
+        task_label (str): Task label as reported by the environment.
+
+    Returns:
+        str: T5 cache key for this label.
+    """
+    cache_label = task_label
+
+    # Camera / init-state / sensor-noise variants.
+    cache_label = re.sub(r" view .+ initstate \d+(?: noise \d+)?$", "", cache_label)
+
+    # Other LIBERO-plus environment variants.
+    for pattern in (
+        r" table \d+$",
+        r" tb \d+$",
+        r" light \d+$",
+        r" add \d+$",
+        r" level\d+ sample\d+$",
+        r" noise \d+$",
+    ):
+        cache_label = re.sub(pattern, "", cache_label)
+
+    return cache_label
 
 
 def init_t5_text_embeddings_cache(t5_text_embeddings_path: str = None, worker_id: int = 0) -> dict:

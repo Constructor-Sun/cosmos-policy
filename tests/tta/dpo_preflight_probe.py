@@ -7,7 +7,7 @@ Four checks on the REAL manifest data + REAL base checkpoint, single GPU:
    the DPO loss has the analytic value log(2) ~= 0.6931 with margin 0.
    Any deviation means the forward plumbing is broken.
 2. backward — LoRA gradients must be NONZERO and finite. Exactly-zero grads
-   are the TTA_LoRAFix.md dead-init signature (A=B=0 deadlock); the correct
+   are the docs/sft/sft.md dead-init signature (A=B=0 deadlock); the correct
    init has A=kaiming (nonzero), so d(loss)/d(B) != 0. Frozen base must have
    no grads at all.
 3. 3 optimizer steps — loss/margin stay finite, peak memory recorded
@@ -92,7 +92,7 @@ def main():
     if max_grad <= 0 or not all(torch.isfinite(g).all() for g in lora_grads):
         fail(f"LoRA grads dead or non-finite: max={max_grad}")
     if max_grad == 0 or zero_grads == len(lora_grads):
-        fail("ALL LoRA grads exactly zero — TTA_LoRAFix.md dead-init signature")
+        fail("ALL LoRA grads exactly zero — docs/sft/sft.md dead-init signature")
     base_grads = [p.grad for n, p in ttm.model.net.named_parameters()
                   if "lora_" not in n and p.grad is not None]
     if base_grads:

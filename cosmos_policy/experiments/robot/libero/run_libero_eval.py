@@ -194,6 +194,7 @@ TASK_MAX_STEPS = {
     TaskSuite.LIBERO_90: 400,  # longest training demo has 373 steps
     TaskSuite.LIBERO_MIX: 520,  # LIBERO-plus mixture; keep the conservative LIBERO-10 horizon
 }
+TASK_MAX_STEPS.update(libero_10_swap=520, libero_10_task=520)
 
 
 @dataclass
@@ -313,7 +314,7 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
         )
 
     # Validate task suite
-    assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+    assert cfg.task_suite_name in [suite.value for suite in TaskSuite] + ["libero_10_swap", "libero_10_task"], f"Invalid task suite: {cfg.task_suite_name}"
 
     if cfg.enable_initial_alignment:
         if cfg.task_suite_name != TaskSuite.LIBERO_10:
@@ -646,7 +647,12 @@ def run_episode(
     from cosmos_policy.experiments.robot.libero.libero_joint_control import step_correction_controller
 
     def _close_alignment_controller(controller) -> None:
-        if controller is not None and hasattr(controller, "close"):
+        if controller is None:
+            return
+        if _repair_request is not None:
+            _repair_result["duration_steps"] = int(_alignment_step_index)
+            _repair_result["finish_status"] = getattr(controller, "status", "unknown")
+        if hasattr(controller, "close"):
             controller.close()
 
     def _maybe_start_initial_alignment(t_now, observation, obs, log_fh) -> None:
@@ -981,7 +987,11 @@ def run_episode(
         )
 
     # Setup
-    t = 0
+    NUM_STEPS_WAIT = 10
+    # In repair mode the prefix replay above already advanced the episode to
+    # the cut-in; re-running the settle here would execute the open-gripper
+    # dummy action on a held object, so the wait window counts as served.
+    t = NUM_STEPS_WAIT if _repair_request is not None else 0
     replay_images = []
     replay_wrist_images = [] if cfg.use_wrist_image else None
     future_image_predictions_list = []
@@ -1022,7 +1032,6 @@ def run_episode(
     # Run episode
     success = False
     try:
-        NUM_STEPS_WAIT = 10
         while t < max_steps + NUM_STEPS_WAIT:
             # If the deterministic flag is set, reset the random state with the same seed in every step
             if os.environ.get("DETERMINISTIC", "").lower() == "true":
@@ -1402,8 +1411,6 @@ def run_episode(
                     _alignment_controller, "finished", False
                 ):
                     _alignment_steps_remaining = min(_alignment_steps_remaining, 1)
-                _alignment_steps_remaining -= 1
-                _alignment_step_index += 1
             else:
                 action = action_queue.popleft()
                 _policy_step_count += 1
@@ -1422,6 +1429,10 @@ def run_episode(
             ):
                 _screen_release_frame = t - NUM_STEPS_WAIT
             obs, reward, done, info = env.step(action.tolist())
+            if _is_alignment_action:
+                # Count only after the action has actually executed.
+                _alignment_steps_remaining -= 1
+                _alignment_step_index += 1
             observe_skill_shadow(obs, action, t)
             if hasattr(_alignment_controller, "observe"):
                 _alignment_controller.observe(obs)
