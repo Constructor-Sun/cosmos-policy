@@ -31,7 +31,11 @@ os.environ["HF_HUB_CACHE"] = "/data1/liu/exp/counterfactual/checkpoints/huggingf
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 REPO = "/data1/liu/exp/counterfactual/external/cosmos-policy"
-LIB = "/data1/liu/exp/counterfactual/external/LIBERO-plus"
+# Which libero package this process imports: LIBERO-plus by default, LIBERO-PRO
+# when the census says so (COSMOS_LIBERO_ROOT must be set before this import).
+LIB = os.environ.get(
+    "COSMOS_LIBERO_ROOT", "/data1/liu/exp/counterfactual/external/LIBERO-plus"
+)
 sys.path[:0] = [REPO, LIB]
 
 from pathlib import Path
@@ -238,25 +242,35 @@ def make_png(path: Path, title: str, info_lines, img, record,
 
 
 def diagnose_task(task_entry, variant, cfg, model, dataset_stats, resize_size, out_root,
-                  video=False):
-    from libero.libero import benchmark
+                  video=False, flavor="plus", suite_name=None):
+    from libero.libero import benchmark, get_libero_path
     from cosmos_policy.experiments.robot.libero.libero_utils import get_libero_env
+    from memory_system.execute.plan import drop_presatisfied_turnon, plan_from_bddl
     from memory_system.tta.phase_record import (
         PhaseEventRecorder,
         compute_t_star,
-        load_task_sequence,
         save_record,
     )
     from memory_system.tta.object_query import SceneObjectQuery
 
     base_task = task_entry["task"]
-    pert_name = task_entry["task_name_perturbed"]
+    pert_name = task_entry.get("task_name_perturbed") or base_task
     abs_inits = task_entry["fail_init_indices_abs"]
 
-    variant_spec = resolve_variant(pert_name, suite="libero_10")
-    suite = benchmark.get_benchmark_dict()[variant_spec.suite](
-        category_value=variant_spec.category
-    )
+    if flavor == "pro":
+        # PRO suites are their own perturbation (the suite name selects it) and
+        # their tasks keep the base names, so there is no classification entry
+        # to resolve; identity rides on the recorded suite + BDDL instead.
+        category = condition = suite_name
+        suite = benchmark.get_benchmark_dict()[suite_name]()
+    else:
+        variant_spec = resolve_variant(pert_name, suite="libero_10")
+        category = variant_spec.category
+        condition = variant_spec.condition
+        suite_name = variant_spec.suite
+        suite = benchmark.get_benchmark_dict()[variant_spec.suite](
+            category_value=variant_spec.category
+        )
     exact_matches = [
         i for i in range(suite.n_tasks) if suite.get_task(i).name == pert_name
     ]
@@ -274,26 +288,39 @@ def diagnose_task(task_entry, variant, cfg, model, dataset_stats, resize_size, o
     init_states = suite.get_task_init_states(tid)
     object_query = SceneObjectQuery(env, resolution=256)
 
-    base_resolved, demo_id, phases = load_task_sequence(suite_task_name)
+    # The plan is read straight from the current task's BDDL goal: predicate
+    # order is execution order, arguments are the scene names the memory
+    # retrieval keys on, and no demo sequence is involved.
+    bddl_path = os.path.join(
+        get_libero_path("bddl_files"), suite_task.problem_folder, suite_task.bddl_file
+    )
+    phases = plan_from_bddl(bddl_path)
+    # Runtime skip of pre-satisfied TurnOn preconditions (plan_from_goal_state
+    # docstring): evaluate at the first failing init's state.
+    env.reset()
+    env.set_init_state(init_states[abs_inits[0]])
+    phases = drop_presatisfied_turnon(phases, env)
     print(
-        f"[{variant}] category={variant_spec.category!r} "
-        f"task={suite_task_name} bddl={suite_task.bddl_file} "
-        f"phases={[p.skill for p in phases]} demo={demo_id}",
+        f"[{variant}] flavor={flavor} suite={suite_name} category={category!r} "
+        f"task={suite_task_name} bddl={bddl_path} "
+        f"phases={[p.skill for p in phases]}",
         flush=True,
     )
 
     result = {
         "task": base_task,
         "variant": variant,
+        "flavor": flavor,
+        "suite": suite_name,
         "suite_task": suite_task_name,
-        "perturbation_category": variant_spec.category,
-        "perturbation_condition": variant_spec.condition,
+        "perturbation_category": category,
+        "perturbation_condition": condition,
         "bddl_file": suite_task.bddl_file,
     }
     init_indices = abs_inits
     for init_idx in init_indices:
         recorder = PhaseEventRecorder(
-            phases, task_name=base_resolved, demo_id=demo_id,
+            phases, task_name=suite_task_name,
             episode_id=f"{variant}-init{init_idx}",
             object_query=object_query,
         )
@@ -313,8 +340,10 @@ def diagnose_task(task_entry, variant, cfg, model, dataset_stats, resize_size, o
         record["census_abs_init"] = init_idx
         record["suite_task_name"] = suite_task_name
         record["task_name_perturbed"] = pert_name
-        record["perturbation_category"] = variant_spec.category
-        record["perturbation_condition"] = variant_spec.condition
+        record["flavor"] = flavor
+        record["suite"] = suite_name
+        record["perturbation_category"] = category
+        record["perturbation_condition"] = condition
         record["bddl_file"] = suite_task.bddl_file
         candidate = None if success else record.get("candidate")
         t_star = event_step = None
@@ -333,7 +362,7 @@ def diagnose_task(task_entry, variant, cfg, model, dataset_stats, resize_size, o
         cand = record["candidate"]
         info_lines = [
             f"task: {base_task[:52]}",
-            f"category: {variant_spec.category}",
+            f"category: {category}",
             f"actual: {suite_task_name[-62:]}",
             f"variant {variant} / init {init_idx}  success={success}",
             "candidate: none" if cand is None else
@@ -391,11 +420,30 @@ def main() -> None:
     args = parser.parse_args()
 
     census = json.loads(Path(args.census).read_text())
+    flavor = str(census.get("flavor", "plus")).lower()
+    pro_suite = census.get("suite")
+    if flavor == "pro" and not pro_suite:
+        raise ValueError("flavor=pro census requires a top-level 'suite' field")
+    if flavor == "pro":
+        import libero
+
+        if "LIBERO-PRO" not in libero.__file__:
+            raise RuntimeError(
+                f"flavor=pro requires the LIBERO-PRO package on sys.path, "
+                f"got {libero.__file__}. Restart with "
+                "COSMOS_LIBERO_ROOT=/data1/liu/exp/counterfactual/external/LIBERO-PRO."
+            )
     wanted = {s.strip() for s in args.tasks.split(",") if s.strip()}
+
+    def entry_variant(entry):
+        # plus census entries carry variant_state; PRO entries fall back to
+        # the (base-named) perturbed task so --tasks keeps working.
+        return str(entry.get("variant_state") or entry.get("task_name_perturbed") or "")
+
     entries = [
-        (t, str(t["variant_state"]))
+        (t, entry_variant(t))
         for t in census["tasks"]
-        if t["n_fail"] > 0 and (not wanted or str(t["variant_state"]) in wanted)
+        if t.get("n_fail", 1) > 0 and (not wanted or entry_variant(t) in wanted)
     ]
 
     print("loading policy...", flush=True)
@@ -406,7 +454,8 @@ def main() -> None:
     summary = []
     for entry, variant in entries:
         summary.append(diagnose_task(entry, variant, cfg, model, dataset_stats,
-                                     resize_size, out_root, video=args.video))
+                                     resize_size, out_root, video=args.video,
+                                     flavor=flavor, suite_name=pro_suite))
 
     print("\n=== SUMMARY ===", flush=True)
     for r in summary:

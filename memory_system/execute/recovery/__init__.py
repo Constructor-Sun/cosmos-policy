@@ -1,5 +1,8 @@
 """Generic pose-control and retrieval helpers used by Initial Alignment."""
-from memory_system.execute.recovery.controller import PoseController
+from memory_system.execute.recovery.controller import (
+    LiftTranslateDescendController,
+    PoseController,
+)
 from memory_system.execute.recovery.retrieval import (
     arguments_key,
     close,
@@ -11,6 +14,7 @@ from memory_system.execute.recovery.retrieval import (
     token,
 )
 __all__ = [
+    "LiftTranslateDescendController",
     "PoseController",
     "arguments_key",
     "close",

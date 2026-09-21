@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -23,8 +25,22 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from memory_system.offline.build_targets import patch_numpy2_segmentation
-patch_numpy2_segmentation()
+# NOTE: importing memory_system.offline silently puts LIBERO-plus first on
+# sys.path (a known conflict in this repo), which would make `libero.libero` below
+# resolve to the wrong package for a LIBERO-PRO run.  get_libero_env() applies the
+# same segmentation patch itself when a segmentation env is requested, so skip this
+# import whenever the caller already asked for that (COSMOS_SKILL_COMPLETION_SHADOW).
+if os.environ.get("COSMOS_SKILL_COMPLETION_SHADOW", "").lower() not in {"1", "true", "yes"}:
+    try:
+        from memory_system.offline.build_targets import patch_numpy2_segmentation
+
+        patch_numpy2_segmentation()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] segmentation patch skipped: {type(exc).__name__}: {exc}")
+_root = os.environ.get("COSMOS_LIBERO_ROOT")
+if _root and _root in sys.path:  # re-assert which libero package wins
+    sys.path.remove(_root)
+    sys.path.insert(0, _root)
 
 from libero.libero import benchmark
 from cosmos_policy.experiments.robot.libero.libero_utils import (
@@ -125,6 +141,10 @@ def main():
                         help="1-based episode number in the rollout video")
     parser.add_argument("--init-state-index", type=int, default=None)
     parser.add_argument("--task-name", type=str, default=DEFAULT_TASK)
+    parser.add_argument("--suite", type=str, default="libero_10",
+                        help="benchmark suite; libero_10_swap for LIBERO-PRO")
+    parser.add_argument("--category", type=str, default="Robot Initial States",
+                        help="plus category filter; empty string means none (PRO suites)")
     parser.add_argument("--episodes-json", type=str,
                         default="scripts/experiments/libero10_robotinit_single/robotinit/robot_initial_states/episodes.json")
     parser.add_argument("--xmin", type=float, default=-0.70)
@@ -136,6 +156,10 @@ def main():
     parser.add_argument("--max-points-per-category", type=int, default=15000)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--no-show", action="store_true")
+    parser.add_argument("--t-min", type=int, default=None,
+                        help="restrict to one alignment window (t >= this)")
+    parser.add_argument("--t-max", type=int, default=None,
+                        help="restrict to one alignment window (t <= this)")
     args = parser.parse_args()
 
     log_path = Path(args.log_path)
@@ -156,6 +180,14 @@ def main():
     records = parse_debug_records(log_path, args.episode - 1)
     if not records:
         raise RuntimeError(f"no INIT_ALIGN_DEBUG records for episode {args.episode}")
+    if args.t_min is not None or args.t_max is not None:
+        # A repair episode holds several alignments; without a window their
+        # trajectories are concatenated into one polyline with spurious jumps.
+        lo = -10**9 if args.t_min is None else args.t_min
+        hi = 10**9 if args.t_max is None else args.t_max
+        records = [r for r in records if lo <= int(r.get("t", 0)) <= hi]
+        if not records:
+            raise RuntimeError("no INIT_ALIGN_DEBUG records in the given t window")
     print(f"parsed {len(records)} debug records")
 
     # Reconstruct the actual EEF path from logged before/after poses.
@@ -166,6 +198,12 @@ def main():
 
     # Prefer the full Curobo plan from INIT_ALIGN_FULL_PLAN if available.
     full_plan_records = parse_full_plan_records(log_path, args.episode - 1)
+    if full_plan_records and (args.t_min is not None or args.t_max is not None):
+        lo = -10**9 if args.t_min is None else args.t_min
+        hi = 10**9 if args.t_max is None else args.t_max
+        in_window = [r for r in full_plan_records if lo <= int(r.get("t", 0)) <= hi]
+        if in_window:
+            full_plan_records = in_window
     if full_plan_records:
         full_plan = full_plan_records[-1]
         waypoints = np.asarray(full_plan["waypoints"], dtype=np.float64)
@@ -194,9 +232,8 @@ def main():
           f"{np.linalg.norm(actual_path[-1, :3] - DEFAULT_TARGET[:3]):.4f}")
 
     # Build labeled/cropped point cloud for this init state.
-    suite = benchmark.get_benchmark_dict()["libero_10"](
-        category_value="Robot Initial States"
-    )
+    _suite_cls = benchmark.get_benchmark_dict()[args.suite]
+    suite = _suite_cls(category_value=args.category) if args.category else _suite_cls()
     matches = [
         (i, t) for i, t in enumerate(suite.tasks) if t.name == args.task_name
     ]

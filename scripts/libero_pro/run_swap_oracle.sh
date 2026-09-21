@@ -8,7 +8,7 @@
 #   export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl HF_HUB_OFFLINE=1
 #   export TOKENIZERS_PARALLELISM=false TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 PYTHONNOUSERSITE=1
 #   CUDA_VISIBLE_DEVICES=0 python scripts/libero_pro/oracle_ready_eval.py \
-#     --item black_book_1 --mode controller --suite libero_10_swap --task STUDY_SCENE1 \
+#     --mode controller --suite libero_10_swap --task STUDY_SCENE1 \
 #     --trials 1 --out experiments/liberopro/oracle_smoke
 #
 # 对照基线：experiments/liberopro/libero_10_swap_seed7/summary.txt = 0/200（10 任务全 0/20）
@@ -37,32 +37,30 @@ mkdir -p "$O/logs" "$O/local_logs"
 GA=($G); NG=${#GA[@]}
 [ -z "$P" ] && P=$NG
 
-# task:item —— item 是该任务【第一阶段】的目标物体。
+# 任务列表 —— 对齐目标不再手工指定：参照体按技能取自各任务的 BDDL 阶段计划
+# （Pick→item，Place/TurnOn→target），开局对齐第一阶段。
 #
-# KITCHEN_SCENE3  第一阶段是 TurnOn，memory 里没有 TurnOn 记录（只有 Pick/PlaceIn/PlaceOn），
-#                 所以只能对齐到 Pick 的 ready pose —— 等于跳过了开灶台，TurnOn 需由 VLA 补做。
-#                 结果需单独解读，详见 docs/libero-pro/LIBERO_PRO_REPAIR.md。
-# KITCHEN_SCENE8  第一阶段要抓 moka_pot_2，该实例不在 memory 里；靠同型回退
-#                 （moka_pot_2 -> moka_pot_1 的记录）命中。
-PAIRS=(
-  "KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it:moka_pot_1"
-  "KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it:akita_black_bowl_1"
-  "KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it:white_yellow_mug_1"
-  "KITCHEN_SCENE8_put_both_moka_pots_on_the_stove:moka_pot_2"
-  "LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket:alphabet_soup_1"
-  "LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket:alphabet_soup_1"
-  "LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket:cream_cheese_1"
-  "LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate:porcelain_mug_1"
-  "LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate:porcelain_mug_1"
-  "STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy:black_book_1"
+# KITCHEN_SCENE3 / KITCHEN_SCENE8  第一阶段都是 TurnOn（swap 变体的 BDDL 含
+#                 turnon 谓词）：对齐到灶台 ready pose。moka_pot_2 的同型回退
+#                 （-> moka_pot_1 记录）只在逐 Pick 对齐（stage 4）时才会用到。
+TASKS=(
+  "KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it"
+  "KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it"
+  "KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it"
+  "KITCHEN_SCENE8_put_both_moka_pots_on_the_stove"
+  "LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket"
+  "LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket"
+  "LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket"
+  "LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate"
+  "LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate"
+  "STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy"
 )
 
 i=0
-for pair in "${PAIRS[@]}"; do
-    t=${pair%%:*}; item=${pair##*:}
+for t in "${TASKS[@]}"; do
     g=${GA[$((i % NG))]}; i=$((i + 1))
     CUDA_VISIBLE_DEVICES=$g python scripts/libero_pro/oracle_ready_eval.py \
-        --item "$item" --suite "$S" --task "$t" \
+        --suite "$S" --task "$t" \
         --trials "$N" --seed "$D" --mode "$MODE" --model "$M" --out "$O" \
         >"$O/logs/$t.log" 2>&1 &
     [ $((i % P)) -eq 0 ] && wait || true

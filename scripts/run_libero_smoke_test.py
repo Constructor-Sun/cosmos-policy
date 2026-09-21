@@ -30,6 +30,13 @@ policy_ckpt_path = os.environ.get(
 )
 
 benchmark_dict = benchmark.get_benchmark_dict()
+# Fail-loud identity check: which libero package and data root this process
+# actually resolved (plus vs PRO differ in suites, BDDL and instructions).
+print(
+    f"[libero] benchmark module: {benchmark.__file__}  "
+    f"LIBERO_CONFIG_PATH: {os.environ.get('LIBERO_CONFIG_PATH', '<repo default>')}",
+    flush=True,
+)
 
 # config_v2 imports every experiment module. The unrelated ALOHA module resolves
 # its checkpoint eagerly, so give that import-only URI an existing local path.
@@ -693,6 +700,17 @@ if os.environ.get("COSMOS_HELD_OBJECT", "").lower() in {"1", "true", "yes"}:
 
 def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/logs"):
     unnorm_key = "libero_10" if suite_name == "libero_mix" else suite_name
+    if unnorm_key not in {
+        "libero_spatial",
+        "libero_object",
+        "libero_goal",
+        "libero_10",
+        "libero_90",
+        "libero_100",
+        "libero_mix",
+    }:
+        # PRO/derived suites (libero_10_swap, ...) share the base statistics.
+        unnorm_key = "libero_10"
     deterministic_reset = os.environ["COSMOS_SMOKE_DETERMINISTIC_RESET"].lower() in {"1", "true", "yes"}
     data_collection = os.environ.get("COSMOS_DATA_COLLECTION", "").lower() in {"1", "true", "yes"}
     save_vector_db = os.environ.get("COSMOS_VECTOR_DB", "").lower() in {"1", "true", "yes"}
@@ -838,7 +856,10 @@ def parse_episode_successes(log_dir, run_id_note):
 
 
 def get_matching_variants(suite_name, category_value, base_task):
-    task_suite = benchmark_dict[suite_name](category_value=category_value)
+    # PRO suite constructors do not accept category_value; plus suites treat
+    # None as "no category filter", so only pass it when actually set.
+    kwargs = {"category_value": category_value} if category_value is not None else {}
+    task_suite = benchmark_dict[suite_name](**kwargs)
     variants = []
     for task_id in range(task_suite.n_tasks):
         task = task_suite.get_task(task_id)
@@ -848,7 +869,8 @@ def get_matching_variants(suite_name, category_value, base_task):
 
 
 def get_task_by_name(suite_name, category_value, task_name):
-    task_suite = benchmark_dict[suite_name](category_value=category_value)
+    kwargs = {"category_value": category_value} if category_value is not None else {}
+    task_suite = benchmark_dict[suite_name](**kwargs)
     for task_id in range(task_suite.n_tasks):
         task = task_suite.get_task(task_id)
         if task.name == task_name:
@@ -922,7 +944,9 @@ if mode == "paired":
     base_task = os.environ["COSMOS_SMOKE_PAIR_BASE_TASK"]
     clean_language = os.environ["COSMOS_SMOKE_PAIR_CLEAN_LANGUAGE"]
     pert_name = os.environ["COSMOS_SMOKE_PAIR_PERT_NAME"]
-    pert_category = os.environ["COSMOS_SMOKE_PAIR_PERT_CATEGORY"]
+    # Empty category means "no plus classification" (PRO suites): the suite
+    # itself is the perturbation and the real BDDL instruction must be used.
+    pert_category = os.environ["COSMOS_SMOKE_PAIR_PERT_CATEGORY"].strip() or None
     pert_task_name = os.environ["COSMOS_SMOKE_PAIR_PERT_TASK"]
     num_pairs = int(os.environ["COSMOS_SMOKE_NUM_PAIRS"])
     seed = int(os.environ["COSMOS_SMOKE_SEED"])
@@ -1016,7 +1040,13 @@ if mode == "paired":
                     "name": pert_name,
                     "category": pert_category,
                     "task_name": pert_task_name,
-                    "instruction_mode": "strict" if pert_name == "language_instructions" else "base",
+                    # No category (= PRO) means the instruction itself may
+                    # differ from base: require the exact T5 embedding.
+                    "instruction_mode": (
+                        "strict"
+                        if (pert_name == "language_instructions" or pert_category is None)
+                        else "base"
+                    ),
                 }
             ]
 
@@ -1030,7 +1060,7 @@ if mode == "paired":
     print("  perturbations:")
     for item in perturbations:
         print(
-            f"    - {item['name']} ({item['category']}): {item['task_name']} "
+            f"    - {item['name']} ({item.get('category') or '-'}): {item['task_name']} "
             f"[instruction={item.get('instruction_mode', 'task')}]"
         )
     if os.environ["COSMOS_SMOKE_T5_FALLBACK_TO_BASE"].lower() in {"1", "true", "yes"}:
@@ -1043,7 +1073,7 @@ if mode == "paired":
     for item in perturbations:
         if item.get("instruction_mode") != "strict":
             continue
-        _, strict_task = get_task_by_name(pair_suite, item["category"], item["task_name"])
+        _, strict_task = get_task_by_name(pair_suite, item.get("category"), item["task_name"])
         item["language"] = strict_task.language
         if strict_task.language not in available_t5_keys:
             strict_missing.append((item["name"], item["task_name"], strict_task.language))
@@ -1123,10 +1153,10 @@ if mode == "paired":
         pert_dir.mkdir(parents=True, exist_ok=True)
 
         if item.get("variant_mode") == "all_variants":
-            variants = get_matching_variants(pair_suite, item["category"], base_task)
+            variants = get_matching_variants(pair_suite, item.get("category"), base_task)
             if not variants:
                 raise RuntimeError(
-                    f"No variants found for suite={pair_suite}, category={item['category']}, base_task={base_task}"
+                    f"No variants found for suite={pair_suite}, category={item.get('category')}, base_task={base_task}"
                 )
             if len(variants) < num_pairs:
                 print(f"  Warning: only {len(variants)} {item['name']} variants available; requested {num_pairs}")
@@ -1138,7 +1168,7 @@ if mode == "paired":
                 run_eval_with_task_filter(
                     suite_name=pair_suite,
                     task_name=variant_task.name,
-                    category_value=item["category"],
+                    category_value=item.get("category"),
                     num_trials=1,
                     run_id_note=pert_note,
                     local_log_dir=str(log_dir),
@@ -1156,7 +1186,7 @@ if mode == "paired":
                         "deterministic_reset_seed": deterministic_reset_seed,
                         "base_task": base_task,
                         "condition": item["name"],
-                        "category": item["category"],
+                        "category": item.get("category"),
                         "task_id": variant_id,
                         "task_name": variant_task.name,
                         "language": variant_task.language,
@@ -1177,12 +1207,12 @@ if mode == "paired":
             pert_log = pert_logs
             summary_task_name = item["task_name"]
         else:
-            pert_task_id, pert_task = get_task_by_name(pair_suite, item["category"], item["task_name"])
+            pert_task_id, pert_task = get_task_by_name(pair_suite, item.get("category"), item["task_name"])
             pert_note = f"paired-{item['name']}-{num_pairs}pair"
             pert_rate = run_eval_with_task_filter(
                 suite_name=pair_suite,
                 task_name=item["task_name"],
-                category_value=item["category"],
+                category_value=item.get("category"),
                 num_trials=num_pairs,
                 run_id_note=pert_note,
                 local_log_dir=str(log_dir),
@@ -1197,7 +1227,7 @@ if mode == "paired":
                 suite=pair_suite,
                 base_task=base_task,
                 condition=item["name"],
-                category=item["category"],
+                category=item.get("category"),
                 task_id=pert_task_id,
                 task_name=pert_task.name,
                 language=pert_task.language,

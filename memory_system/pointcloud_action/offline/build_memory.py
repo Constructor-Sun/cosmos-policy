@@ -320,7 +320,10 @@ def main() -> None:
     args = parser.parse_args()
     output = args.output
     if args.skills != ["Pick"] and output == DEFAULT_OUTPUT:
-        output = Path(DEFAULT_OUTPUT).with_name("pointcloud_action_memory_place.pt")
+        # 非 Pick 构建绝不落到 Pick 主库；Place 沿用既有文件名，TurnOn 落到
+        # 自己的 turnon.pt（builder 对 TurnOn 无需专门分支，走非 Place 共享路径）。
+        name = "turnon" if set(args.skills) == {"TurnOn"} else "place"
+        output = Path(DEFAULT_OUTPUT).with_name(f"pointcloud_action_memory_{name}.pt")
     build_memory(
         args.manifest,
         args.demo_dir,

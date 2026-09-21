@@ -194,7 +194,7 @@ TASK_MAX_STEPS = {
     TaskSuite.LIBERO_90: 400,  # longest training demo has 373 steps
     TaskSuite.LIBERO_MIX: 520,  # LIBERO-plus mixture; keep the conservative LIBERO-10 horizon
 }
-TASK_MAX_STEPS.update(libero_10_swap=520, libero_10_task=520)
+TASK_MAX_STEPS.update(libero_10_swap=600, libero_10_task=520)
 
 
 @dataclass
@@ -314,10 +314,19 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
         )
 
     # Validate task suite
-    assert cfg.task_suite_name in [suite.value for suite in TaskSuite] + ["libero_10_swap", "libero_10_task"], f"Invalid task suite: {cfg.task_suite_name}"
+    assert cfg.task_suite_name in [suite.value for suite in TaskSuite] + ["libero_10_swap", "libero_10_task", "libero_10_lan", "libero_10_object", "libero_10_env"], f"Invalid task suite: {cfg.task_suite_name}"
 
     if cfg.enable_initial_alignment:
-        if cfg.task_suite_name != TaskSuite.LIBERO_10:
+        # PRO suites keep the base task names, so the libero_10 alignment
+        # memory (keyed by task name) applies to them unchanged.
+        if cfg.task_suite_name not in {
+            TaskSuite.LIBERO_10,
+            "libero_10_swap",
+            "libero_10_task",
+            "libero_10_lan",
+            "libero_10_object",
+            "libero_10_env",
+        }:
             raise ValueError("Initial alignment memory currently supports only the libero_10 task suite")
         if cfg.env_img_res != 256:
             raise ValueError("Initial alignment memory was built at env_img_res=256")
@@ -328,6 +337,29 @@ def validate_config(cfg: PolicyEvalConfig) -> None:
 
 def _create_initial_alignment_selector(cfg: PolicyEvalConfig):
     """Build the one-shot Initial Alignment selector."""
+    knob = os.environ.get("COSMOS_SKILL_READY_MEMORY", "").strip().lower()
+    # align = ready-pose alignment only; timegrip/rawactions = alignment plus
+    # executing the memory segment (waypoint tracking with the demo's gripper
+    # timing / object-frame raw actions) before handing back to the policy.
+    # PRO-ready either way: swap moves objects, world-frame poses do not
+    # transfer.  Controller mode only -- the repair path executes planned
+    # joint trajectories.  The selector lives in the libero_pro experiment
+    # script and is the single source shared with the oracle runs.
+    if knob in {"1", "true", "yes", "align", "replay", "timegrip", "rawactions"}:
+        from scripts.libero_pro.oracle_ready_eval import (
+            DEFAULT_MEMORY,
+            OracleReadySelector,
+            _memory_paths,
+        )
+
+        replay = {
+            "replay": "timegrip",
+            "timegrip": "timegrip",
+            "rawactions": "rawactions",
+        }.get(knob, "")
+        return OracleReadySelector(
+            _memory_paths(DEFAULT_MEMORY), mode="controller", replay=replay
+        )
     memory_dir = _REPO_ROOT / "skill_memory_test" / "libero_10"
     segments_manifest = memory_dir / "segments_ready_fixed16.json"
     feasible_recovery_targets = memory_dir / "feasible_recovery_targets.pt"
@@ -455,6 +487,30 @@ def run_episode(
     _repair_request = _load_tta_repair_request()
     _repair_armed = False
     _repair_result = {"status": "not_started"}
+    # Per-phase loop (COSMOS_TTA_PHASE_LOOP=1): after the single t* intervention,
+    # correct again at the START of every subsequent phase.  The order comes from
+    # the request's BDDL-derived plan, not from a demo sequence.  Off = the
+    # single-shot repair path, unchanged.
+    _phase_loop = _repair_request is not None and os.environ.get(
+        "COSMOS_TTA_PHASE_LOOP", ""
+    ).lower() in {"1", "true", "yes"}
+    _phase_plan = []
+    if _phase_loop:
+        from memory_system.execute.plan import PhaseSpec
+
+        _phase_plan = [
+            PhaseSpec(int(e["planner_step_id"]), str(e["skill"]),
+                      {str(k): str(v) for k, v in (e.get("arguments") or {}).items()})
+            for e in (_repair_request.get("plan") or []) if e.get("skill")
+        ]
+        # Cursor starts at the diagnosed failing phase: the t* intervention above
+        # already covers it, so the loop corrects only the phases after it.  An
+        # earlier phase the prefix replay finished is never redone.
+        _phase_plan = _phase_plan[int((_repair_request.get("phase") or {}).get("phase_index", 0)):]
+        if not _phase_plan:  # older request JSON: fail loud, not silently inert
+            log_message("[PHASE_LOOP] request has no 'plan'; loop inactive", log_file)
+    _holding = False        # belief tracker; only semantic completions update it
+    _interventions: list = []
     # Prefix capture: frames from the replayed reference prefix are recorded so
     # SFT data covers the perturbed-init -> cut-in approach. Static settle and
     # wait frames stay out (the eval harness performs its own 10-step wait).
@@ -526,13 +582,27 @@ def run_episode(
     pick_point_cloud = None
     session = None
     coordinator = None
+    if _phase_plan:
+        from memory_system.execute.vla_skill_runtime import VLASkillRuntime
+
+        skill_runtime = VLASkillRuntime(
+            _phase_plan,
+            task_name=alignment_task_name,
+            demo_id=_repair_request.get("tag"),
+            episode_id=episode_index,
+        )
+        log_message(
+            "[PHASE_LOOP] plan "
+            + json.dumps([[ph.skill, ph.arguments] for ph in _phase_plan]),
+            log_file,
+        )
 
     def _begin_vla_window(frame: int) -> None:
         if skill_runtime is None or skill_runtime.active or skill_runtime.exhausted:
             return
         try:
             initially_holding = (
-                session.held_item is not None if session is not None else False
+                session.held_item is not None if session is not None else _holding
             )
             phase = skill_runtime.begin_vla(
                 frame=frame,
@@ -814,6 +884,7 @@ def run_episode(
         nonlocal _alignment_controller, _alignment_steps_remaining
         nonlocal _alignment_step_index, alignment_gripper_action
         nonlocal _screen_place_start
+        nonlocal _holding, _interventions
         if decision is None or not decision.advance:
             return
         if skill_runtime is None or skill_runtime.phase_index < 1:
@@ -824,6 +895,47 @@ def run_episode(
             return
         if _screen_place_start is None and next_phase.skill in {"PlaceIn", "PlaceOn"}:
             _screen_place_start = frame - NUM_STEPS_WAIT
+
+        # Per-phase loop: the cursor has already advanced, so next_phase is the
+        # phase about to run.  A Place phase's memory assumes the object is in
+        # hand; a timeout-advanced Pick leaves that belief false, so hand that
+        # phase back to the VLA rather than approach with a closed empty gripper.
+        if _phase_loop:
+            if decision.semantic_completed and completed_phase.skill == "Pick":
+                _holding = True
+            elif decision.semantic_completed and completed_phase.skill in {"PlaceIn", "PlaceOn"}:
+                _holding = False
+            if not _holding and next_phase.skill in {"PlaceIn", "PlaceOn"}:
+                _status = "skipped_not_holding"
+                log_message(
+                    f"[PHASE_LOOP] t={frame}: skip {next_phase.skill} correction "
+                    f"({completed_phase.skill} advanced by {decision.reason}); "
+                    "handing back to VLA",
+                    log_file,
+                )
+            else:
+                _status = _maybe_start_repair_alignment(
+                    frame, observation, observation, log_file,
+                    phase_override={
+                        "phase_index": int(next_phase.planner_step_id),
+                        "planner_step_id": int(next_phase.planner_step_id),
+                        "skill": next_phase.skill,
+                        "arguments": dict(next_phase.arguments),
+                    },
+                    repeatable=True,
+                )
+                if _status != "armed":
+                    log_message(
+                        f"[PHASE_LOOP] t={frame}: {next_phase.skill} correction not "
+                        f"armed ({_status}); handing back to VLA",
+                        log_file,
+                    )
+            _interventions.append({
+                "phase_index": int(next_phase.planner_step_id),
+                "skill": next_phase.skill, "status": _status, "frame": int(frame),
+            })
+            _repair_result["interventions"] = list(_interventions)
+            return
 
         if coordinator is not None:
             try:
@@ -921,17 +1033,21 @@ def run_episode(
             log_file,
         )
 
-    def _maybe_start_repair_alignment(t_now, observation, obs, log_fh) -> None:
+    def _maybe_start_repair_alignment(t_now, observation, obs, log_fh,
+                                      phase_override=None, repeatable=False) -> str:
         nonlocal _repair_armed, _repair_result
         nonlocal _alignment_controller, _alignment_steps_remaining
         nonlocal _alignment_step_index, alignment_gripper_action, action_queue
-        if _repair_request is None or _repair_armed:
-            return
+        # `repeatable` is for the per-phase hook only.  The legacy call site must
+        # stay one-shot: it sits in the "action queue empty" block, so re-arming
+        # there would fire on every VLA query and the policy would never run.
+        if _repair_request is None or (_repair_armed and not repeatable):
+            return "disabled"
         _repair_armed = True
         if initial_alignment_selector is None or not _captured_latent:
             _repair_result = {"status": "route_failed", "reason": "selector_or_latent_missing"}
-            return
-        raw_phase = _repair_request["phase"]
+            return "route_failed"
+        raw_phase = _repair_request["phase"] if phase_override is None else phase_override
         phase = type("Phase", (), raw_phase)
         main_depth = (
             _make_main_depth(obs, alignment_camera_params, cfg.flip_images)
@@ -955,10 +1071,14 @@ def run_episode(
             )
         except Exception as exc:
             _repair_result = {"status": "route_failed", "reason": f"select_error:{exc}"}
-            return
+            return "route_failed"
         if alignment is None:
-            _repair_result = {"status": "route_failed", "reason": "no_matching_ready_pose_for_phase"}
-            return
+            _skip = getattr(initial_alignment_selector, "last_skip_reason", None)
+            _repair_result = {
+                "status": "route_failed",
+                "reason": _skip or "no_matching_ready_pose_for_phase",
+            }
+            return _skip or "no_matching_ready_pose_for_phase"
         if alignment.joint_trajectory is not None:
             from cosmos_policy.experiments.robot.libero.libero_joint_control import LiberoJointTrajectoryController
             _alignment_controller = LiberoJointTrajectoryController(
@@ -980,11 +1100,33 @@ def run_episode(
             "target": np.asarray(alignment.target_ee_states).tolist(),
             "similarity": float(alignment.similarity),
         }
+        if (
+            os.environ.get("COSMOS_DEBUG_INIT_ALIGN", "").lower() in {"1", "true", "yes"}
+            and getattr(_alignment_controller, "waypoints", None) is not None
+        ):
+            # Mirror the non-repair path's dump so the existing point-cloud +
+            # planned-path visualiser can read repair rollouts too.
+            log_message(
+                "[INIT_ALIGN_FULL_PLAN] "
+                + json.dumps(
+                    {
+                        "episode": episode_index,
+                        "t": t_now,
+                        "waypoints": np.asarray(
+                            _alignment_controller.waypoints, dtype=np.float32
+                        ).tolist(),
+                        "target": np.asarray(alignment.target_ee_states).tolist(),
+                    }
+                ),
+                log_fh,
+                console=False,
+            )
         log_message(
             f"[TTA REPAIR] t={t_now}: armed phase={raw_phase.get('skill')} "
             f"target={_repair_result['target']} steps={_alignment_steps_remaining}",
             log_fh,
         )
+        return "armed"
 
     # Setup
     NUM_STEPS_WAIT = 10
@@ -1062,14 +1204,25 @@ def run_episode(
                 replay_wrist_images.append(observation["wrist_image"])
 
             if cfg.data_collection:
-                primary_images_list.append(observation["primary_image"])
-                wrist_images_list.append(observation["wrist_image"])
-                proprio_list.append(observation["proprio"])
-                frame_indices.append(t)
+                # Buffer this frame; it is committed together with its action
+                # further below.  Alignment frames are dropped on commit: the
+                # joint controller acts in a different action space (8-dim)
+                # from the policy (7-dim) and is not part of the data stream.
+                _frame_buffer = (
+                    observation["primary_image"],
+                    observation["wrist_image"],
+                    observation["proprio"],
+                    t,
+                )
                 if rgbd:
                     d = np.asarray(obs["robot0_eye_in_hand_depth"]).copy()
-                    wrist_depth_list.append(d); wrist_segmentation_list.append(np.asarray(obs["robot0_eye_in_hand_segmentation_instance"]).copy())
-                    wrist_c2w_list.append(build_camera_params(env.sim, "robot0_eye_in_hand", d.shape[0], d.shape[1]).T_c2w)
+                    _frame_buffer_rgbd = (
+                        d,
+                        np.asarray(obs["robot0_eye_in_hand_segmentation_instance"]).copy(),
+                        build_camera_params(env.sim, "robot0_eye_in_hand", d.shape[0], d.shape[1]).T_c2w,
+                    )
+                else:
+                    _frame_buffer_rgbd = None
 
             _alignment_active = (
                 _alignment_steps_remaining > 0
@@ -1084,8 +1237,12 @@ def run_episode(
                     _step_action = step_correction_controller(_alignment_controller, obs)
                 if np.ndim(_step_action) == 1 and _step_action.shape[0] in (7, 8):
                     action = _step_action.astype(np.float32).copy()
-                    # Preserve the gripper command captured before alignment.
-                    if alignment_gripper_action is not None:
+                    # Preserve the gripper command captured before alignment,
+                    # unless the controller owns per-step gripper timing
+                    # (memory replay follows the demo's gripper sequence).
+                    if alignment_gripper_action is not None and not getattr(
+                        _alignment_controller, "gripper_authority", False
+                    ):
                         action[-1] = alignment_gripper_action
                 else:
                     action = np.zeros(7, dtype=np.float32)
@@ -1119,9 +1276,9 @@ def run_episode(
                             dtype=np.float32,
                         )
 
-                if cfg.data_collection:
-                    actions_list.append(action.copy())
-
+                # Alignment frames are not collected (joint-space actions must
+                # not enter the 7-dim policy action stream); the buffered
+                # frame is simply not committed.
                 last_gripper_closed = bool(float(action[-1]) > 0.0)
                 obs, reward, done, info = env.step(action.tolist())
                 observe_skill_shadow(obs, action, t)
@@ -1418,7 +1575,15 @@ def run_episode(
             # Process action
             print(f"t: {t}\t action: {action}")
 
-            if cfg.data_collection:
+            if cfg.data_collection and not _is_alignment_action:
+                primary_images_list.append(_frame_buffer[0])
+                wrist_images_list.append(_frame_buffer[1])
+                proprio_list.append(_frame_buffer[2])
+                frame_indices.append(_frame_buffer[3])
+                if _frame_buffer_rgbd is not None:
+                    wrist_depth_list.append(_frame_buffer_rgbd[0])
+                    wrist_segmentation_list.append(_frame_buffer_rgbd[1])
+                    wrist_c2w_list.append(_frame_buffer_rgbd[2])
                 actions_list.append(action.copy())
             # Execute action in environment
             _prev_gripper_closed = last_gripper_closed
@@ -1484,11 +1649,25 @@ def run_episode(
             json.dump(_repair_result, open(_repair_out, "w"), indent=2)
         log_message("[TTA REPAIR] result " + json.dumps(_repair_result), log_file)
     if skill_runtime is not None:
-        for summary in skill_runtime.finalize(success):
+        _summaries = skill_runtime.finalize(success)
+        for summary in _summaries:
             log_message(
                 "[SKILL_COMPLETION] summary " + json.dumps(summary),
                 log_file,
             )
+        # Which phases memory was asked to carry (corrected) vs which ran purely
+        # on the VLA, and whether each ended on evidence or on its chunk timeout.
+        _corrected = {i["phase_index"] for i in _interventions if i["status"] == "armed"}
+        log_message(
+            "[PHASE_LOOP] per-phase: "
+            + " | ".join(
+                f"{s['phase_index']} {s['skill']} corrected={s['phase_index'] in _corrected} "
+                f"frames={s['vla_start_frame']}->{s['vla_end_frame']} chunks={s['action_chunks']} "
+                + ("SEMANTIC" if s["semantic_completed"] else f"TIMEOUT({s['advance_reason']})")
+                for s in _summaries
+            ),
+            log_file,
+        )
     if skill_shadow is not None:
         skill_shadow.close()
 

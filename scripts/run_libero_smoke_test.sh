@@ -31,7 +31,9 @@ SMOKE_PAIR_SUITE=${SMOKE_PAIR_SUITE:-libero_10}
 SMOKE_PAIR_BASE_TASK=${SMOKE_PAIR_BASE_TASK:-KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it}
 SMOKE_PAIR_CLEAN_LANGUAGE=${SMOKE_PAIR_CLEAN_LANGUAGE:-put the black bowl in the bottom drawer of the cabinet and close it}
 SMOKE_PAIR_PERT_NAME=${SMOKE_PAIR_PERT_NAME:-camera_viewpoints,background_textures,light_conditions,objects_layout,robot_initial_states,sensor_noise}
-SMOKE_PAIR_PERT_CATEGORY=${SMOKE_PAIR_PERT_CATEGORY:-Camera Viewpoints}
+# Note ${VAR-default} (no colon): an explicitly EMPTY category must survive --
+# it signals a PRO suite (no plus classification), not the default.
+SMOKE_PAIR_PERT_CATEGORY=${SMOKE_PAIR_PERT_CATEGORY-Camera Viewpoints}
 SMOKE_PAIR_PERT_TASK=${SMOKE_PAIR_PERT_TASK:-${SMOKE_PAIR_BASE_TASK}_view_50_0_100_0_0_initstate_0}
 SMOKE_T5_FALLBACK_TO_BASE=${SMOKE_T5_FALLBACK_TO_BASE:-true}
 SMOKE_T5_EXTRA_EMBEDDINGS=${SMOKE_T5_EXTRA_EMBEDDINGS:-}
@@ -42,6 +44,9 @@ COSMOS_HELD_OBJECT=${COSMOS_HELD_OBJECT:-}
 COSMOS_PLACE_MODE=${COSMOS_PLACE_MODE:-curobo}
 SMOKE_HF_HUB_OFFLINE=${SMOKE_HF_HUB_OFFLINE:-1}
 SMOKE_PYTHON_SCRIPT=${SMOKE_PYTHON_SCRIPT:-$REPO_ROOT/run_libero_smoke_test.py}
+# Which libero package goes first on sys.path (LIBERO-plus default, LIBERO-PRO
+# for PRO cases); must match LIBERO_CONFIG_PATH, which the caller exports.
+LIBERO_ROOT=${COSMOS_LIBERO_ROOT:-../../LIBERO-plus}
 
 if [ ! -f "$BASE_MODEL_DIR/model-480p-16fps.pt" ]; then
     echo "Missing base checkpoint: $BASE_MODEL_DIR/model-480p-16fps.pt" >&2
@@ -72,7 +77,7 @@ export MUJOCO_GL="$SMOKE_GL_BACKEND"
 export PYOPENGL_PLATFORM="$SMOKE_GL_BACKEND"
 export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="../../LIBERO-plus${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$LIBERO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export NUMBA_CACHE_DIR="${TMPDIR:-/tmp}/cosmospolicy-numba"
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/cosmospolicy-matplotlib"
 export HF_HUB_CACHE="$CHECKPOINT_ROOT/huggingface-hub"

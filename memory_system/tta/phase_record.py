@@ -403,6 +403,11 @@ class PhaseEventRecorder:
                              evidence: MemoryPhaseEvidence,
                              event: int | None) -> None:
         """Freeze the first failing phase as the single repair candidate."""
+        # First-wins: a later path (e.g. a timeout decision after an
+        # object_mismatch stop) must not overwrite the first candidate --
+        # it would also flip t* onto the wrong branch.
+        if self._diagnosis_stopped:
+            return
         self._diagnosis_stopped = True
         start = evidence.start_step if evidence.start_step is not None else 0
         self._candidate = {

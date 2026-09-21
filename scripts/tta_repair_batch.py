@@ -14,6 +14,7 @@ from memory_system.tta.variant_spec import resolve_variant
 DEFAULT_RESULT_DIR = REPO / "memory_system/pointcloud_action/results/tta_failure_screening_68"
 DEFAULT_META = REPO / "memory_system/pointcloud_action/results/tta_screening_meta.json"
 DEFAULT_SUMMARY = REPO / "memory_system/pointcloud_action/results/tta_repair_68_summary.json"
+PRO_LIBERO_ROOT = Path("/data1/liu/exp/counterfactual/external/LIBERO-PRO")
 LANGS = {
     "KSCENE3": "turn on the stove and put the moka pot on it",
     "KSCENE4": "put the black bowl in the bottom drawer of the cabinet and close it",
@@ -66,6 +67,11 @@ def prepare_inputs_from_diagnosis(diagnosis_root, out_dir):
         init = record_path.parent.name
         tag = _case_tag(task, init)
         if tag in meta:
+            # Same scene hosting two base tasks (LIBERO-PRO swap suites):
+            # extend the compact tag with the task's distinguishing prefix.
+            distinct = re.sub(r"^(?:KITCHEN|LIVING_ROOM|STUDY)_SCENE\d+_", "", task)
+            tag = f"{tag}-{re.sub(r'[^A-Za-z0-9]+', '', distinct)[:12].lower()}"
+        if tag in meta:
             raise ValueError(f"duplicate generated tag {tag!r} under {diagnosis_root}")
         variant_task = (
             record.get("task_name_perturbed")
@@ -86,6 +92,11 @@ def prepare_inputs_from_diagnosis(diagnosis_root, out_dir):
             "census_abs_init": int(record["census_abs_init"]),
             "suite_task_name": variant_task,
             "clean_language": _clean_language(task),
+            # Case identity as recorded by diagnosis; the repair env must be
+            # rebuilt from these, never re-derived from the task name.
+            "suite": record.get("suite"),
+            "bddl_file": record.get("bddl_file"),
+            "flavor": record.get("flavor", "plus"),
             # Only diagnosis-root inputs opt into phase-aware requests.  The
             # legacy RobotInit meta remains byte-for-byte behavior compatible.
             "use_diagnosed_phase": True,
@@ -118,6 +129,30 @@ def prepare_inputs_from_diagnosis(diagnosis_root, out_dir):
     return meta_path, summary_path
 
 
+def _plan_from_record(record):
+    """Plan recorded at diagnosis time (BDDL-derived, current-task arguments).
+
+    ``memory_phases`` entries already carry planner_step_id/skill/arguments in
+    plan order, so no task-name re-derivation happens here.
+    """
+    if not record:
+        return None
+    specs = [
+        {
+            "phase_index": index,
+            "planner_step_id": int(entry["planner_step_id"]),
+            "skill": str(entry["skill"]),
+            "arguments": {
+                str(key): str(value)
+                for key, value in (entry.get("arguments") or {}).items()
+            },
+        }
+        for index, entry in enumerate(record.get("memory_phases") or [])
+        if entry.get("skill")
+    ]
+    return specs or None
+
+
 def build_request(tag, out_dir, *, result_dir=DEFAULT_RESULT_DIR,
                   meta_path=DEFAULT_META, summary_path=DEFAULT_SUMMARY):
     import h5py, numpy as np
@@ -131,16 +166,29 @@ def build_request(tag, out_dir, *, result_dir=DEFAULT_RESULT_DIR,
         # No interaction event in the recording: documented fallback restarts
         # the phase at the first-phase floor.
         t_star = 10
-    base, demo, phases = load_task_sequence(task)
+    record_path = Path(result_dir) / record_task / init / "phase_record.json"
+    record = (
+        json.loads(record_path.read_text()) if record_path.exists() else None
+    )
+    phases = _plan_from_record(record)
+    if phases is None:
+        # Legacy records predating the BDDL-derived plan.
+        phases = [
+            {
+                "phase_index": index,
+                "planner_step_id": int(spec.planner_step_id),
+                "skill": spec.skill,
+                "arguments": dict(spec.arguments),
+            }
+            for index, spec in enumerate(load_task_sequence(task)[2])
+        ]
     request_phase = {
         "phase_index": 0,
-        "planner_step_id": int(phases[0].planner_step_id),
-        "skill": phases[0].skill,
-        "arguments": dict(phases[0].arguments),
+        "planner_step_id": int(phases[0]["planner_step_id"]),
+        "skill": phases[0]["skill"],
+        "arguments": dict(phases[0]["arguments"]),
     }
-    if meta.get("use_diagnosed_phase"):
-        record_path = Path(result_dir) / record_task / init / "phase_record.json"
-        record = json.loads(record_path.read_text())
+    if meta.get("use_diagnosed_phase") and record is not None:
         candidate = record.get("candidate") or {}
         # A numeric event-based t* belongs to the diagnosed phase.  When the
         # event is missing and t*=10 is used, retain the proven RobotInit
@@ -163,6 +211,10 @@ def build_request(tag, out_dir, *, result_dir=DEFAULT_RESULT_DIR,
         actions = np.asarray(h5["actions"], dtype=np.float32)
     req = {"task": task, "tag": tag,
            "phase": request_phase,
+           # Full BDDL-derived phase plan, so the per-phase loop
+           # (COSMOS_TTA_PHASE_LOOP) reads the same order the diagnosis used
+           # instead of re-deriving it from the task name.
+           "plan": phases,
            "t_star": int(t_star), "actions": actions.tolist()}
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"repair_{tag}.json"
@@ -179,7 +231,6 @@ def run_case(gpu, tag, req_path, out_path, *, meta_path=DEFAULT_META, args_work_
         or meta.get("suite_task_name")
         or meta["task"]
     )
-    variant_spec = resolve_variant(target_task, suite="libero_10")
     clean_language = (
         meta.get("clean_language")
         or meta.get("language")
@@ -187,15 +238,41 @@ def run_case(gpu, tag, req_path, out_path, *, meta_path=DEFAULT_META, args_work_
         or base_task.replace("_", " ")
     )
     env = dict(os.environ)
+    variant_spec = None
+    if meta.get("flavor") == "pro":
+        # PRO suites are their own perturbation: the suite selects it and the
+        # task keeps the base name, so resolve_variant (plus classification)
+        # does not apply.  The smoke test runs strict-instruction mode for the
+        # empty perturbation category, i.e. the real BDDL instruction.
+        pair_suite = meta["suite"]
+        pert_category = ""
+        pert_task = target_task
+        condition = "pro_variant"
+        env.setdefault("COSMOS_LIBERO_ROOT", str(PRO_LIBERO_ROOT))
+        # PRO 修复 selector：align（只对齐）/timegrip/rawactions（对齐+回放记忆段）。
+        env["COSMOS_SKILL_READY_MEMORY"] = os.environ.get(
+            "COSMOS_SKILL_READY_MEMORY", "align")
+        env.setdefault(
+            "LIBERO_CONFIG_PATH", str(PRO_LIBERO_ROOT / "configs" / "libero_pro")
+        )
+        # PRO init-state files only load with the legacy torch.load default
+        # (same workaround as scripts/libero_pro/run_swap.sh).
+        env.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+    else:
+        variant_spec = resolve_variant(target_task, suite="libero_10")
+        pair_suite = variant_spec.suite
+        pert_category = variant_spec.category
+        pert_task = variant_spec.task_name
+        condition = variant_spec.condition
     env.update({
         "GPU_ID": str(gpu),
         "SMOKE_ONLY_CONDITION": "perturb",
-        "SMOKE_PAIR_SUITE": variant_spec.suite,
+        "SMOKE_PAIR_SUITE": pair_suite,
         "SMOKE_PAIR_BASE_TASK": base_task,
         "SMOKE_PAIR_CLEAN_LANGUAGE": clean_language,
-        "SMOKE_PAIR_PERT_NAME": variant_spec.condition,
-        "SMOKE_PAIR_PERT_CATEGORY": variant_spec.category,
-        "SMOKE_PAIR_PERT_TASK": variant_spec.task_name,
+        "SMOKE_PAIR_PERT_NAME": condition,
+        "SMOKE_PAIR_PERT_CATEGORY": pert_category,
+        "SMOKE_PAIR_PERT_TASK": pert_task,
         "SMOKE_NUM_PAIRS": "1",
         "SMOKE_SEED": str(meta.get("seed", 7)),
         "SMOKE_RESULTS_DIR": str(Path(args_work_dir) / "results" / tag),
@@ -217,8 +294,8 @@ def run_case(gpu, tag, req_path, out_path, *, meta_path=DEFAULT_META, args_work_
         "MUJOCO_EGL_DEVICE_ID": str(gpu),
     })
     print(
-        f"[gpu{gpu}] {tag}: category={variant_spec.category!r} "
-        f"task={variant_spec.task_name}",
+        f"[gpu{gpu}] {tag}: flavor={meta.get('flavor', 'plus')} suite={pair_suite} "
+        f"category={pert_category!r} task={pert_task} bddl={meta.get('bddl_file') or '-'}",
         flush=True,
     )
     subprocess.run(["sh", "run_libero_smoke_test.sh"], env=env,
@@ -229,7 +306,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gpus", default="0,1,2,3", help="GPUs to use, one chain each")
     ap.add_argument("--tags", default="", help="comma-separated case tags (default: all 68)")
-    ap.add_argument("--work-dir", default=str(REPO / "scripts/experiments/tta_repair_work"))
+    ap.add_argument("--work-dir", default=str(REPO / "scripts/experiments/tta_repair_work"),
+                    help="work directory; use an ABSOLUTE path -- the smoke child "
+                         "process runs with cwd=scripts/ and would resolve relative "
+                         "paths differently from this driver")
     ap.add_argument("--result-dir", default=str(DEFAULT_RESULT_DIR),
                     help="directory holding <task>/<initNNN>/episode.h5 recordings")
     ap.add_argument("--meta", default=str(DEFAULT_META),
