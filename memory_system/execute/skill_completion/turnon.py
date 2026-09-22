@@ -34,7 +34,7 @@ from memory_system.execute.skill_completion.base import (
     TimedSkillCompletion,
 )
 
-DEFAULT_MIN_ROTATION_DEG = 35.0
+DEFAULT_MIN_ROTATION_DEG = 30.0
 
 
 def _quat(value: Any) -> np.ndarray | None:

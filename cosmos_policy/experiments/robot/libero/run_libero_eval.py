@@ -566,7 +566,41 @@ def run_episode(
                 log_file,
             )
 
-    def observe_skill_shadow(observation, action, frame):
+    def observe_skill_shadow(observation, action, frame, feed_rule=False):
+        nonlocal _alignment_steps_remaining
+        # feed_rule=True 时，把"非 VLA 帧"（对齐段）也喂给唯一那个判定点。
+        # 语义不变：规则只吃观测，timeout 只由 VLA chunk 累计（这里不调
+        # finish_action_chunk）；区别只是对齐段里发生的完成（拧旋钮、松手、
+        # 抓起）能被认出来，而不是白等到 chunk 用满。
+        if feed_rule and skill_runtime is not None and skill_runtime.active:
+            try:
+                decision = skill_runtime.observe_vla_frame(
+                    target_points=_active_vla_points(
+                        observation, skill_runtime.active_phase
+                    ),
+                    eef_pos=observation.get("robot0_eef_pos"),
+                    eef_quat=observation.get("robot0_eef_quat"),
+                    gripper_closed=bool(
+                        np.asarray(action, dtype=np.float64).reshape(-1)[-1] > 0.0
+                    ),
+                    gripper_qpos=observation.get("robot0_gripper_qpos"),
+                    frame=frame,
+                )
+                if decision.advance:
+                    action_queue.clear()
+                    log_message(
+                        f"[SKILL_COMPLETION] advance phase={skill_runtime.phase_index - 1} "
+                        f"reason={decision.reason} semantic={decision.semantic_completed} "
+                        f"chunks={decision.action_chunks}; (during alignment)",
+                        log_file,
+                    )
+                    _alignment_steps_remaining = min(_alignment_steps_remaining, 1)
+                    # 与 VLA 路径同一条推进序列：先结束当前对齐，再交给相位转移钩子
+                    # （它负责武装下一个相位的对齐 / 通知协调器）。顺序不能反——
+                    # 钩子若新武装了对齐，会自己重设 _alignment_steps_remaining。
+                    _maybe_run_phase_transition_hook(decision, observation, frame)
+            except Exception as exc:
+                log_message(f"[SKILL_COMPLETION] phase rule feed failed: {exc}", log_file)
         if skill_shadow is None:
             return
         try:
@@ -577,7 +611,9 @@ def run_episode(
 
     # Active completion is deliberately kept separate from the read-only
     # shadow.  It is created only after Initial Alignment selects a concrete
-    # memory demo, and it observes VLA actions only (never planner actions).
+    # memory demo.  2026-09-22: 现在对齐段的帧也会喂给它（observe_skill_shadow
+    # 的 feed_rule=True，只在这两处对齐分支调用）——原先"只吃 VLA 帧"会让
+    # 发生在对齐段里的完成（拧旋钮 / 松手）永远判不到，只能靠 chunk timeout 收尾。
     skill_runtime = None
     pick_point_cloud = None
     session = None
@@ -1281,7 +1317,7 @@ def run_episode(
                 # frame is simply not committed.
                 last_gripper_closed = bool(float(action[-1]) > 0.0)
                 obs, reward, done, info = env.step(action.tolist())
-                observe_skill_shadow(obs, action, t)
+                observe_skill_shadow(obs, action, t, feed_rule=True)
                 if _repair_request is not None and _alignment_steps_remaining == 1 and _repair_result.get("status") == "aligned_pending":
                     _repair_result["status"] = "reached"
                     _repair_result["final_ee"] = np.concatenate([obs["robot0_eef_pos"], Rotation.from_quat(obs["robot0_eef_quat"]).as_rotvec()]).astype(np.float32).tolist()
@@ -1598,7 +1634,7 @@ def run_episode(
                 # Count only after the action has actually executed.
                 _alignment_steps_remaining -= 1
                 _alignment_step_index += 1
-            observe_skill_shadow(obs, action, t)
+            observe_skill_shadow(obs, action, t, feed_rule=True)
             if hasattr(_alignment_controller, "observe"):
                 _alignment_controller.observe(obs)
             if getattr(_alignment_controller, "finished", False):

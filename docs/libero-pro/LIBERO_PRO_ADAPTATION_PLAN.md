@@ -4,7 +4,7 @@
 
 ## 1. 先统一任务身份，保证整条链跑的是同一个 PRO case
 
-现在只切换评测的 `task_suite_name` 还不够，`diagnose_failed.py` 和 `tta_repair_batch.py` 仍有 LIBERO-plus 的任务解析逻辑。PRO 的 swap/task 与原任务可能同名，容易在诊断或修复时跑回原任务。
+现在只切换评测的 `task_suite_name` 还不够：PRO 的 swap/task 与原任务同名，容易在诊断或修复时跑回原任务。（2026-09-22 更新：后半句已过时——`diagnose_failed.py:260-265` 与 `tta_repair_batch.py:243-263` 现在都有 `flavor == "pro"` 分支，身份取自 census / phase_record 的 `suite` 与 `bddl_file`，`prepare_inputs_from_diagnosis` 也是 perturbation-agnostic 的。）
 
 让 baseline、census、诊断和 repair 显式传递同一套 suite、task、BDDL、初始状态索引、seed 和实际指令，并检查实际导入的 LIBERO 路径。当前 PRO benchmark 已经支持从 BDDL 读取真实指令，这部分保留并确认 T5 缓存与实际输入一致。
 

@@ -20,8 +20,10 @@ def _quat(deg: float) -> np.ndarray:
 class TurnOnCompletionTest(unittest.TestCase):
     def test_default_threshold_matches_calibration(self) -> None:
         # Measured from the grasp: 29-34 deg when the knob turns on,
-        # 49-55 deg ten frames later.
-        self.assertEqual(DEFAULT_MIN_ROTATION_DEG, 35.0)
+        # 49-55 deg ten frames later.  35 sat just above that band, so a
+        # replayed segment that stops at ~33 deg never fired; 30 is the
+        # floor of the calibration band.
+        self.assertEqual(DEFAULT_MIN_ROTATION_DEG, 30.0)
 
     def test_registered_as_the_turnon_rule(self) -> None:
         self.assertIs(COMPLETION_REGISTRY["TurnOn"], TurnOnCompletion)

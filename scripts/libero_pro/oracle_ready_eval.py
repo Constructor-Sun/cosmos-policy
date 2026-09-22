@@ -64,6 +64,39 @@ from memory_system.execute.plan import drop_presatisfied_turnon, plan_from_bddl
 from memory_system.types import RecoveryTarget
 
 DEFAULT_MEMORY = REPO / "memory_system/pointcloud_action/pointcloud_action_memory.pt"
+# TurnOn 记录的选择索引：库里 40 条参数完全相同，第一条是 5 帧/8.6° 的空段。
+TURNON_RECORD_INDEX = 1
+# Pick 记录按"合爪后抬升"挑：规则要求 ≥2cm，而库里 22% 的记录不到 2cm。
+PICK_MIN_LIFT = 0.02
+_SELECTED_SKILLS = {"TurnOn", "Pick", "PlaceIn", "PlaceOn"}
+
+
+def _place_tilt(record: dict) -> float:
+    """ready pose 的工具 z 轴在物体系里偏离竖直多少（越小越"俯视放下"）。"""
+    try:
+        matrix = np.asarray(record["T_object_ee_ready"], dtype=np.float64).reshape(4, 4)
+        tool_z = matrix[:3, :3][:, 2]
+        return float(np.hypot(tool_z[0], tool_z[1]))
+    except Exception:
+        return float("inf")
+
+
+def _post_grasp_lift(record: dict) -> float:
+    """合爪之后末端还能抬高多少（物体系、米）——Pick 完成规则要的信号。"""
+    try:
+        seq = np.asarray(record["ee_pose_object_sequence"], dtype=np.float64)
+        grip = np.asarray(record["gripper_sequence"], dtype=np.float64).reshape(-1)
+        count = min(len(seq), len(grip))
+        closed = np.nonzero(grip[:count] > 0)[0]
+        if len(closed) == 0 or int(closed[0]) >= count - 1:
+            return 0.0
+        z = seq[:count, 2, 3]
+        return float(z[int(closed[0]):].max() - z[int(closed[0])])
+    except Exception:
+        return 0.0
+# 记忆段每个 waypoint 实际要花的帧数（WaypointPoseController 到位才推进）。
+# 原公式按 2 给份额，实测约 3.8，导致 23 点的 TurnOn 段在 64 帧里只走完 71%。
+SEGMENT_STEPS_PER_FRAME = 4
 DEFAULT_MODEL = "/data1/liu/exp/counterfactual/checkpoints/Cosmos-Policy-LIBERO-Predict2-2B"
 
 _DEBUG_LOG = None
@@ -200,6 +233,7 @@ def _load_ready_pose(
     want = {str(key): str(value) for key, value in arguments.items()}
     same_type: tuple[np.ndarray, str] | None = None
     want_type = ""
+    exact: list[tuple[np.ndarray, str, dict]] = []
     for record in _records(memory_path):
         if record.get("skill") != skill:
             continue
@@ -207,12 +241,49 @@ def _load_ready_pose(
         matrix = np.asarray(record["T_object_ee_ready"], dtype=np.float64).reshape(4, 4)
         memory_id = str(record["memory_id"])
         if got == want:
-            return matrix, memory_id, record
+            if skill not in _SELECTED_SKILLS:
+                return matrix, memory_id, record
+            exact.append((matrix, memory_id, record))
+            continue
         if skill == "Pick":
             if not want_type:
                 want_type = _object_type(want.get("item", ""))
             if same_type is None and _object_type(got.get("item", "")) == want_type:
                 same_type = (matrix, memory_id, record)
+    if exact:
+        if skill == "TurnOn":
+            # TurnOn 的 40 条记录参数完全相同，只按"第一条"取会拿到只有 5 帧、
+            # 净旋转 8.6° 的空段（低于完成规则要求的 30°），回放等于没在开灶台。
+            index = min(TURNON_RECORD_INDEX, len(exact) - 1)
+            _diag(
+                f"TurnOn 取第 {index} 条匹配记录（共 {len(exact)} 条）: {exact[index][1]}"
+            )
+            return exact[index]
+        # Pick：合爪后的抬升要够完成规则（≥2cm）用。同参数记录里抬升差异很大
+        # （moka_pot_1 的 20 条从 1.13cm 到 6.03cm），而"取第一条"恰好会踩到
+        # 1.13cm 那条。这里取"满足阈值里最小的"，尽量少改变现状。
+        if skill == "Pick":
+            ranked = sorted(exact, key=lambda item: _post_grasp_lift(item[2]))
+            above = [
+                item for item in ranked if _post_grasp_lift(item[2]) >= PICK_MIN_LIFT
+            ]
+            chosen = above[0] if above else ranked[-1]
+            _diag(
+                f"Pick {want.get('item')!r} 取抬升 "
+                f"{_post_grasp_lift(chosen[2]) * 100:.2f}cm 的记录（共 {len(exact)} 条，"
+                f"阈值 {PICK_MIN_LIFT * 100:.0f}cm）: {chosen[1]}"
+            )
+            return chosen
+        # Place：ready pose 的工具轴越接近竖直越好（俯视放下、少蹭容器边）。
+        # 同参数记录里差别很大（moka_pot_1 放灶台：20° 到 63°），"取第一条"
+        # 取到的是 38° 那条。
+        chosen = min(exact, key=lambda item: _place_tilt(item[2]))
+        _diag(
+            f"{skill} {want.get('item')!r}->{want.get('target')!r} 取工具轴偏竖直 "
+            f"{np.degrees(np.arcsin(min(_place_tilt(chosen[2]), 1.0))):.0f}° 的记录"
+            f"（共 {len(exact)} 条）: {chosen[1]}"
+        )
+        return chosen
     if same_type is not None:
         _diag(f"{skill} {want} 无精确记录，回退到同型 {want_type!r}: {same_type[1]}")
         return same_type
@@ -669,6 +740,13 @@ class OracleReadySelector:
         # 直接拒绝（stove: goal in collision），也可能规划成功但执行到不了（汤任务）。
         # 只有开了 replay 才这样做——非 replay 的调用方行为不变。
         force_lift = self.replay and str(record.get("skill")) in {"PlaceIn", "PlaceOn"}
+        # TurnOn 单独换成"动作复刻"：waypoint 追踪的推进条件是"末端进入下一个
+        # waypoint 的容差"，握着旋钮时够不到的点会让索引冻住（实测卡在 40% 旋转、
+        # 后 50 帧空转），而记录里本来就有逐帧动作（action_sequence_object_physical，
+        # 23 帧）。复刻模式无条件逐帧播，不会冻在某个点上，预算也只要 23 帧。
+        segment_mode = (
+            "rawactions" if str(record.get("skill")) == "TurnOn" else self.replay
+        )
         plan = None
         if not force_lift:
             plan = self.planner.plan(
@@ -691,7 +769,7 @@ class OracleReadySelector:
             from memory_system.execute.recovery import LiftTranslateDescendController
 
             seg_len = int(record.get("sequence_length", 64))
-            steps = 64 + max(64, 2 * seg_len)
+            steps = 64 + max(64, SEGMENT_STEPS_PER_FRAME * seg_len)
             _diag(
                 ("place: forced lift-translate-descend" if force_lift
                  else "cuRobo plan FAILED; fallback approach")
@@ -704,7 +782,7 @@ class OracleReadySelector:
                     LiftTranslateDescendController(
                         current_ee_states, ee_states, step_budget=steps
                     ),
-                    record, T_world_ref, segment=self.replay, wp_max_steps=steps,
+                    record, T_world_ref, segment=segment_mode, wp_max_steps=steps,
                 ),
                 None,
                 memory_id,
@@ -739,14 +817,14 @@ class OracleReadySelector:
                     env, plan.joint_trajectory, target_ee, segment_gripper
                 )
             seg_len = int(record.get("sequence_length", 64))
-            steps = plan.correction_steps + max(64, 2 * seg_len)
+            steps = plan.correction_steps + max(64, SEGMENT_STEPS_PER_FRAME * seg_len)
             controller = _ReplayController(
-                approach, record, T_world_ref, segment=self.replay,
+                approach, record, T_world_ref, segment=segment_mode,
                 wp_max_steps=steps,
             )
             joint_trajectory = None
             _diag(
-                f"replay mode={self.replay} segment_len={seg_len} "
+                f"replay mode={segment_mode} segment_len={seg_len} "
                 f"approach_gripper={segment_gripper:+.0f} steps<= {steps}"
             )
         _diag(
