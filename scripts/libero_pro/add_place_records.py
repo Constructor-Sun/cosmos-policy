@@ -22,7 +22,7 @@
     object_frame 重算或在离线诊断里用，保留原值不影响。
 
 注意
-    本文件是 memory_system/offline/build_recovery.py 的构建产物；重建 place 库会
+    本文件是 memory_system/pointcloud_action/offline/build_memory.py 的构建产物；重建 place 库会
     覆盖这里追加的记录，届时需要重跑本脚本。
 
 用法

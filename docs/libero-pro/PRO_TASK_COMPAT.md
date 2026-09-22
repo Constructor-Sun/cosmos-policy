@@ -98,7 +98,7 @@ LRSCENE5 是 10 条变体里唯一"交换关系"的一条：两个杯子的盘�
 `T_world_object_anchor`、`target_points_*`、`complete_points_*` 由运行时 `object_frame` 重算或
 只用于离线诊断。`RECORD_FIELDS` 只是字段清单，没有校验调用点。
 
-⚠️ place 库是 `memory_system/offline/build_recovery.py` 的产物，重建会覆盖这 13 条，
+⚠️ place 库是 `memory_system/pointcloud_action/offline/build_memory.py` 的产物，重建会覆盖这 13 条，
 届时重跑 `scripts/libero_pro/add_place_records.py`。
 
 ## 3. 起跑环境（照抄，缺一项行为就会变）
