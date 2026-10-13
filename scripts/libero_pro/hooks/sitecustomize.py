@@ -53,3 +53,10 @@ def _install():
 
 
 _install()
+
+
+try:
+    import probe_goal
+    probe_goal.install()
+except Exception:
+    pass

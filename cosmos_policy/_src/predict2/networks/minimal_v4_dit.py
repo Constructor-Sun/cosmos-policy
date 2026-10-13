@@ -564,6 +564,7 @@ class Attention(nn.Module):
         rope_emb: Optional[torch.Tensor] = None,
         video_size: Optional[VideoSize] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
+        action_vision_indices: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         """
         Args:
@@ -573,7 +574,49 @@ class Attention(nn.Module):
             video_size(VideoSize): Shape [T, H, W]
         """
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
-        return self.compute_attention(q, k, v, video_size=video_size, kv_cache_cfg=kv_cache_cfg)
+        output = self.compute_attention(q, k, v, video_size=video_size, kv_cache_cfg=kv_cache_cfg)
+        if action_vision_indices is None:
+            return output
+        # q/k here are the actual normalized, post-RoPE tensors used above.
+        attention_map = self.action_to_vision_attention(q, k, *action_vision_indices, video_size=video_size)
+        return output, attention_map
+
+    def action_to_vision_attention(self, q, k, action_indices, vision_indices, *, video_size):
+        """Average action-query -> current-image-key attention, with its graph.
+
+        Normalize over the entire self-attention key sequence before selecting
+        image keys. Query chunks bound peak memory without changing the mean.
+        """
+        if not self.is_selfattn or video_size is None or self.qkv_format != "bshd":
+            raise ValueError("Mask supervision requires dense bshd video self-attention")
+        if isinstance(self.attn_op, (NattenA2AAttnOp, NeighborhoodAttention, AttentionOpWithKVCache)) or self.backend == "i4":
+            raise ValueError("Mask supervision requires full dense attention without a KV cache")
+        batch_size, sequence_length, heads, head_dim = q.shape
+        spatial_tokens = video_size.H * video_size.W
+        if sequence_length != video_size.T * spatial_tokens or k.shape != q.shape:
+            raise ValueError("Mask attention requires an unsplit full video sequence (context parallel size 1)")
+        action_indices = action_indices.to(device=q.device, dtype=torch.long).reshape(-1)
+        vision_indices = vision_indices.to(device=q.device, dtype=torch.long).reshape(-1)
+        if action_indices.numel() != batch_size or vision_indices.numel() != batch_size:
+            raise ValueError("Expected one action and current-image frame index per sample")
+        if ((action_indices < 0) | (action_indices >= video_size.T) |
+                (vision_indices < 0) | (vision_indices >= video_size.T)).any():
+            raise ValueError("Action/current-image frame index is outside the encoded sequence")
+        offsets = torch.arange(spatial_tokens, device=q.device)
+        action_rows = action_indices[:, None] * spatial_tokens + offsets
+        image_columns = vision_indices[:, None] * spatial_tokens + offsets
+        with amp.autocast(q.device.type, enabled=False):
+            action_q = q.gather(1, action_rows[:, :, None, None].expand(-1, -1, heads, head_dim))
+            action_q = action_q.transpose(1, 2).float()
+            all_k = k.transpose(1, 2).transpose(-1, -2).float()
+            image_attention = torch.zeros(batch_size, spatial_tokens, device=q.device, dtype=torch.float32)
+            for start in range(0, spatial_tokens, 32):
+                queries = action_q[:, :, start : start + 32]
+                weights = torch.softmax((queries @ all_k) * (head_dim ** -0.5), dim=-1)
+                selected = weights.gather(-1, image_columns[:, None, None, :].expand(-1, heads, queries.shape[2], -1))
+                image_attention = image_attention + selected.sum(dim=(1, 2))
+            image_attention = image_attention / (heads * spatial_tokens)
+        return image_attention.reshape(batch_size, video_size.H, video_size.W)
 
     def set_context_parallel_group(self, process_group, ranks, stream, cp_comm_type: str = "p2p"):
         # self.attn_op.set_context_parallel_group(process_group, ranks, stream, cp_comm_type="a2a")
@@ -1264,7 +1307,8 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         kv_cache_cfg: Optional[KVCacheConfig] = None,
-    ) -> torch.Tensor:
+        action_vision_indices: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
@@ -1323,15 +1367,21 @@ class Block(nn.Module):
         if self.cp_size is not None and self.cp_size > 1:
             video_size = VideoSize(T=T * self.cp_size, H=H, W=W)
 
+        attention_kwargs = {}
+        if action_vision_indices is not None:
+            attention_kwargs["action_vision_indices"] = action_vision_indices
+        self_attention_output = self.self_attn(
+            rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
+            None,
+            rope_emb=rope_emb_L_1_1_D,
+            video_size=video_size,
+            kv_cache_cfg=kv_cache_cfg,
+            **attention_kwargs,
+        )
+        if action_vision_indices is not None:
+            self_attention_output, action_vision_attention = self_attention_output
         result_B_T_H_W_D = rearrange(
-            self.self_attn(
-                # normalized_x_B_T_HW_D,
-                rearrange(normalized_x_B_T_H_W_D, "b t h w d -> b (t h w) d"),
-                None,
-                rope_emb=rope_emb_L_1_1_D,
-                video_size=video_size,
-                kv_cache_cfg=kv_cache_cfg,
-            ),
+            self_attention_output,
             "b (t h w) d -> b t h w d",
             t=T,
             h=H,
@@ -1380,6 +1430,10 @@ class Block(nn.Module):
         )
         result_B_T_H_W_D = self.mlp(normalized_x_B_T_H_W_D)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result_B_T_H_W_D
+        if action_vision_indices is not None:
+            # Return the auxiliary tensor through checkpoint/FSDP wrappers so
+            # recomputation and their backward hooks include its graph.
+            return x_B_T_H_W_D, action_vision_attention
         return x_B_T_H_W_D
 
 
@@ -1710,6 +1764,24 @@ class MiniTrainDIT(WeightTrainingStat):
         )
         return x_B_C_Tt_Hp_Wp
 
+    def set_action_vision_supervision(self, action_indices, vision_indices, num_layers=4):
+        if self.patch_temporal != 1:
+            raise ValueError("Action/vision mask supervision requires temporal patch size 1")
+        if not 1 <= num_layers <= len(self.blocks):
+            raise ValueError("The supervised layer count must be within the DiT block count")
+        self._action_vision_indices = (action_indices, vision_indices)
+        self._action_vision_layers = num_layers
+        self._action_vision_attention = None
+
+    def take_action_vision_attention(self):
+        attention_map = getattr(self, "_action_vision_attention", None)
+        self.clear_action_vision_supervision()
+        return attention_map
+
+    def clear_action_vision_supervision(self):
+        self._action_vision_indices = None
+        self._action_vision_attention = None
+
     def forward(
         self,
         x_B_C_T_H_W: torch.Tensor,
@@ -1770,15 +1842,26 @@ class MiniTrainDIT(WeightTrainingStat):
         # x_B_THW_D = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
 
         intermediate_features_outputs = []
+        action_vision_indices = getattr(self, "_action_vision_indices", None)
+        action_vision_maps = []
         for i, block in enumerate(self.blocks):
-            x_B_T_H_W_D = block(
+            block_kwargs = {}
+            if action_vision_indices is not None and i >= len(self.blocks) - self._action_vision_layers:
+                block_kwargs["action_vision_indices"] = action_vision_indices
+            block_output = block(
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
                 context_input,
                 rope_emb_L_1_1_D=rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D=adaln_lora_B_T_3D,
                 extra_per_block_pos_emb=extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D,
+                **block_kwargs,
             )
+            if block_kwargs:
+                x_B_T_H_W_D, attention_map = block_output
+                action_vision_maps.append(attention_map)
+            else:
+                x_B_T_H_W_D = block_output
             if intermediate_feature_ids and i in intermediate_feature_ids:
                 x_reshaped_for_disc = rearrange(x_B_T_H_W_D, "b tp hp wp d -> b (tp hp wp) d")
                 intermediate_features_outputs.append(x_reshaped_for_disc)
@@ -1787,6 +1870,8 @@ class MiniTrainDIT(WeightTrainingStat):
         # O = out_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
+        if action_vision_indices is not None:
+            self._action_vision_attention = torch.stack(action_vision_maps).mean(dim=0)
         if intermediate_feature_ids:
             if len(intermediate_features_outputs) != len(intermediate_feature_ids):
                 log.warning(

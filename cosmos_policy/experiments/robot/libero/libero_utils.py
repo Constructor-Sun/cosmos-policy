@@ -27,7 +27,7 @@ from PIL import Image, ImageDraw, ImageFont
 from cosmos_policy.experiments.robot.robot_utils import DATE, DATE_TIME
 
 
-def get_libero_env(task, model_family, resolution=256, camera_depths=None):
+def get_libero_env(task, model_family, resolution=256, camera_depths=None, env_seed=0):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
@@ -54,7 +54,9 @@ def get_libero_env(task, model_family, resolution=256, camera_depths=None):
         else OffScreenRenderEnv
     )
     env = env_class(**env_args)
-    env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
+    if env_seed is not None:
+        # Legacy callers keep seed=0; openwam mode uses only the global env RNG.
+        env.seed(env_seed)
     return env, task_description
 
 

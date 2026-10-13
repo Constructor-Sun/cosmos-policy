@@ -19,6 +19,7 @@ Run this command to print a few samples from the LIBERO dataset:
     python -m cosmos_policy.datasets.libero_dataset
 """
 
+import json
 import os
 import pickle
 import random
@@ -79,6 +80,7 @@ def build_action_chunk_sample(
     value_function_sample_mask: int = 0,
     global_rollout_idx: int = -1,
     sample_key=None,
+    use_agentview_masks: bool = False,
     extra_fields: dict | None = None,
 ) -> dict:
     """Assemble one action-chunk training sample from a loaded episode.
@@ -93,6 +95,8 @@ def build_action_chunk_sample(
             command, num_steps, success, is_jpeg and (optionally) returns.
         relative_step_idx: episode step the chunk starts at.
         decompress_jpeg: decode jpeg-encoded frames on the fly (rollout data).
+        use_agentview_masks: Return the current agentview mask after the same
+            spatial preprocessing as RGB. Missing demo masks remain empty.
 
     Returns:
         dict: the standard training sample (same fields as before).
@@ -212,13 +216,31 @@ def build_action_chunk_sample(
 
     # Stack images and preprocess
     images = np.concatenate(image_list, axis=0)
-    images = preprocess_image(
+    spatial_masks = None
+    if use_agentview_masks:
+        if not use_third_person_images:
+            raise ValueError("Agentview mask supervision requires use_third_person_images=True")
+        episode_masks = episode_data.get("agentview_masks")
+        if episode_masks is None:
+            spatial_masks = np.zeros((1, *decompressed_images[relative_step_idx].shape[:2]), dtype=np.bool_)
+        else:
+            if len(episode_masks) != episode_data["num_steps"]:
+                raise ValueError("Agentview masks must have one pre-action frame per episode step")
+            # Use the local pre-action frame index, not the absolute simulator
+            # frame_indices (which include the initial settling steps).
+            spatial_masks = episode_masks[relative_step_idx : relative_step_idx + 1]
+    preprocessed = preprocess_image(
         images,
         final_image_size=final_image_size,
         normalize_images=normalize_images,
         use_image_aug=use_image_aug,
         stronger_image_aug=stronger_image_aug,
+        spatial_masks=spatial_masks,
     )
+    if use_agentview_masks:
+        images, agentview_mask = preprocessed
+    else:
+        images = preprocessed
 
     # Calculate how many actions we can get from the current index
     action_chunk = get_action_chunk_with_padding(
@@ -285,6 +307,9 @@ def build_action_chunk_sample(
         "next_action_chunk": next_action_chunk,
         "next_value_function_return": next_value_function_return,
     }
+    if use_agentview_masks:
+        sample_dict["agentview_mask"] = agentview_mask  # FP32 (1, H, W), no gradients
+        sample_dict["agentview_mask_valid"] = agentview_mask.any()
     if extra_fields:
         sample_dict.update(extra_fields)
     return sample_dict
@@ -312,6 +337,7 @@ class LIBERODataset(Dataset):
         treat_success_rollouts_as_demos: bool = False,
         return_value_function_returns: bool = True,
         gamma: float = 0.99,
+        agentview_mask_manifest: str = "",
     ):
         """
         Initialize LIBERO dataset for training.
@@ -337,8 +363,25 @@ class LIBERODataset(Dataset):
             treat_success_rollouts_as_demos (bool): If True, copy successful rollout episodes into demonstration dataset (self.data)
             return_value_function_returns (bool): If True, returns value function returns for rollout episodes
             gamma (float): Discount factor for value function returns
+            agentview_mask_manifest (str): Optional latest mask manifest. Match
+                exact source HDF5 paths, not just episode tags, to avoid pairing
+                masks with another trajectory or perturbation of the same tag.
         """
         self.data_dir = data_dir
+        self.use_agentview_masks = bool(agentview_mask_manifest)
+        self._agentview_mask_paths = {}
+        if self.use_agentview_masks:
+            if not use_third_person_images:
+                raise ValueError("Agentview mask supervision requires use_third_person_images=True")
+            manifest_path = os.path.realpath(agentview_mask_manifest)
+            with open(manifest_path) as file:
+                mask_manifest = json.load(file)
+            for case in mask_manifest["cases"]:
+                source_h5 = os.path.realpath(os.path.join(os.path.dirname(manifest_path), case["source_h5"]))
+                mask_npz = os.path.realpath(os.path.join(os.path.dirname(manifest_path), case["mask_npz"]))
+                if source_h5 in self._agentview_mask_paths:
+                    raise ValueError(f"Duplicate source HDF5 in agentview mask manifest: {source_h5}")
+                self._agentview_mask_paths[source_h5] = mask_npz
         self.chunk_size = chunk_size
         self.final_image_size = final_image_size
         self.t5_text_embeddings_path = t5_text_embeddings_path
@@ -595,6 +638,8 @@ class LIBERODataset(Dataset):
                         suite=suite_name,
                         returns=returns,
                     )
+                    if self.use_agentview_masks:
+                        self.data[self.num_episodes]["agentview_masks"] = episode_data["agentview_masks"]
                     self.unique_commands.add(ep_meta.get("command"))
                     self.num_episodes += 1
                     self.num_steps += ep_meta.get("num_steps")
@@ -708,6 +753,21 @@ class LIBERODataset(Dataset):
                 success=episode_metadata["success"],
                 is_jpeg=episode_metadata["is_jpeg"],
             )
+            if self.use_agentview_masks:
+                mask_path = self._agentview_mask_paths.get(os.path.realpath(file_path))
+                if mask_path is None:
+                    raise ValueError(f"No mask for exact rollout source HDF5: {file_path}")
+                with np.load(mask_path, allow_pickle=False) as mask_data:
+                    bits = mask_data["agentview_bits"]
+                    if bits.ndim != 3 or bits.shape[0] != len(actions) or len(images) != len(actions):
+                        raise ValueError(f"Agentview mask/image/action frame count mismatch: {file_path}")
+                    if bits.dtype != np.uint8:
+                        raise ValueError(f"Expected uint8 agentview mask component bits: {mask_path}")
+                    # The latest NPZ and video are already flipped like saved RGB.
+                    # Bit 1 is gripper; bit 2 is the current phase objects,
+                    # including the placement target when needed. Bit 4 (all
+                    # task targets) does not belong to current-phase supervision.
+                    episode_data["agentview_masks"] = (bits & 3) != 0
 
             return episode_data
 
@@ -824,6 +884,7 @@ class LIBERODataset(Dataset):
             value_function_sample_mask=1 if is_value_function_sample else 0,
             global_rollout_idx=global_rollout_idx,
             sample_key=idx,
+            use_agentview_masks=self.use_agentview_masks,
         )
 
 

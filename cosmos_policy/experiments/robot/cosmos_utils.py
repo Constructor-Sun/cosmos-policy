@@ -286,13 +286,18 @@ def get_model(cfg):
         print(f"Detected HuggingFace repository: {checkpoint_path}")
         checkpoint_path = download_hf_checkpoint(checkpoint_path)
 
-    # Load the model
-    model, config = load_model_from_checkpoint(
-        experiment_name=cfg.config,
-        s3_checkpoint_dir=checkpoint_path,
-        config_file=cfg.config_file,
-        load_ema_to_reg=False,
-    )
+    # Inference: build the net straight in bf16 rather than fp32 (the fp32 construction peak is ~7.3 GiB; the bf16 checkpoint overwrites every value anyway).
+    _prev_default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        model, config = load_model_from_checkpoint(
+            experiment_name=cfg.config,
+            s3_checkpoint_dir=checkpoint_path,
+            config_file=cfg.config_file,
+            load_ema_to_reg=False,
+        )
+    finally:
+        torch.set_default_dtype(_prev_default_dtype)
     model.eval()
     model = model.to(DEVICE)
     return model, config

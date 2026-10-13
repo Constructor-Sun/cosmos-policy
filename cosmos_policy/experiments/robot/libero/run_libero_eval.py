@@ -109,12 +109,15 @@ Usage examples:
 import json
 import logging
 import os
+import random
 import sys
 import time
 import traceback
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -160,6 +163,42 @@ from memory_system.geometry import (
     flip_depth,
 )
 from scipy.spatial.transform import Rotation
+
+
+@contextmanager
+def _policy_rng_scope(seed):
+    """Keep inference (including deterministic VAE encoding) off the env RNG stream."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    hash_seed = os.environ.get("PYTHONHASHSEED")
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_initialized() else []
+    try:
+        with torch.random.fork_rng(devices=devices):
+            set_seed_everywhere(seed)
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        if hash_seed is None:
+            os.environ.pop("PYTHONHASHSEED", None)
+        else:
+            os.environ["PYTHONHASHSEED"] = hash_seed
+
+
+def _isolate_policy_rng(function):
+    @wraps(function)
+    def isolated(cfg, *args, **kwargs):
+        if cfg.rng_mode != "openwam":
+            return function(cfg, *args, **kwargs)
+        with _policy_rng_scope(kwargs.get("seed", cfg.seed)):
+            return function(cfg, *args, **kwargs)
+    return isolated
+
+
+get_action = _isolate_policy_rng(get_action)
+get_future_state_prediction = _isolate_policy_rng(get_future_state_prediction)
+get_value_prediction = _isolate_policy_rng(get_value_prediction)
+get_qvalue_prediction = _isolate_policy_rng(get_qvalue_prediction)
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -278,6 +317,8 @@ class PolicyEvalConfig:
 
     seed: int = 7                                                        # Random seed (for reproducibility)
     randomize_seed: bool = False                                         # Whether to randomize the seed for sampling
+    rng_mode: str = "legacy"                                             # legacy, or openwam: independent env/policy streams
+    environment_seed: int = 10000                                        # Global RNG seed at environment-run startup
 
     #################################################################################################################
     # Data collection parameters
@@ -474,7 +515,7 @@ def run_episode(
 ):
     """Run a single episode in the environment."""
     # Reset environment
-    if cfg.deterministic_reset:
+    if cfg.rng_mode == "legacy" and cfg.deterministic_reset:
         reset_seed = cfg.deterministic_reset_seed if cfg.deterministic_reset_seed is not None else cfg.seed
         set_seed_everywhere(reset_seed)
     env.reset()
@@ -1212,7 +1253,7 @@ def run_episode(
     try:
         while t < max_steps + NUM_STEPS_WAIT:
             # If the deterministic flag is set, reset the random state with the same seed in every step
-            if os.environ.get("DETERMINISTIC", "").lower() == "true":
+            if cfg.rng_mode == "legacy" and os.environ.get("DETERMINISTIC", "").lower() == "true":
                 seed = 0
                 set_seed_everywhere(seed)
 
@@ -1312,9 +1353,18 @@ def run_episode(
                             dtype=np.float32,
                         )
 
-                # Alignment frames are not collected (joint-space actions must
-                # not enter the 7-dim policy action stream); the buffered
-                # frame is simply not committed.
+                # 7-dim (EE) alignment steps are committed so the episode stays
+                # complete; 8-dim joint-execution steps remain out of the stream.
+                if cfg.data_collection and action.shape[0] == 7:
+                    primary_images_list.append(_frame_buffer[0])
+                    wrist_images_list.append(_frame_buffer[1])
+                    proprio_list.append(_frame_buffer[2])
+                    frame_indices.append(_frame_buffer[3])
+                    if _frame_buffer_rgbd is not None:
+                        wrist_depth_list.append(_frame_buffer_rgbd[0])
+                        wrist_segmentation_list.append(_frame_buffer_rgbd[1])
+                        wrist_c2w_list.append(_frame_buffer_rgbd[2])
+                    actions_list.append(action.copy())
                 last_gripper_closed = bool(float(action[-1]) > 0.0)
                 obs, reward, done, info = env.step(action.tolist())
                 observe_skill_shadow(obs, action, t, feed_rule=True)
@@ -1611,7 +1661,7 @@ def run_episode(
             # Process action
             print(f"t: {t}\t action: {action}")
 
-            if cfg.data_collection and not _is_alignment_action:
+            if cfg.data_collection and (not _is_alignment_action or action.shape[0] == 7):
                 primary_images_list.append(_frame_buffer[0])
                 wrist_images_list.append(_frame_buffer[1])
                 proprio_list.append(_frame_buffer[2])
@@ -1819,6 +1869,7 @@ def run_task(
         task,
         cfg.model_family,
         resolution=cfg.env_img_res,
+        env_seed=None if cfg.rng_mode == "openwam" else 0,
         camera_depths=[True, True] if os.environ.get("COSMOS_TTA_RGBD") == "1" else ([True, False] if (
             cfg.enable_initial_alignment and cfg.enable_collision_aware_initial_alignment
         ) else None),
@@ -1965,6 +2016,11 @@ def eval_libero(
 ) -> float:
     """Main function to evaluate a trained policy on LIBERO benchmark tasks."""
 
+    if cfg.rng_mode not in {"legacy", "openwam"}:
+        raise ValueError(f"Unknown rng_mode: {cfg.rng_mode!r}")
+    if cfg.rng_mode == "openwam" and (cfg.randomize_seed or cfg.num_queries_best_of_n != 1):
+        raise ValueError("openwam RNG mode requires fixed sampling and one action candidate")
+
     # Set DETERMINISTIC environment variable if on deterministic mode (makes some model operations deterministic)
     assert not (cfg.deterministic and cfg.randomize_seed), (
         "Cannot enable both deterministic mode and randomize seed mode!"
@@ -2058,6 +2114,14 @@ def eval_libero(
         log_message("Using serial inference (parallel inference disabled)", log_file)
 
     # Initialize LIBERO task suite
+    if cfg.rng_mode == "openwam":
+        # Model construction may consume global RNGs. Start the environment stream
+        # only afterwards, at the same point as the separate OpenWAM env client.
+        set_seed_everywhere(cfg.environment_seed)
+        log_message(
+            f"RNG protocol: openwam; environment_seed={cfg.environment_seed}; "
+            f"action_seed={cfg.seed}; env.seed disabled; reset/step reseeding disabled", log_file,
+        )
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks = task_suite.n_tasks

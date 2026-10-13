@@ -178,7 +178,10 @@ def build_memory(
                         release_frame = None
                         if place:
                             sequence_end = min(len(actions), segment_end - 1)
-                            grip = actions[segment_start:sequence_end, -1]
+                            # 释放边可能落在 success_end 之后（labeler 把 success 标在
+                            # 夹爪真正张开之前），搜索窗向后留 20 帧。
+                            release_search_end = min(len(actions), segment_end + 20)
+                            grip = actions[segment_start:release_search_end, -1]
                             edges = np.where((grip[:-1] > 0) & (grip[1:] < 0))[0]
                             if not len(edges):
                                 warnings.append(

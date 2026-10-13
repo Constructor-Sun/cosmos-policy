@@ -734,6 +734,8 @@ def make_cfg(suite_name, num_trials, run_id_note, local_log_dir="./experiments/l
         local_log_dir=local_log_dir,
         run_id_note=run_id_note,
         seed=int(os.environ["COSMOS_SMOKE_SEED"]),
+        rng_mode=os.environ.get("COSMOS_SMOKE_RNG_MODE", "legacy"),
+        environment_seed=int(os.environ.get("COSMOS_SMOKE_ENVIRONMENT_SEED", "10000")),
         randomize_seed=False,
         deterministic=True,
         deterministic_reset=deterministic_reset,
@@ -918,6 +920,12 @@ def annotate_episodes(
             "run_id": run_id,
             "suite": suite,
             "seed": seed,
+            "action_seed": seed,
+            "rng_mode": os.environ.get("COSMOS_SMOKE_RNG_MODE", "legacy"),
+            "environment_seed": (
+                int(os.environ.get("COSMOS_SMOKE_ENVIRONMENT_SEED", "10000"))
+                if os.environ.get("COSMOS_SMOKE_RNG_MODE", "legacy") == "openwam" else None
+            ),
             "deterministic_reset": deterministic_reset,
             "deterministic_reset_seed": deterministic_reset_seed,
             "base_task": base_task,
@@ -1098,6 +1106,12 @@ if mode == "paired":
         "run_id": run_id,
         "suite": pair_suite,
         "seed": seed,
+        "action_seed": seed,
+        "rng_mode": os.environ.get("COSMOS_SMOKE_RNG_MODE", "legacy"),
+        "environment_seed": (
+            int(os.environ.get("COSMOS_SMOKE_ENVIRONMENT_SEED", "10000"))
+            if os.environ.get("COSMOS_SMOKE_RNG_MODE", "legacy") == "openwam" else None
+        ),
         "deterministic_reset": deterministic_reset,
         "deterministic_reset_seed": deterministic_reset_seed,
         "num_pairs": num_pairs,
@@ -1182,6 +1196,12 @@ if mode == "paired":
                         "episode": episode_idx,
                         "success": bool(variant_episodes[0]["success"]),
                         "seed": seed,
+                        "action_seed": seed,
+                        "rng_mode": os.environ.get("COSMOS_SMOKE_RNG_MODE", "legacy"),
+                        "environment_seed": (
+                            int(os.environ.get("COSMOS_SMOKE_ENVIRONMENT_SEED", "10000"))
+                            if os.environ.get("COSMOS_SMOKE_RNG_MODE", "legacy") == "openwam" else None
+                        ),
                         "deterministic_reset": deterministic_reset,
                         "deterministic_reset_seed": deterministic_reset_seed,
                         "base_task": base_task,

@@ -19,10 +19,14 @@ Cosmos Policy Diffusion Model - extends Text2WorldModel with policy-specific fun
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 
 import attrs
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 from einops import rearrange
 
 from cosmos_policy._src.imaginaire.lazy_config import LazyCall as L
@@ -208,8 +212,25 @@ class CosmosPolicyModelConfig(BaseText2WorldModelConfig):
     # (Must be an integer - or will be cast to an integer later!)
     action_loss_multiplier: int = 1
 
+    use_mask_attention_loss: bool = False
+    mask_attention_layers: int = 4
+    # A number fixes the auxiliary weight; None enables first-batch gradient calibration.
+    mask_attention_lambda: Optional[float] = 1.0
+    mask_attention_grad_ratio: float = 0.1
+    mask_attention_eps: float = 1e-8
+
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
+        if self.mask_attention_layers < 1:
+            raise ValueError("mask_attention_layers must be positive")
+        if self.mask_attention_lambda is not None and (
+            not math.isfinite(self.mask_attention_lambda) or self.mask_attention_lambda <= 0
+        ):
+            raise ValueError("mask_attention_lambda must be None or finite and positive")
+        if not math.isfinite(self.mask_attention_grad_ratio) or self.mask_attention_grad_ratio <= 0:
+            raise ValueError("mask_attention_grad_ratio must be finite and positive")
+        if not math.isfinite(self.mask_attention_eps) or self.mask_attention_eps <= 0:
+            raise ValueError("mask_attention_eps must be finite and positive")
         assert not (
             self.mask_loss_for_action_future_state_prediction and self.mask_value_prediction_loss_for_policy_prediction
         ), (
@@ -236,6 +257,134 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         # Cosmos Policy SDE and Sampler
         self.sde = lazy_instantiate(config.sde)
         self.sampler = CosmosPolicySampler()
+        self._mask_attention_lambda = config.mask_attention_lambda
+
+    def state_dict(self):
+        state = super().state_dict()
+        if self.config.use_mask_attention_loss and self._mask_attention_lambda is not None:
+            state["mask_attention_lambda"] = torch.tensor(self._mask_attention_lambda, dtype=torch.float32)
+        return state
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        # An explicitly fixed config takes precedence over an older calibrated checkpoint.
+        fixed = getattr(self.config, "mask_attention_lambda", None)
+        value = fixed if fixed is not None else state_dict.get("mask_attention_lambda")
+        self._mask_attention_lambda = None if value is None else float(value)
+        if self._mask_attention_lambda is not None and (
+            not math.isfinite(self._mask_attention_lambda) or self._mask_attention_lambda <= 0
+        ):
+            raise ValueError("Checkpoint mask_attention_lambda must be finite and positive")
+        return result
+
+    def _mask_data_parallel_group(self):
+        mesh = getattr(self, "fsdp_device_mesh", None)
+        if mesh is not None:
+            # The stock single-node FSDP config builds a (1, N) HSDP mesh.
+            if mesh.ndim == 2 and mesh.mesh_dim_names == ("replicate", "shard") and mesh.size(0) == 1:
+                return mesh["shard"].get_group()
+            if mesh.ndim != 1:
+                raise ValueError("Mask loss requires one data-parallel shard group (replica size 1)")
+            return mesh.get_group()
+        return None
+
+    def _mask_valid_samples(self, data_batch):
+        if "agentview_mask" not in data_batch:
+            raise ValueError("Mask attention loss requires a dataset configured with agentview_mask_manifest")
+        masks = data_batch["agentview_mask"].detach().float()
+        if masks.ndim != 4 or masks.shape[1] != 1 or not torch.isfinite(masks).all() or (masks < 0).any():
+            raise ValueError("Expected finite nonnegative agentview masks shaped (B, 1, H, W)")
+        valid = masks.flatten(1).sum(dim=1) > 0
+        if "agentview_mask_valid" in data_batch:
+            valid = valid & data_batch["agentview_mask_valid"].to(device=masks.device, dtype=torch.bool).reshape(-1)
+        count = valid.sum().to(torch.float32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(count, group=self._mask_data_parallel_group())
+        return masks, valid, count
+
+    def _compute_mask_attention_loss(self, attention_map, masks, valid, global_count):
+        if attention_map is None or not attention_map.requires_grad:
+            raise RuntimeError("Action-to-agentview attention must come from the real forward with its graph")
+        if attention_map.shape[0] != masks.shape[0]:
+            raise ValueError("Mask and attention batch sizes differ")
+        token_h, token_w = attention_map.shape[-2:]
+        if masks.shape[-2] % token_h or masks.shape[-1] % token_w:
+            raise ValueError("Mask dimensions must divide evenly into the actual visual token grid")
+        with torch.autocast(attention_map.device.type, enabled=False):
+            pooled = F.avg_pool2d(masks, (masks.shape[-2] // token_h, masks.shape[-1] // token_w)).flatten(1)
+            eps = self.config.mask_attention_eps
+            q = (pooled / pooled.sum(dim=1, keepdim=True).clamp_min(eps)).detach()
+            a = attention_map.float().flatten(1)
+            p = a / a.sum(dim=1, keepdim=True).clamp_min(eps)
+            per_sample = (p - q).square().sum(dim=1)
+            # FSDP/DDP averages rank gradients. Weight by valid sample counts so
+            # that the resulting gradient is the global valid-sample mean.
+            world_size = dist.get_world_size(self._mask_data_parallel_group()) if dist.is_initialized() else 1
+            return per_sample[valid].sum() * world_size / global_count.clamp_min(1)
+
+    def _mask_gradient_norm(self, parameters, device):
+        sharded_sq = torch.zeros((), device=device, dtype=torch.float32)
+        replicated_sq = torch.zeros_like(sharded_sq)
+        group = self._mask_data_parallel_group()
+        world_size = dist.get_world_size(group) if dist.is_initialized() else 1
+        for parameter in parameters:
+            gradient = parameter.grad
+            if isinstance(parameter, DTensor):
+                if parameter.device_mesh.ndim != 1:
+                    raise ValueError("Mask calibration requires a one-dimensional parameter mesh")
+                if gradient is None:
+                    continue
+                value = gradient.to_local().detach().float()
+                if any(placement.is_shard() for placement in parameter.placements):
+                    sharded_sq = sharded_sq + value.square().sum()
+                else:
+                    replicated_sq = replicated_sq + value.square().sum()
+            else:
+                value = torch.zeros_like(parameter, dtype=torch.float32) if gradient is None else gradient.detach().float()
+                if world_size > 1:
+                    value = value.clone()
+                    dist.all_reduce(value, group=group)
+                    value.div_(world_size)
+                replicated_sq = replicated_sq + value.square().sum()
+        if world_size > 1:
+            dist.all_reduce(sharded_sq, group=group)
+        return (sharded_sq + replicated_sq).sqrt()
+
+    def _calibrate_mask_attention_lambda(self, forward_sft, forward_mask, device):
+        parameters = [parameter for parameter in self.net.parameters() if parameter.requires_grad]
+        if not parameters:
+            raise RuntimeError("Mask loss calibration requires trainable parameters")
+        saved_gradients = [None if parameter.grad is None else parameter.grad.clone() for parameter in parameters]
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+        try:
+            for parameter in parameters:
+                parameter.grad = None
+            output, sft_loss, _ = forward_sft()
+            sft_loss.backward()  # Before GradScaler, accumulation scaling or clipping.
+            sft_norm = self._mask_gradient_norm(parameters, device)
+            del output, sft_loss
+            for parameter in parameters:
+                parameter.grad = None
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng, device)
+            output, _, mask_loss = forward_mask()
+            mask_loss.backward()
+            mask_norm = self._mask_gradient_norm(parameters, device)
+            del output, mask_loss
+            if not torch.isfinite(sft_norm) or not torch.isfinite(mask_norm) or sft_norm <= 0 or mask_norm <= 0:
+                raise RuntimeError("First valid batch must produce finite, nonzero SFT and mask gradient norms")
+            self._mask_attention_lambda = float(self.config.mask_attention_grad_ratio * sft_norm / mask_norm)
+            return sft_norm.detach(), mask_norm.detach()
+        finally:
+            for parameter, saved in zip(parameters, saved_gradients):
+                parameter.grad = saved
+            # Both calibration passes and the final joint pass see the same
+            # dropout randomness as well as the same sampled diffusion noise.
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng, device)
 
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
@@ -272,11 +421,7 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T = self.broadcast_split_for_model_parallelsim(
             x0_B_C_T_H_W, condition, epsilon_B_C_T_H_W, sigma_B_T
         )
-        output_batch, kendall_loss, _, _ = self.compute_loss_with_epsilon_and_sigma(
-            x0_B_C_T_H_W,
-            condition,
-            epsilon_B_C_T_H_W,
-            sigma_B_T,
+        loss_kwargs = dict(
             action_chunk=data_batch["actions"],
             action_indices=data_batch["action_latent_idx"],
             proprio=data_batch["proprio"],
@@ -297,15 +442,65 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             value_function_return=data_batch["value_function_return"],
             value_indices=data_batch["value_latent_idx"],
         )
+        enabled = self.config.use_mask_attention_loss
+        masks = valid = count = None
+        if enabled:
+            cp_group = self.get_context_parallel_group()
+            if cp_group is not None and dist.get_world_size(cp_group) > 1:
+                raise ValueError("Agentview mask attention currently requires context parallel size 1")
+            masks, valid, count = self._mask_valid_samples(data_batch)
+        capture_mask = enabled and bool(count > 0)
 
-        if self.loss_reduce == "mean":
-            kendall_loss = kendall_loss.mean() * self.loss_scale
-        elif self.loss_reduce == "sum":
-            kendall_loss = kendall_loss.sum(dim=1).mean() * self.loss_scale
-        else:
-            raise ValueError(f"Invalid loss_reduce: {self.loss_reduce}")
+        def forward_losses(capture):
+            if capture:
+                self.net.set_action_vision_supervision(
+                    data_batch["action_latent_idx"], data_batch["current_image_latent_idx"],
+                    num_layers=self.config.mask_attention_layers,
+                )
+            try:
+                output, sft_loss, _, _ = self.compute_loss_with_epsilon_and_sigma(
+                    x0_B_C_T_H_W.clone() if enabled else x0_B_C_T_H_W,
+                    condition, epsilon_B_C_T_H_W, sigma_B_T, **loss_kwargs,
+                )
+                if self.loss_reduce == "mean":
+                    sft_loss = sft_loss.mean() * self.loss_scale
+                elif self.loss_reduce == "sum":
+                    sft_loss = sft_loss.sum(dim=1).mean() * self.loss_scale
+                else:
+                    raise ValueError(f"Invalid loss_reduce: {self.loss_reduce}")
+                mask_loss = sft_loss.new_zeros(())
+                if capture:
+                    attention_map = self.net.take_action_vision_attention()
+                    mask_loss = self._compute_mask_attention_loss(attention_map, masks, valid, count)
+                    # Reach the top-level FSDP output's pre-backward hook even
+                    # during the mask-only calibration pass. This term is zero.
+                    mask_loss = mask_loss + output["model_pred"].x0.sum() * 0.0
+                    output["mask_attention_map"] = attention_map.detach()
+                return output, sft_loss, mask_loss
+            finally:
+                if capture:
+                    self.net.clear_action_vision_supervision()
 
-        return output_batch, kendall_loss
+        calibration_norms = None
+        if capture_mask and self._mask_attention_lambda is None:
+            # Fresh forwards/backwards support FSDP and activation checkpointing;
+            # no autograd.grad or retained-graph double backward is required.
+            calibration_norms = self._calibrate_mask_attention_lambda(
+                lambda: forward_losses(False), lambda: forward_losses(True), x0_B_C_T_H_W.device,
+            )
+        output_batch, sft_loss, mask_loss = forward_losses(capture_mask)
+        if not enabled:
+            return output_batch, sft_loss
+        coefficient = self._mask_attention_lambda if self._mask_attention_lambda is not None else 0.0
+        total_loss = sft_loss + coefficient * mask_loss
+        output_batch.update(
+            sft_loss=sft_loss.detach(), mask_attention_loss=mask_loss.detach(),
+            mask_attention_lambda=total_loss.new_tensor(coefficient), mask_valid_samples=count.detach(),
+            total_loss=total_loss.detach(),
+        )
+        if calibration_norms is not None:
+            output_batch["mask_calibration_sft_grad_norm"], output_batch["mask_calibration_mask_grad_norm"] = calibration_norms
+        return output_batch, total_loss
 
     def compute_loss_with_epsilon_and_sigma(
         self,

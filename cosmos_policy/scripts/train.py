@@ -55,6 +55,22 @@ def launch(config: Config, args: argparse.Namespace) -> None:
     with model_init():
         model = instantiate(config.model)
 
+    # [FIX] LoRA 重初始化（PEFT 标准：A=kaiming_uniform(a=sqrt(5))、B=0）。
+    # 背景：build_net 在 meta device 建网，to_empty 物化后 init_weights() 不认识
+    # PEFT 注入的 LoRA → A=B=0 出生 → grad 恒零永久死锁（少数层因垃圾内存逃逸）。
+    # 必须在物化之后、训练之前执行。勿删（v2fix 链路的关键修复）。
+    import math as _math
+    import torch as _torch
+
+    _n_lora = 0
+    for _name, _mod in model.net.named_modules():
+        if _name.endswith('lora_A.default'):
+            _torch.nn.init.kaiming_uniform_(_mod.weight, a=_math.sqrt(5))
+            _n_lora += 1
+        elif _name.endswith('lora_B.default'):
+            _torch.nn.init.zeros_(_mod.weight)
+    print(f'[FIX] LoRA reinit: {_n_lora} layers (A=kaiming, B=0)', flush=True)
+
     # Create the dataloaders.
     with data_loader_init():
         # NOTE (user): We manually instantiate the dataloader instead of using instantiate(config.dataloader_train),

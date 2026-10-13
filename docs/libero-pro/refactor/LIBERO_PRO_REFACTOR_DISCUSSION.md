@@ -8,7 +8,7 @@
 - 结构优先于行为保持，允许精度暂时回退，以固定冒烟例观测；不静默删除已有执行路径，有意改变或暂未迁入的逻辑明确记录。
 - 补丁迁入时提升为所属组件的显式参数，标定值作默认。
 - 重构求快求优雅：以搬为主、步子小、冒烟即验收，不铺仪式。
-- 失败定位到类：各类的判定输出自带原因（PhaseDecision 的 reason、ExecutionResult 的 outcome/stage、MemoryCandidate 的 match、RepairRequest 的 t_star 与 failure），统一写进按类标记的运行日志；case 失败先读日志定类，再进类里修。
+- 千万不要删除memory_system中的文件
 
 ### 1.2 已确认的现实
 

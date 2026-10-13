@@ -286,21 +286,29 @@ def resize_images(images: np.ndarray, target_size: int) -> np.ndarray:
     return resized_images
 
 
-def apply_image_aug(images: torch.Tensor, stronger: bool = False) -> torch.Tensor:
+def apply_image_aug(
+    images: torch.Tensor, stronger: bool = False, spatial_masks: torch.Tensor | None = None
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Apply image augmentations to a batch of images represented as a torch.Tensor of shape (C, T, H, W).
 
     Args:
         images: A torch.Tensor of shape (C, T, H, W) and dtype torch.uint8 representing a set of images.
         stronger (bool): Whether to apply stronger augmentations
+        spatial_masks: Optional FP32 masks of shape (N, H, W). Share the image
+            crop and rotation, using nearest-neighbor interpolation and no color jitter.
 
     Returns:
-        A torch.Tensor of the same shape and dtype with augmentations applied.
+        Augmented images, or (images, masks) when spatial_masks is supplied.
     """
     # Get dimensions
     _, _, H, W = images.shape
     assert H == W, "Image height and width must be equal"
     assert images.dtype == torch.uint8, f"Expected images dtype == torch.uint8 but got: {images.dtype}"
+    if spatial_masks is not None:
+        if spatial_masks.ndim != 3 or spatial_masks.shape[-2:] != (H, W):
+            raise ValueError(f"Expected masks shaped (N, {H}, {W}), got {spatial_masks.shape}")
+        spatial_masks = spatial_masks.to(torch.float32)
 
     # Convert to (T, C, H, W) format for compatibility with torchvision transforms
     images = images.permute(1, 0, 2, 3)
@@ -373,6 +381,13 @@ def apply_image_aug(images: torch.Tensor, stronger: bool = False) -> torch.Tenso
     augmented_images = torch.stack(results)
     augmented_images = augmented_images.permute(1, 0, 2, 3)
 
+    if spatial_masks is not None:
+        spatial_masks = F.resized_crop(
+            spatial_masks, i, j, h, w, size=[H, W], interpolation=T.InterpolationMode.NEAREST
+        )
+        if stronger:
+            spatial_masks = F.rotate(spatial_masks, angle, expand=False, interpolation=T.InterpolationMode.NEAREST)
+        return augmented_images, spatial_masks
     return augmented_images
 
 
@@ -382,7 +397,8 @@ def preprocess_image(
     normalize_images: bool = False,
     use_image_aug: bool = True,
     stronger_image_aug: bool = False,
-) -> torch.Tensor:
+    spatial_masks: np.ndarray | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Preprocesses images for training.
 
@@ -395,9 +411,11 @@ def preprocess_image(
         final_image_size (int): Target size for resized images (square)
         normalize_images (bool): Whether the images should be normalized in the end
         stronger_image_aug (bool): Whether to apply stronger image augmentations
+        spatial_masks: Optional masks of shape (N, H, W), already in the saved
+            image orientation. Resize, crop and rotate with the images; never flip.
 
     Returns:
-        torch.Tensor: Preprocessed images
+        Preprocessed images, or (images, FP32 masks) when spatial_masks is supplied.
     """
     assert isinstance(images, np.ndarray), f"Images are not of type `np.ndarray`! Got type: {type(images)}"
     assert images.dtype == np.uint8, f"Images do not have dtype `np.uint8`! Got dtype: {images.dtype}"
@@ -405,12 +423,22 @@ def preprocess_image(
         f"Unexpected images shape! Expected (T, H, W, 3) but got: {images.shape}"
     )
 
+    masks = None
+    if spatial_masks is not None:
+        if spatial_masks.ndim != 3 or spatial_masks.shape[-2:] != images.shape[1:3]:
+            raise ValueError(f"Masks must match image height and width, got {spatial_masks.shape} vs {images.shape}")
+        masks = torch.as_tensor(np.ascontiguousarray(spatial_masks), dtype=torch.float32)
+        masks = F.resize(masks, [final_image_size, final_image_size], interpolation=T.InterpolationMode.NEAREST)
+
     images = resize_images(images, final_image_size)
 
     images = np.transpose(images, (3, 0, 1, 2))  # (T, H, W, C) -> (C, T, H, W)
     images = torch.from_numpy(images)
     if use_image_aug:
-        images = apply_image_aug(images, stronger=stronger_image_aug)
+        if masks is None:
+            images = apply_image_aug(images, stronger=stronger_image_aug)
+        else:
+            images, masks = apply_image_aug(images, stronger=stronger_image_aug, spatial_masks=masks)
     if normalize_images:
         # Normalize images and return as dtype torch.float32
         images = images.to(torch.float32)
@@ -420,4 +448,6 @@ def preprocess_image(
     else:
         # Keep images as dtype torch.uint8
         images = images.to(torch.uint8)
+    if masks is not None:
+        return images, masks
     return images
